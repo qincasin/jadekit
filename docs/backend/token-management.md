@@ -1,324 +1,70 @@
-# Claude API Token 管理系统设计
+# Claude API Token 管理系统
+
+> **注意**: Token 管理已作为 Provider 系统的兼容层保留。新功能请使用 Provider 系统（`provider_service.rs`）。
 
 ## 1. 功能概述
 
-管理多个 Claude API tokens，支持快速切换当前使用的 token。
+管理多个 Claude API Token，支持快速切换。切换时将选中 Token 的配置写入 `~/.claude/settings.json` 的 `env` 字段。
 
-## 2. 数据存储
+## 2. 数据模型
 
-### 2.1 Token 配置文件
-**位置**: `~/.jadekit/tokens.json`
-
-```json
-{
-  "tokens": [
-    {
-      "id": "token-1",
-      "name": "主账号",
-      "apiKey": "sk-ant-xxx",
-      "description": "日常开发使用",
-      "isActive": true,
-      "createdAt": "2024-01-01T00:00:00Z",
-      "lastUsed": "2024-01-15T10:30:00Z"
-    },
-    {
-      "id": "token-2",
-      "name": "测试账号",
-      "apiKey": "sk-ant-yyy",
-      "description": "测试环境",
-      "isActive": false,
-      "createdAt": "2024-01-05T00:00:00Z",
-      "lastUsed": null
-    }
-  ]
-}
-```
-
-### 2.2 Claude 配置文件
-**位置**: `~/.claude/settings.json`
-
-切换 token 时修改此文件的 `apiKey` 字段。
-
-## 3. 后端设计（Rust）
-
-### 3.1 数据模型
+**文件**: `src-tauri/src/models/token.rs`
 
 ```rust
-// src-tauri/src/models/token.rs
-use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiToken {
     pub id: String,
     pub name: String,
-    #[serde(rename = "apiKey")]
-    pub api_key: String,
+    pub api_key: String,                    // apiKey
+    pub url: Option<String>,                // 自定义 API 地址
+    pub default_sonnet_model: Option<String>, // Sonnet 模型映射
+    pub default_opus_model: Option<String>,   // Opus 模型映射
+    pub default_haiku_model: Option<String>,  // Haiku 模型映射
+    pub custom_params: Option<HashMap<String, Value>>, // 自定义参数
     pub description: Option<String>,
-    #[serde(rename = "isActive")]
     pub is_active: bool,
-    #[serde(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
-    #[serde(rename = "lastUsed")]
     pub last_used: Option<DateTime<Utc>>,
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TokensConfig {
-    pub tokens: Vec<ApiToken>,
-}
 ```
 
-### 3.2 Service 层
+## 3. 数据存储
 
-```rust
-// src-tauri/src/services/token_service.rs
-use crate::models::token::{ApiToken, TokensConfig};
-use std::fs;
-use std::io;
-use std::path::PathBuf;
-use serde_json;
-use chrono::Utc;
+| 文件 | 路径 | 说明 |
+|------|------|------|
+| Token 数据 | `~/.jadekit/tokens.json` | 通过 `app_paths::data_file("tokens.json")` |
+| Claude 设置 | `~/.claude/settings.json` | Token 切换写入 `env` 字段 |
 
-fn get_tokens_path() -> Result<PathBuf, io::Error> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Home directory not found"))?;
-    Ok(home.join(".jadekit").join("tokens.json"))
-}
+## 4. 切换机制
 
-fn get_claude_settings_path() -> Result<PathBuf, io::Error> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Home directory not found"))?;
-    Ok(home.join(".claude").join("settings.json"))
-}
+`switch_token` 将选中 Token 写入 Claude 运行时配置：
 
-pub fn list_tokens() -> Result<Vec<ApiToken>, io::Error> {
-    let tokens_path = get_tokens_path()?;
-
-    if !tokens_path.exists() {
-        return Ok(vec![]);
-    }
-
-    let content = fs::read_to_string(&tokens_path)?;
-    let config: TokensConfig = serde_json::from_str(&content)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    Ok(config.tokens)
-}
-
-pub fn add_token(token: ApiToken) -> Result<(), io::Error> {
-    let tokens_path = get_tokens_path()?;
-
-    // 确保目录存在
-    if let Some(parent) = tokens_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut tokens = list_tokens().unwrap_or_default();
-    tokens.push(token);
-
-    let config = TokensConfig { tokens };
-    let content = serde_json::to_string_pretty(&config)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    fs::write(&tokens_path, content)?;
-    Ok(())
-}
-
-pub fn switch_token(token_id: &str) -> Result<(), io::Error> {
-    let tokens_path = get_tokens_path()?;
-    let mut tokens = list_tokens()?;
-
-    // 找到要激活的 token
-    let token_to_activate = tokens.iter_mut()
-        .find(|t| t.id == token_id)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Token not found"))?;
-
-    // 获取 api_key
-    let api_key = token_to_activate.api_key.clone();
-
-    // 更新所有 token 的 active 状态
-    for token in tokens.iter_mut() {
-        token.is_active = token.id == token_id;
-        if token.is_active {
-            token.last_used = Some(Utc::now());
-        }
-    }
-
-    // 保存 tokens.json
-    let config = TokensConfig { tokens };
-    let content = serde_json::to_string_pretty(&config)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    fs::write(&tokens_path, content)?;
-
-    // 更新 Claude settings.json
-    let settings_path = get_claude_settings_path()?;
-    let settings_content = fs::read_to_string(&settings_path)?;
-    let mut settings: serde_json::Value = serde_json::from_str(&settings_content)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    settings["apiKey"] = serde_json::Value::String(api_key);
-
-    let updated_content = serde_json::to_string_pretty(&settings)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    fs::write(&settings_path, updated_content)?;
-
-    Ok(())
-}
-
-pub fn delete_token(token_id: &str) -> Result<(), io::Error> {
-    let tokens_path = get_tokens_path()?;
-    let mut tokens = list_tokens()?;
-
-    tokens.retain(|t| t.id != token_id);
-
-    let config = TokensConfig { tokens };
-    let content = serde_json::to_string_pretty(&config)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    fs::write(&tokens_path, content)?;
-    Ok(())
-}
+```
+~/.claude/settings.json → env:
+  ANTHROPIC_AUTH_TOKEN       = api_key
+  ANTHROPIC_BASE_URL         = url（如有）
+  ANTHROPIC_DEFAULT_SONNET_MODEL = default_sonnet_model（如有）
+  ANTHROPIC_DEFAULT_OPUS_MODEL  = default_opus_model（如有）
+  ANTHROPIC_DEFAULT_HAIKU_MODEL = default_haiku_model（如有）
 ```
 
-### 3.3 Tauri Commands
+## 5. Tauri 命令
 
-```rust
-// src-tauri/src/lib.rs
-use crate::services::token_service;
-use crate::models::token::ApiToken;
+| 命令 | 说明 |
+|------|------|
+| `get_tokens` | 获取所有 Token |
+| `add_api_token` | 添加 Token |
+| `update_api_token` | 更新 Token |
+| `delete_api_token` | 删除 Token |
+| `switch_api_token` | 切换活跃 Token |
+| `move_api_token` | 拖拽排序 |
+| `fetch_available_models` | 从 API 获取可用模型列表 |
 
-#[tauri::command]
-fn get_tokens() -> Result<Vec<ApiToken>, String> {
-    token_service::list_tokens().map_err(|e| e.to_string())
-}
+## 6. 前端
 
-#[tauri::command]
-fn add_api_token(token: ApiToken) -> Result<(), String> {
-    token_service::add_token(token).map_err(|e| e.to_string())
-}
+- **页面**: `src/pages/ClaudePage.tsx`
+- **Store**: `src/stores/useTokenStore.ts`
+- **视图**: 表格/卡片双视图，搜索、拖拽排序
 
-#[tauri::command]
-fn switch_api_token(token_id: String) -> Result<(), String> {
-    token_service::switch_token(&token_id).map_err(|e| e.to_string())
-}
+## 7. 兼容说明
 
-#[tauri::command]
-fn delete_api_token(token_id: String) -> Result<(), String> {
-    token_service::delete_token(&token_id).map_err(|e| e.to_string())
-}
-```
-
-## 4. 前端设计（React + TypeScript）
-
-### 4.1 类型定义
-
-```typescript
-// src/types/token.ts
-export interface ApiToken {
-    id: string;
-    name: string;
-    apiKey: string;
-    description?: string;
-    isActive: boolean;
-    createdAt: string;
-    lastUsed?: string;
-}
-```
-
-### 4.2 Store
-
-```typescript
-// src/stores/useTokenStore.ts
-import { create } from 'zustand';
-import { invoke } from '@tauri-apps/api/core';
-import { ApiToken } from '../types/token';
-
-interface TokenState {
-    tokens: ApiToken[];
-    loading: boolean;
-    error: string | null;
-
-    loadTokens: () => Promise<void>;
-    addToken: (token: Omit<ApiToken, 'id' | 'createdAt' | 'isActive' | 'lastUsed'>) => Promise<void>;
-    switchToken: (tokenId: string) => Promise<void>;
-    deleteToken: (tokenId: string) => Promise<void>;
-}
-
-export const useTokenStore = create<TokenState>((set, get) => ({
-    tokens: [],
-    loading: false,
-    error: null,
-
-    loadTokens: async () => {
-        set({ loading: true, error: null });
-        try {
-            const tokens = await invoke<ApiToken[]>('get_tokens');
-            set({ tokens, loading: false });
-        } catch (error) {
-            set({ error: String(error), loading: false });
-        }
-    },
-
-    addToken: async (tokenData) => {
-        set({ loading: true, error: null });
-        try {
-            const newToken: ApiToken = {
-                ...tokenData,
-                id: `token-${Date.now()}`,
-                isActive: false,
-                createdAt: new Date().toISOString(),
-            };
-            await invoke('add_api_token', { token: newToken });
-            await get().loadTokens();
-        } catch (error) {
-            set({ error: String(error), loading: false });
-            throw error;
-        }
-    },
-
-    switchToken: async (tokenId: string) => {
-        set({ loading: true, error: null });
-        try {
-            await invoke('switch_api_token', { tokenId });
-            await get().loadTokens();
-        } catch (error) {
-            set({ error: String(error), loading: false });
-            throw error;
-        }
-    },
-
-    deleteToken: async (tokenId: string) => {
-        set({ loading: true, error: null });
-        try {
-            await invoke('delete_api_token', { tokenId });
-            await get().loadTokens();
-        } catch (error) {
-            set({ error: String(error), loading: false });
-            throw error;
-        }
-    },
-}));
-```
-
-### 4.3 UI 组件
-
-页面结构：
-- Token 列表卡片
-- 添加 Token 对话框
-- 切换按钮
-- 删除确认对话框
-
-## 5. 实现步骤
-
-1. 创建 Rust models 和 services
-2. 注册 Tauri commands
-3. 创建前端 types 和 store
-4. 实现 Token 管理页面 UI
-5. 测试完整流程
-
-## 6. 安全考虑
-
-- API Key 存储在本地文件系统
-- 不在 UI 中完整显示 key（显示 sk-ant-xxx...）
-- 文件权限检查（仅用户可读写）
+`token_service.rs` 为兼容层，保留原有 API。新功能已迁移至 `provider_service.rs`（统一 Provider 管理），此模块将在适配完成后逐步废弃。

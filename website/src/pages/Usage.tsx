@@ -1,4 +1,4 @@
-import { Shield, Server, FileText, BarChart3, Cpu, ChevronRight, Terminal, Key, Zap } from 'lucide-react';
+import { Shield, Server, FileText, BarChart3, Cpu, ChevronRight, Terminal, Key, Zap, Orbit } from 'lucide-react';
 import { ISSUES_URL } from '../config/site';
 
 const sections = [
@@ -7,11 +7,11 @@ const sections = [
     icon: Key,
     gradient: 'from-amber-500 to-orange-500',
     title: 'API Token 管理',
-    description: '轻松管理多个 Claude/Codex/Gemini API Token，一键切换使用',
+    description: '轻松管理多个 Provider 配置与 API 凭证，一键切换当前使用方案',
     features: [
-      { title: '添加 Token', desc: '填写名称、API Key 和相关配置' },
-      { title: '快速切换', desc: '点击「设为活跃」即可切换当前 Token' },
-      { title: '模型映射', desc: '为 Sonnet、Opus、Haiku 配置默认模型' },
+      { title: '添加 Provider', desc: '填写名称、API Key、模型与端点等配置' },
+      { title: '快速切换', desc: '点击「设为活跃」即可切换当前 Provider 配置' },
+      { title: '模型映射', desc: '为 Claude、Codex、Gemini 等工具配置默认模型' },
       { title: '自定义端点', desc: '支持 Azure、自定义代理等' }
     ]
   },
@@ -39,6 +39,19 @@ const sections = [
       { title: '快速应用', desc: '一键将预设应用到项目' },
       { title: '分类管理', desc: '按用途组织预设模板' },
       { title: '变量支持', desc: '支持动态变量替换' }
+    ]
+  },
+  {
+    key: 'antigravity',
+    icon: Orbit,
+    gradient: 'from-teal-500 to-cyan-500',
+    title: 'Antigravity 账号管理',
+    description: '集中管理 Antigravity / Antigravity IDE 账号，查看状态并快速切换',
+    features: [
+      { title: '账号列表', desc: '查看邮箱、标签、订阅等级与当前激活状态' },
+      { title: '一键切换', desc: '快速切换当前生效账号，并同步刷新本地凭证' },
+      { title: '状态检测', desc: '查看 token、配额、到期时间与异常提示' },
+      { title: '预热与维护', desc: '支持 warmup、刷新凭证与批量导入导出' }
     ]
   },
   {
@@ -91,8 +104,8 @@ const quickStart = [
   },
   {
     step: 2,
-    title: '添加 API Token',
-    desc: '在 Token 管理页面添加你的 Claude/Codex/Gemini API 密钥',
+    title: '配置 Provider / 账号',
+    desc: '先配置 Provider，若使用 Antigravity 再补充账号信息与活跃账号',
     icon: Key
   },
   {
@@ -109,8 +122,8 @@ const quickStart = [
   },
   {
     step: 5,
-    title: '开始使用',
-    desc: '在终端中使用 Claude Code，享受无缝切换体验',
+    title: '切换并开始使用',
+    desc: '在应用中切换 Provider 或 Antigravity 活跃账号后，再回到终端继续工作',
     icon: Zap
   }
 ];
@@ -239,7 +252,7 @@ export default function Usage() {
                     <div className="flex-shrink-0 w-6 h-6 rounded-full bg-orange-500/20 flex items-center justify-center mt-0.5">
                       <span className="text-orange-400 text-xs font-bold">1</span>
                     </div>
-                    <p className="text-gray-300 text-sm">为不同项目创建独立的 Token 配置，避免混淆</p>
+                    <p className="text-gray-300 text-sm">为不同项目分别整理 Provider 配置和 Antigravity 账号，切换时更清晰</p>
                   </div>
                   <div className="flex items-start space-x-3">
                     <div className="flex-shrink-0 w-6 h-6 rounded-full bg-pink-500/20 flex items-center justify-center mt-0.5">
@@ -253,7 +266,7 @@ export default function Usage() {
                     <div className="flex-shrink-0 w-6 h-6 rounded-full bg-rose-500/20 flex items-center justify-center mt-0.5">
                       <span className="text-rose-400 text-xs font-bold">3</span>
                     </div>
-                    <p className="text-gray-300 text-sm">定期查看数据面板，了解 Token 消耗情况</p>
+                    <p className="text-gray-300 text-sm">定期检查 Antigravity 账号状态、配额和到期时间，避免工作中断</p>
                   </div>
                   <div className="flex items-start space-x-3">
                     <div className="flex-shrink-0 w-6 h-6 rounded-full bg-amber-500/20 flex items-center justify-center mt-0.5">

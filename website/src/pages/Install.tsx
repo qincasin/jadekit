@@ -1,4 +1,4 @@
-import { Download, Apple, Monitor, Terminal, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Download, Apple, Monitor, Terminal, CheckCircle2, AlertCircle, Shield, Globe, Server, Trash, TerminalSquare } from 'lucide-react';
 import { useState } from 'react';
 import { RELEASES_URL, ISSUES_URL } from '../config/site';
 
@@ -25,13 +25,13 @@ const platforms = [
     gradient: 'from-gray-600 to-gray-800',
     badge: '',
     downloads: [
-      { name: 'DMG 镜像', file: 'JadeKit-*.dmg', desc: '支持 Apple Silicon & Intel' },
+      { name: 'DMG 镜像', file: 'JadeKit-*.dmg', desc: '支持 Apple Silicon & Intel，未签名版本首次启动可能需要解除隔离' },
       { name: 'Brew 安装', file: 'brew install --cask jadekit', desc: '命令行快速安装' }
     ],
     steps: [
       '下载 .dmg 文件',
       '双击打开并拖拽到 Applications',
-      '首次启动在系统设置中允许',
+      '首次启动如被拦截，请在系统设置中允许或使用下方 xattr 命令解除隔离',
       '享受原生 macOS 体验'
     ]
   },
@@ -78,7 +78,7 @@ const faqs = [
   },
   {
     question: '如何卸载？',
-    answer: 'Windows: 通过"设置 > 应用"卸载；macOS: 删除 Applications 中的应用并清理 ~/.jadekit；Linux: 使用包管理器卸载或删除 AppImage。',
+    answer: 'Windows: 通过"设置 > 应用"卸载；macOS: 删除 Applications 中的应用并清理 ~/.jadekit。若未签名版本无法启动，可先执行 xattr -rd com.apple.quarantine /Applications/JadeKit.app；Linux: 使用包管理器卸载或删除 AppImage。',
     icon: Trash
   }
 ];
@@ -172,6 +172,25 @@ export default function Install() {
                         ))}
                       </div>
                     </div>
+
+                    {platform.name === 'macOS' && (
+                      <div className="p-8 bg-amber-500/10 backdrop-blur-sm rounded-2xl border border-amber-400/20">
+                        <h3 className="text-xl font-bold text-white mb-4 flex items-center">
+                          <TerminalSquare className="text-amber-300 mr-2" size={24} />
+                          macOS 未签名应用提示
+                        </h3>
+                        <p className="text-gray-300 mb-4 leading-relaxed">
+                          如果你下载的是未签名构建，macOS 可能会提示应用已损坏、无法验证开发者，或者打开后直接崩溃。
+                          这时可以先把应用拖到 Applications，再执行下面这条命令解除隔离属性。
+                        </p>
+                        <div className="rounded-xl border border-white/10 bg-slate-950/70 p-4 mb-3">
+                          <code className="text-sm text-amber-200 break-all">xattr -rd com.apple.quarantine /Applications/JadeKit.app</code>
+                        </div>
+                        <p className="text-sm text-gray-400">
+                          如果你还没有把应用拖进 Applications，可以先调整路径，再重新执行命令。执行完成后重新打开 JadeKit 即可。
+                        </p>
+                      </div>
+                    )}
 
                     {/* Installation steps */}
                     <div className="p-8 bg-white/5 backdrop-blur-sm rounded-2xl border border-white/10">
@@ -289,5 +308,3 @@ export default function Install() {
   );
 }
 
-// Additional imports for icons
-import { Shield, Globe, Server, Trash } from 'lucide-react';

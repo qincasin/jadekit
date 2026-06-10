@@ -1,199 +1,18 @@
 import { Tag, Calendar, Github, Sparkles, Wrench, Zap } from 'lucide-react';
+import changelogRaw from '../../../CHANGELOG.md?raw';
 import { RELEASES_URL } from '../config/site';
+
+interface ChangeItem {
+  type: 'feature' | 'fix' | 'improvement' | 'breaking';
+  text: string;
+}
 
 interface Version {
   version: string;
   date: string;
   type: 'major' | 'minor' | 'patch';
-  changes: {
-    type: 'feature' | 'fix' | 'improvement' | 'breaking';
-    text: string;
-  }[];
+  changes: ChangeItem[];
 }
-
-const versions: Version[] = [
-        {
-    version: '1.0.0',
-    date: '2026-06-10',
-    type: 'patch',
-    changes: [
-      { type: 'fix', text: "发布 1.0.0" }
-    ]
-  },
-{
-    version: '1.0.0-SNAPSHOT',
-    date: '2026-06-06',
-    type: 'minor',
-    changes: [
-      { type: 'feature', text: 'Antigravity 账号管理：账号增删改查、自定义标签、批量导入/导出' },
-      { type: 'feature', text: '本地一键切换 Antigravity / Antigravity IDE，自动注入凭证并重启应用' },
-      { type: 'feature', text: 'Token 状态可视化与手动刷新，过期自动告警' },
-      { type: 'feature', text: '配额可视化展示（按模型分组，进度条 + 重置时间）' },
-      { type: 'feature', text: '操作历史记录（切换/刷新/预热等）' },
-      { type: 'feature', text: '账号预热（warmup），防止账号被风控' },
-      { type: 'feature', text: '账号列表支持网格 / 列表双视图切换' },
-      { type: 'improvement', text: '统一加上 User-Agent 头，降低 Google 风控风险' },
-      { type: 'improvement', text: 'project_id 缓存，减少不必要的 loadCodeAssist 调用' },
-      { type: 'fix', text: '修复切换账号后 Antigravity 没有自动重启的问题' },
-      { type: 'fix', text: '修复 PRO/ULTRA 订阅等级显示与筛选错误' },
-      { type: 'fix', text: '修复 403 时直接放弃而不尝试降级请求的问题' }
-    ]
-  },
-{
-    version: '1.5.1',
-    date: '2026-06-05',
-    type: 'patch',
-    changes: [
-      { type: 'fix', text: "新增 Claude Code 高级参数分组" }
-    ]
-  },
-{
-    version: '1.5.0',
-    date: '2026-04-29',
-    type: 'minor',
-    changes: [
-      { type: 'feature', text: '修复配置导入导出数据库存储流程' }
-    ]
-  },
-    {
-    version: '1.3.1',
-    date: '2026-03-17',
-    type: 'patch',
-    changes: [
-      { type: 'fix', text: '修复 macOS 上本地环境检查无法识别已安装工具（Claude/Gemini/OpenCode）的问题' },
-      { type: 'fix', text: '修复设置页开机自启动检测导致 Tab 切换卡顿的问题，改用 auto-launch crate + 异步非阻塞' },
-      { type: 'fix', text: '修复 macOS 下点击 Dock 图标无法唤起隐藏窗口的问题' },
-      { type: 'fix', text: '修复删除所有 Provider 后数据自动恢复的问题' },
-      { type: 'improvement', text: '设置页 Tab 切换改为 CSS 隐藏模式，消除组件重建卡顿' },
-      { type: 'improvement', text: '开机自启动支持跨平台（Windows/macOS/Linux）' },
-    ]
-  },
-        {
-    version: '1.2.18',
-    date: '2026-03-13',
-    type: 'patch',
-    changes: [
-      { type: 'improvement', text: '优化：设置页面"关于"选项卡加载速度，工具版本检测改为并行执行 + 非阻塞调用 + 5分钟缓存' },
-      { type: 'improvement', text: '优化：服务商页面和技能管理页面顶部搜索/筛选栏固定，内容区域独立滚动' },
-      { type: 'fix', text: '修复：导入配置时取消文件选择对话框后按钮一直转圈的问题' }
-    ]
-  },
-        {
-    version: '1.2.17',
-    date: '2026-03-12',
-    type: 'patch',
-    changes: [
-      { type: 'fix', text: "修复 Windows 和 Linux 打包编译错误" }
-    ]
-  },
-{
-    version: '1.2.16',
-    date: '2026-03-12',
-    type: 'patch',
-    changes: [
-      { type: 'fix', text: "修复 Linux 打包编译错误" }
-    ]
-  },
-{
-    version: '1.2.15',
-    date: '2026-03-12',
-    type: 'patch',
-    changes: [
-      { type: 'fix', text: "统一版本号到 1.2.15" }
-    ]
-  },
-{
-    version: 'v1.2.14',
-    date: '2025-03-12',
-    type: 'minor',
-    changes: [
-      { type: 'feature', text: '新增：macOS 更新自动安装功能' },
-      { type: 'feature', text: '新增：安装进度实时跟踪（挂载→复制→验证→清理→完成）' },
-      { type: 'feature', text: '新增：权限不足时显示详细引导提示' },
-      { type: 'improvement', text: '优化：更新安装界面交互体验' },
-      { type: 'improvement', text: '新增：安装失败时提供重新下载按钮' }
-    ]
-  },
-  {
-    version: 'v1.2.13',
-    date: '2025-03-12',
-    type: 'minor',
-    changes: [
-      { type: 'feature', text: '新增：macOS 更新自动安装功能' },
-      { type: 'feature', text: '新增：安装进度实时跟踪（挂载→复制→验证→清理→完成）' },
-      { type: 'feature', text: '新增：权限不足时显示详细引导提示' },
-      { type: 'improvement', text: '优化：更新安装界面交互体验' },
-      { type: 'improvement', text: '新增：安装失败时提供重新下载按钮' }
-    ]
-  },
-  {
-    version: 'v1.2.12',
-    date: '2025-01-13',
-    type: 'patch',
-    changes: [
-      { type: 'fix', text: '修复编译错误，优化构建流程' },
-      { type: 'improvement', text: '优化技能页卡片排版，提升视觉体验' },
-      { type: 'fix', text: '修复若干已知问题' }
-    ]
-  },
-  {
-    version: 'v1.2.11',
-    date: '2025-01-10',
-    type: 'minor',
-    changes: [
-      { type: 'feature', text: '新增：技能页面卡片展示模式' },
-      { type: 'feature', text: '新增：Prompt 预设管理功能' },
-      { type: 'improvement', text: '优化：MCP 服务器配置界面' },
-      { type: 'fix', text: '修复：Token 切换时的配置写入问题' }
-    ]
-  },
-  {
-    version: 'v1.2.10',
-    date: '2024-12-28',
-    type: 'minor',
-    changes: [
-      { type: 'feature', text: '新增：仪表盘数据统计功能' },
-      { type: 'feature', text: '新增：活跃度历史图表' },
-      { type: 'improvement', text: '优化：应用启动性能' },
-      { type: 'fix', text: '修复：语言切换不生效的问题' }
-    ]
-  },
-  {
-    version: 'v1.2.0',
-    date: '2024-12-15',
-    type: 'major',
-    changes: [
-      { type: 'feature', text: '重大更新：全新的 UI 设计' },
-      { type: 'feature', text: '新增：暗色模式支持' },
-      { type: 'feature', text: '新增：中英文国际化' },
-      { type: 'improvement', text: '重构：状态管理迁移至 Zustand' },
-      { type: 'improvement', text: '优化：响应式布局适配移动端' }
-    ]
-  },
-  {
-    version: 'v1.1.0',
-    date: '2024-11-20',
-    type: 'minor',
-    changes: [
-      { type: 'feature', text: '新增：MCP 服务器管理功能' },
-      { type: 'feature', text: '新增：项目级 MCP 配置支持' },
-      { type: 'improvement', text: '优化：Token 管理界面' },
-      { type: 'fix', text: '修复：配置文件读写权限问题' }
-    ]
-  },
-  {
-    version: 'v1.0.0',
-    date: '2024-11-01',
-    type: 'major',
-    changes: [
-      { type: 'feature', text: '首个稳定版本发布' },
-      { type: 'feature', text: '支持多 API Token 管理' },
-      { type: 'feature', text: '支持自定义 API 端点' },
-      { type: 'feature', text: '支持模型配置映射' },
-      { type: 'feature', text: '基础 CLAUDE.md 管理功能' }
-    ]
-  }
-];
 
 const changeTypeConfig = {
   feature: { icon: Sparkles, gradient: 'from-emerald-500 to-teal-500', label: '新功能' },
@@ -208,17 +27,74 @@ const versionTypeConfig = {
   patch: { badge: 'Patch', gradient: 'from-gray-500 to-gray-600' }
 };
 
+function inferVersionType(version: string): Version['type'] {
+  const parts = version.split('.').map((part) => Number.parseInt(part, 10) || 0);
+  const minor = parts[1] ?? 0;
+  const patch = parts[2] ?? 0;
+  if (minor === 0 && patch === 0) return 'major';
+  if (patch === 0) return 'minor';
+  return 'patch';
+}
+
+function mapSectionType(section: string): ChangeItem['type'] {
+  const key = section.trim().toLowerCase();
+  if (key.startsWith('add')) return 'feature';
+  if (key.startsWith('fix')) return 'fix';
+  if (key.startsWith('improve')) return 'improvement';
+  if (key.startsWith('break')) return 'breaking';
+  return 'improvement';
+}
+
+function parseChangelog(markdown: string): Version[] {
+  const blocks = markdown.split(/^##\s+/m).slice(1).map((block) => block.trim()).filter(Boolean);
+
+  return blocks.map((block) => {
+    const lines = block.split('\n');
+    const header = lines.shift() ?? '';
+    const match = header.match(/^\[(.+?)\](?:\s+-\s+(\d{4}-\d{2}-\d{2}))?/);
+    const version = match?.[1] ?? header.trim();
+    const date = match?.[2] ?? '日期待补充';
+
+    const changes: ChangeItem[] = [];
+    let currentType: ChangeItem['type'] = 'improvement';
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      const sectionMatch = line.match(/^###\s+(.+)$/);
+      if (sectionMatch) {
+        currentType = mapSectionType(sectionMatch[1]);
+        continue;
+      }
+      if (/^[-*]\s+/.test(line)) {
+        changes.push({
+          type: currentType,
+          text: line.replace(/^[-*]\s*/, '').trim()
+        });
+      }
+    }
+
+    return {
+      version,
+      date,
+      type: inferVersionType(version),
+      changes
+    } satisfies Version;
+  });
+}
+
+const versions = parseChangelog(changelogRaw);
+const latest = versions[0];
+
 export default function Changelog() {
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950">
-      {/* Background effects */}
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
         <div className="absolute top-1/4 left-1/3 w-96 h-96 bg-purple-500/10 rounded-full blur-3xl" />
         <div className="absolute bottom-1/3 right-1/3 w-80 h-80 bg-blue-500/10 rounded-full blur-3xl" />
       </div>
 
       <div className="relative z-10">
-        {/* Header */}
         <div className="py-20 sm:py-28 px-4 sm:px-6 lg:px-8">
           <div className="max-w-4xl mx-auto text-center">
             <div className="inline-flex items-center space-x-2 px-4 py-2 bg-white/5 backdrop-blur-sm border border-white/10 rounded-full mb-6">
@@ -231,60 +107,51 @@ export default function Changelog() {
               </span>
             </h1>
             <p className="text-xl text-gray-400 max-w-2xl mx-auto">
-              跟踪 JadeKit 的版本更新和改进记录
+              官网直接读取仓库 CHANGELOG.md，保证版本信息与项目发布记录一致
             </p>
           </div>
         </div>
 
-        {/* Latest Version Banner */}
-        <section className="py-8 px-4 sm:px-6 lg:px-8">
-          <div className="max-w-4xl mx-auto">
-            <div className="relative p-8 bg-gradient-to-br from-orange-500/20 via-pink-500/20 to-rose-500/20 backdrop-blur-sm rounded-2xl border border-orange-500/30 overflow-hidden">
-              {/* Animated background */}
-              <div className="absolute inset-0 bg-gradient-to-r from-orange-500/10 via-pink-500/10 to-rose-500/10 animate-gradient-shift" />
-
-              <div className="relative">
-                <div className="flex items-center space-x-3 mb-4">
-                  <div className="px-3 py-1 bg-gradient-to-r from-orange-500 to-pink-500 rounded-full">
-                    <span className="text-white text-sm font-medium">最新版本</span>
+        {latest && (
+          <section className="py-8 px-4 sm:px-6 lg:px-8">
+            <div className="max-w-4xl mx-auto">
+              <div className="relative p-8 bg-gradient-to-br from-orange-500/20 via-pink-500/20 to-rose-500/20 backdrop-blur-sm rounded-2xl border border-orange-500/30 overflow-hidden">
+                <div className="absolute inset-0 bg-gradient-to-r from-orange-500/10 via-pink-500/10 to-rose-500/10 animate-gradient-shift" />
+                <div className="relative">
+                  <div className="flex items-center space-x-3 mb-4">
+                    <div className="px-3 py-1 bg-gradient-to-r from-orange-500 to-pink-500 rounded-full">
+                      <span className="text-white text-sm font-medium">最新版本</span>
+                    </div>
+                    <a
+                      href={RELEASES_URL}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center space-x-2 text-orange-400 hover:text-orange-300 transition-colors"
+                    >
+                      <Github size={18} />
+                      <span className="text-sm">查看 Release</span>
+                    </a>
                   </div>
-                  <a
-                    href={RELEASES_URL}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center space-x-2 text-orange-400 hover:text-orange-300 transition-colors"
-                  >
-                    <Github size={18} />
-                    <span className="text-sm">查看 Release</span>
-                  </a>
-                </div>
-                <div className="text-4xl font-bold text-white mb-2">{versions[0].version}</div>
-                <div className="flex items-center space-x-2 text-gray-400">
-                  <Calendar size={16} />
-                  <span className="text-sm">{versions[0].date}</span>
+                  <div className="text-4xl font-bold text-white mb-2">{latest.version}</div>
+                  <div className="flex items-center space-x-2 text-gray-400">
+                    <Calendar size={16} />
+                    <span className="text-sm">{latest.date}</span>
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
-        </section>
+          </section>
+        )}
 
-        {/* Version Timeline */}
         <section className="py-16 px-4 sm:px-6 lg:px-8">
           <div className="max-w-4xl mx-auto">
             <div className="relative">
-              {/* Timeline line */}
               <div className="absolute left-8 top-0 bottom-0 w-px bg-gradient-to-b from-orange-500 via-pink-500 to-transparent" />
-
-              {/* Version cards */}
               <div className="space-y-8">
                 {versions.map((release) => (
                   <div key={release.version} className="relative pl-20">
-                    {/* Timeline dot */}
                     <div className={`absolute left-6 w-5 h-5 rounded-full bg-gradient-to-r ${versionTypeConfig[release.type].gradient} border-4 border-slate-900 shadow-lg`} />
-
-                    {/* Version card */}
                     <div className="group p-6 bg-white/5 backdrop-blur-sm rounded-xl border border-white/10 hover:border-white/20 transition-all">
-                      {/* Header */}
                       <div className="flex flex-wrap items-center gap-4 mb-4">
                         <h3 className="text-2xl font-bold text-white">{release.version}</h3>
                         <div className={`px-2 py-0.5 bg-gradient-to-r ${versionTypeConfig[release.type].gradient} rounded-full`}>
@@ -296,7 +163,6 @@ export default function Changelog() {
                         </span>
                       </div>
 
-                      {/* Changes */}
                       <div className="space-y-2">
                         {release.changes.map((change, idx) => {
                           const Icon = changeTypeConfig[change.type].icon;
@@ -318,7 +184,6 @@ export default function Changelog() {
                         })}
                       </div>
 
-                      {/* Hover effect */}
                       <div className="absolute inset-0 bg-gradient-to-r from-orange-500/5 via-pink-500/5 to-rose-500/5 opacity-0 group-hover:opacity-100 rounded-xl transition-opacity pointer-events-none" />
                     </div>
                   </div>
@@ -328,7 +193,6 @@ export default function Changelog() {
           </div>
         </section>
 
-        {/* View All */}
         <section className="py-16 px-4 sm:px-6 lg:px-8">
           <div className="max-w-4xl mx-auto">
             <div className="p-8 bg-white/5 backdrop-blur-sm rounded-2xl border border-white/10 text-center">
