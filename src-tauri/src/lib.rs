@@ -206,7 +206,7 @@ fn refresh_stats_cache() -> Result<StatsCache, String> {
 // 在终端中打开目录
 #[tauri::command]
 async fn open_in_terminal(
-    _app: tauri::AppHandle,
+    app: tauri::AppHandle,
     path: String,
     terminal: Option<String>,
 ) -> Result<(), String> {
