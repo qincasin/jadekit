@@ -25,7 +25,7 @@ node scripts/bump-version.js minor "新增 macOS 自动更新功能"
 | `src-tauri/Cargo.toml` | Rust package 版本号 |
 | `src-tauri/Cargo.lock` | Rust lockfile 中的 JadeKit 版本号 |
 | `src-tauri/tauri.conf.json` | Tauri 配置 (决定安装包版本) |
-| `website/src/pages/Changelog.tsx` | 新增版本条目 |
+| `CHANGELOG.md` | 新增版本条目，官网更新日志会读取它 |
 
 ### 自动生成的内容
 
@@ -153,7 +153,7 @@ v1.2.15
 📝 更新后的后续步骤:
 
   1. 检查修改的文件
-  2. 补充 Changelog.tsx 中的更新内容（如需要）
+  2. 补充 CHANGELOG.md 中的更新内容（如需要）
   3. 提交更改: git add . && git commit -m "chore: bump version to 1.2.15"
   4. 创建 tag: git tag -a v1.2.15 -m "$(cat <<'EOF'
 ...

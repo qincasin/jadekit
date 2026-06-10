@@ -1,6 +1,6 @@
 [package]
 name = "jadekit"
-version = "1.0.2"
+version = "1.0.3"
 description = "JadeKit desktop app"
 authors = ["JadeKit Contributors"]
 edition = "2021"

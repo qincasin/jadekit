@@ -95,6 +95,16 @@ export const useAboutStore = create<AboutState>((set, get) => ({
         set({ checking: true, updateInfo: null, sourceUpdates: [], checkError: null, downloadedPath: null, downloadProgress: null });
         try {
             const sources = await invoke<SourceUpdateInfo[]>('check_for_updates_all_sources');
+            const failedSources = sources.filter(s => s.error);
+            if (sources.length > 0 && failedSources.length === sources.length) {
+                set({
+                    sourceUpdates: sources,
+                    updateInfo: null,
+                    checkError: failedSources.map(s => `${s.repo}: ${s.error}`).join('\n'),
+                    checking: false,
+                });
+                return;
+            }
             const firstWithUpdate = sources.find(s => s.updateInfo.hasUpdate);
             set({
                 sourceUpdates: sources,

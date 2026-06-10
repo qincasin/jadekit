@@ -49,6 +49,7 @@ pub struct InstallProgress {
 pub struct SourceUpdateInfo {
     pub repo: String,
     pub update_info: UpdateInfo,
+    pub error: Option<String>,
 }
 
 /// 检查 GitHub Release 是否有新版本
@@ -68,7 +69,27 @@ pub async fn check_update(current_version: &str, repo: &str) -> Result<UpdateInf
         .map_err(|e| format!("网络请求失败: {}", e))?;
 
     if !response.status().is_success() {
-        return Err(format!("GitHub API 请求失败: {}", response.status()));
+        let status = response.status();
+        let remaining = response
+            .headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        let reset = response
+            .headers()
+            .get("x-ratelimit-reset")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+
+        if status == reqwest::StatusCode::FORBIDDEN && remaining == "0" {
+            return Err(if reset.is_empty() {
+                "GitHub API 请求被限流，请稍后再试".to_string()
+            } else {
+                format!("GitHub API 请求被限流，请稍后再试 (reset: {})", reset)
+            });
+        }
+
+        return Err(format!("GitHub API 请求失败: {}", status));
     }
 
     let release: serde_json::Value = response
@@ -105,18 +126,25 @@ pub async fn check_update_all_sources(current_version: &str) -> Vec<SourceUpdate
             let repo = repo.to_string();
             let version = current_version.to_string();
             async move {
-                let result = check_update(&version, &repo).await;
-                SourceUpdateInfo {
-                    repo,
-                    update_info: result.unwrap_or(UpdateInfo {
-                        has_update: false,
-                        current_version: version,
-                        latest_version: String::new(),
-                        release_notes: String::new(),
-                        download_url: None,
-                        file_size: None,
-                        published_at: None,
-                    }),
+                match check_update(&version, &repo).await {
+                    Ok(update_info) => SourceUpdateInfo {
+                        repo,
+                        update_info,
+                        error: None,
+                    },
+                    Err(error) => SourceUpdateInfo {
+                        repo,
+                        update_info: UpdateInfo {
+                            has_update: false,
+                            current_version: version,
+                            latest_version: String::new(),
+                            release_notes: String::new(),
+                            download_url: None,
+                            file_size: None,
+                            published_at: None,
+                        },
+                        error: Some(error),
+                    },
                 }
             }
         })
