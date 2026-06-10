@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "JadeKit",
+  "version": "1.0.0",
+  "identifier": "com.jadekit.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "plugins": {
+    "shell": {
+      "open": ".*"
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": ["jadekit", "ccswitch"]
+      }
+    }
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "JadeKit",
+        "width": 1100,
+        "height": 700
+      }
+    ],
+    "security": {
+      "csp": null,
+      "capabilities": [
+        {
+          "identifier": "main-capability",
+          "description": "Main window capabilities",
+          "windows": ["main"],
+          "permissions": [
+            "core:default",
+            "core:app:allow-set-app-theme",
+            "core:window:allow-set-theme",
+            "shell:allow-open"
+          ]
+        }
+      ]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

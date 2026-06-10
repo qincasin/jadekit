@@ -1,0 +1,1059 @@
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Eye, EyeOff, Loader2, RefreshCw, ExternalLink, HeartPulse, ChevronDown, X, Plus } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import ModalDialog from '../common/ModalDialog';
+import { showToast } from '../common/ToastContainer';
+import { useProviderStore } from '../../stores/useProviderStore';
+import { Provider, ProviderProxyConfig } from '../../types/provider';
+import { AppType, VISIBLE_APP_TYPES, APP_LABELS } from '../../types/app';
+import ProviderProxyConfigInput from './ProviderProxyConfig';
+import { cn } from '../../utils/cn';
+
+// ── 基础 UI 组件 ──────────────────────────────────────────────
+
+function LabelText({ children, className }: { children: React.ReactNode, className?: string }) {
+    return (
+        <label className={cn("text-sm font-medium leading-none text-gray-700 dark:text-slate-200", className)}>
+            {children}
+        </label>
+    );
+}
+
+function TextInput({ className, ...props }: React.InputHTMLAttributes<HTMLInputElement>) {
+    return (
+        <input
+            className={cn("flex h-9 w-full rounded-md border border-gray-300 dark:border-slate-700 bg-white dark:bg-slate-900/50 px-3 py-1 text-sm text-gray-900 dark:text-slate-200 shadow-sm transition-colors placeholder:text-gray-400 dark:placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-50", className)}
+            {...props}
+        />
+    );
+}
+
+interface ProviderFormProps {
+    isOpen: boolean;
+    editingProvider?: Provider | null;
+    onClose: () => void;
+    defaultAppType?: AppType;
+}
+
+// ── 内部 SettingsConfig 类型 ──────────────────────────────────────────────
+
+interface InternalSettings {
+    alwaysThinkingEnabled?: boolean;
+    teammatesMode?: boolean;
+    disableNonessentialTraffic?: boolean;
+    disableAttributionHeader?: boolean;
+    disableInstallationChecks?: boolean;
+    enableToolSearch?: boolean;
+    enablePowerShellTool?: boolean;
+    disableTelemetry?: boolean;
+    disableBugCommand?: boolean;
+    disableAutoupdater?: boolean;
+    disableErrorReporting?: boolean;
+    effortLevel?: string;
+    ripgrepMode?: string;
+    maxOutputTokens?: string;
+    apiTimeoutMs?: string;
+    bashDefaultTimeoutMs?: string;
+    mcpTimeoutMs?: string;
+    mcpToolTimeoutMs?: string;
+    taskMaxOutputLength?: string;
+    anthropicBetas?: string;
+    anthropicCustomHeaders?: string;
+    customModelOption?: string;
+    customModelOptionName?: string;
+    customModelOptionDescription?: string;
+    customModelOptionCapabilities?: string;
+}
+
+const CLAUDE_SETTINGS_DEFAULTS: InternalSettings = {
+    alwaysThinkingEnabled: false,
+    teammatesMode: false,
+    disableNonessentialTraffic: false,
+    disableAttributionHeader: false,
+    disableInstallationChecks: false,
+    enableToolSearch: false,
+    enablePowerShellTool: false,
+    disableTelemetry: false,
+    disableBugCommand: false,
+    disableAutoupdater: false,
+    disableErrorReporting: false,
+    effortLevel: '',
+    ripgrepMode: '',
+    maxOutputTokens: '',
+    apiTimeoutMs: '',
+    bashDefaultTimeoutMs: '',
+    mcpTimeoutMs: '',
+    mcpToolTimeoutMs: '',
+    taskMaxOutputLength: '',
+    anthropicBetas: '',
+    anthropicCustomHeaders: '',
+    customModelOption: '',
+    customModelOptionName: '',
+    customModelOptionDescription: '',
+    customModelOptionCapabilities: '',
+};
+
+const CLAUDE_SETTING_KEYS = Object.keys(CLAUDE_SETTINGS_DEFAULTS) as (keyof InternalSettings)[];
+
+type ClaudeBooleanKey =
+    | 'alwaysThinkingEnabled'
+    | 'teammatesMode'
+    | 'disableNonessentialTraffic'
+    | 'disableAttributionHeader'
+    | 'disableInstallationChecks'
+    | 'enableToolSearch'
+    | 'enablePowerShellTool'
+    | 'disableTelemetry'
+    | 'disableBugCommand'
+    | 'disableAutoupdater'
+    | 'disableErrorReporting';
+
+const CLAUDE_SETTING_GROUPS: Array<{ title: string; toggles: Array<{ key: ClaudeBooleanKey; label: string; hint?: string }> }> = [
+    {
+        title: '能力增强',
+        toggles: [
+            { key: 'alwaysThinkingEnabled', label: '扩展思考', hint: 'Always thinking enabled' },
+            { key: 'teammatesMode', label: 'Teammates 模式', hint: 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS' },
+            { key: 'enableToolSearch', label: '启用工具搜索', hint: 'ENABLE_TOOL_SEARCH' },
+            { key: 'enablePowerShellTool', label: '启用 PowerShell 工具', hint: 'CLAUDE_CODE_USE_POWERSHELL_TOOL' },
+        ],
+    },
+    {
+        title: '执行与性能',
+        toggles: [],
+    },
+    {
+        title: '隐私与网络',
+        toggles: [
+            { key: 'disableNonessentialTraffic', label: '禁用非必要流量', hint: 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC' },
+            { key: 'disableAttributionHeader', label: '禁用归因头', hint: 'CLAUDE_CODE_ATTRIBUTION_HEADER=0' },
+            { key: 'disableTelemetry', label: '禁用遥测', hint: 'DISABLE_TELEMETRY' },
+            { key: 'disableErrorReporting', label: '禁用错误报告', hint: 'DISABLE_ERROR_REPORTING' },
+        ],
+    },
+    {
+        title: '维护开关',
+        toggles: [
+            { key: 'disableInstallationChecks', label: '禁用安装检查', hint: 'DISABLE_INSTALLATION_CHECKS' },
+            { key: 'disableBugCommand', label: '禁用 /bug 命令', hint: 'DISABLE_BUG_COMMAND' },
+            { key: 'disableAutoupdater', label: '禁用自动升级', hint: 'DISABLE_AUTOUPDATER' },
+        ],
+    },
+];
+
+const CLAUDE_NUMERIC_INPUTS: Array<{ key: keyof InternalSettings; label: string; placeholder: string; hint: string }> = [
+    { key: 'maxOutputTokens', label: '最大输出 Tokens', placeholder: '如 100000', hint: 'CLAUDE_CODE_MAX_OUTPUT_TOKENS' },
+    { key: 'apiTimeoutMs', label: 'API 超时 ms', placeholder: '如 1200000', hint: 'API_TIMEOUT_MS' },
+    { key: 'bashDefaultTimeoutMs', label: 'Bash 默认超时 ms', placeholder: '如 300000', hint: 'BASH_DEFAULT_TIMEOUT_MS' },
+    { key: 'mcpTimeoutMs', label: 'MCP 启动超时 ms', placeholder: '如 30000', hint: 'MCP_TIMEOUT' },
+    { key: 'mcpToolTimeoutMs', label: 'MCP 工具超时 ms', placeholder: '如 100000', hint: 'MCP_TOOL_TIMEOUT' },
+    { key: 'taskMaxOutputLength', label: 'Subagent 输出上限', placeholder: '如 32000', hint: 'TASK_MAX_OUTPUT_LENGTH' },
+];
+
+const CLAUDE_TEXT_INPUTS: Array<{ key: keyof InternalSettings; label: string; placeholder: string; hint: string; multiline?: boolean }> = [
+    { key: 'anthropicBetas', label: 'Beta Headers', placeholder: '如 beta-a,beta-b', hint: 'ANTHROPIC_BETAS' },
+    { key: 'anthropicCustomHeaders', label: '自定义 Headers', placeholder: 'Header-Name: value', hint: 'ANTHROPIC_CUSTOM_HEADERS', multiline: true },
+    { key: 'customModelOption', label: '自定义模型 ID', placeholder: 'provider/model-name', hint: 'ANTHROPIC_CUSTOM_MODEL_OPTION' },
+    { key: 'customModelOptionName', label: '模型显示名', placeholder: 'My Model', hint: 'ANTHROPIC_CUSTOM_MODEL_OPTION_NAME' },
+    { key: 'customModelOptionDescription', label: '模型描述', placeholder: '显示在 /model 中的描述', hint: 'ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION' },
+    { key: 'customModelOptionCapabilities', label: '模型能力', placeholder: '如 thinking,vision', hint: 'ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES' },
+];
+
+const CLAUDE_DEPRECATED_FIELD_LABELS: Record<string, string> = {
+    hideSignature: '隐藏签名',
+    enabledPlugins: '旧版插件启用列表',
+    'env.ANTHROPIC_REASONING_MODEL': '旧版推理模型',
+};
+
+const CLAUDE_SETTING_CONTROL_CLASS = "flex min-h-[36px] items-center rounded-md border border-transparent px-2";
+
+// ── 预设配置 ──────────────────────────────────────────────
+
+const PRESETS = [
+    { label: 'Claude Official', url: 'https://api.anthropic.com', appType: 'claude' as AppType },
+    { label: 'OpenRouter', url: 'https://openrouter.ai/api', appType: 'claude' as AppType },
+];
+
+// ── 白名单配置 ──────────────────────────────────────────────
+
+export default function ProviderForm({ isOpen, editingProvider, onClose, defaultAppType = 'claude' }: ProviderFormProps) {
+    const { t } = useTranslation();
+    const { addProvider, updateProvider } = useProviderStore();
+    const isEditing = !!editingProvider;
+
+    // 基本配置
+    const [name, setName] = useState(editingProvider?.name || '');
+    const [appType, setAppType] = useState<AppType>(editingProvider?.appType || defaultAppType);
+    const [apiKey, setApiKey] = useState(editingProvider?.apiKey || '');
+    const [url, setUrl] = useState(editingProvider?.url || 'https://api.anthropic.com');
+
+    // 模型配置
+    const [defaultSonnetModel, setDefaultSonnetModel] = useState(editingProvider?.defaultSonnetModel || '');
+    const [defaultOpusModel, setDefaultOpusModel] = useState(editingProvider?.defaultOpusModel || '');
+    const [defaultHaikuModel, setDefaultHaikuModel] = useState(editingProvider?.defaultHaikuModel || '');
+    const [defaultReasoningModel, setDefaultReasoningModel] = useState(editingProvider?.defaultReasoningModel || '');
+
+    // 其他配置
+    const [description, setDescription] = useState(editingProvider?.description || '');
+    const [tags, setTags] = useState<string[]>(editingProvider?.tags || []);
+    const [proxyConfig, setProxyConfig] = useState<ProviderProxyConfig>(() => {
+        if (editingProvider?.proxyConfig) {
+            return editingProvider.proxyConfig;
+        }
+        return { enabled: false };
+    });
+
+    // UI 状态
+    const [showKey, setShowKey] = useState(false);
+    const [saving, setSaving] = useState(false);
+    const [fetchedModels, setFetchedModels] = useState<string[]>([]);
+    const [fetchModelsLoading, setFetchModelsLoading] = useState(false);
+    const [testLoading, setTestLoading] = useState(false);
+    const [testResult, setTestResult] = useState<{ success: boolean; latencyMs?: number; error?: string } | null>(null);
+    const [claudeDeprecatedFields, setClaudeDeprecatedFields] = useState<string[]>([]);
+
+    // Internal settings (settingsConfig)
+    const [internalSettings, setInternalSettings] = useState<InternalSettings>(() => {
+        if (editingProvider?.settingsConfig) {
+            return JSON.parse(JSON.stringify(editingProvider.settingsConfig));
+        }
+        return { ...CLAUDE_SETTINGS_DEFAULTS };
+    });
+
+    useEffect(() => {
+        if (isOpen) {
+            setName(editingProvider?.name || '');
+            setAppType(editingProvider?.appType || defaultAppType);
+            setApiKey(editingProvider?.apiKey || '');
+            setUrl(editingProvider?.url || 'https://api.anthropic.com');
+            setDefaultSonnetModel(editingProvider?.defaultSonnetModel || '');
+            setDefaultOpusModel(editingProvider?.defaultOpusModel || '');
+            setDefaultHaikuModel(editingProvider?.defaultHaikuModel || '');
+            setDefaultReasoningModel(editingProvider?.defaultReasoningModel || '');
+            setDescription(editingProvider?.description || '');
+            setTags(editingProvider?.tags || []);
+            if (editingProvider?.proxyConfig) {
+                setProxyConfig(editingProvider.proxyConfig);
+            } else {
+                setProxyConfig({ enabled: false });
+            }
+            setShowKey(false);
+            setFetchedModels([]);
+            setClaudeDeprecatedFields([]);
+            
+            if (editingProvider?.settingsConfig) {
+                setInternalSettings(JSON.parse(JSON.stringify(editingProvider.settingsConfig)));
+            } else {
+                setInternalSettings({ ...CLAUDE_SETTINGS_DEFAULTS });
+            }
+
+            // 对 Claude 类型，从当前 settings.json 读取 checkbox 状态
+            // 用文件实际值填充 Provider 未显式保存的新字段
+            const currentAppType = editingProvider?.appType || defaultAppType;
+            if (currentAppType === 'claude') {
+                invoke<any>('get_claude_settings_state').then(fileState => {
+                    setInternalSettings((prev: any) => {
+                        const saved = editingProvider?.settingsConfig || {};
+                        const merged = { ...prev };
+                        // 对每个已知字段：如果 Provider 没有显式保存过，用文件当前值
+                        for (const key of CLAUDE_SETTING_KEYS) {
+                            if (!(key in saved)) {
+                                merged[key] = fileState[key];
+                            }
+                        }
+                        return merged;
+                    });
+                    const fromFile = Array.isArray(fileState?.deprecatedFields) ? fileState.deprecatedFields : [];
+                    const fromProvider = Object.keys(editingProvider?.settingsConfig || {})
+                        .filter((key) => key === 'hideSignature' || key === 'enabledPlugins');
+                    setClaudeDeprecatedFields(Array.from(new Set([...fromFile, ...fromProvider])));
+                }).catch(() => {});
+            }
+        }
+    }, [isOpen, editingProvider, defaultAppType]);
+
+    const applyPreset = (preset: typeof PRESETS[number]) => {
+        if (preset.url) {
+            setUrl(preset.url);
+        }
+        setAppType(preset.appType);
+    };
+
+    const handleTestConnectivity = async () => {
+        if (!url.trim() || !apiKey.trim()) {
+            showToast(t('providers.fetchModelsNeedUrlKey'), 'error');
+            return;
+        }
+        const testModel = defaultSonnetModel || defaultOpusModel || defaultHaikuModel || defaultReasoningModel || (() => {
+            switch (appType) {
+                case 'codex': return 'gpt-4o';
+                case 'gemini': return 'gemini-2.0-flash';
+                default: return 'claude-sonnet-4-20250514';
+            }
+        })();
+        setTestLoading(true);
+        setTestResult(null);
+        try {
+            const result = await invoke<{ model: string; available: boolean; latencyMs: number; error?: string }>(
+                'check_stream_connectivity', { url: url.trim(), apiKey: apiKey.trim(), model: testModel, appType }
+            );
+            setTestResult({
+                success: result.available,
+                latencyMs: result.latencyMs,
+                error: result.error || undefined,
+            });
+        } catch (err) {
+            setTestResult({ success: false, error: String(err) });
+        } finally {
+            setTestLoading(false);
+        }
+    };
+
+    useEffect(() => {
+        setTestResult(null);
+    }, [url, apiKey, appType]);
+
+    const handleSave = async () => {
+        const finalApiKey = apiKey.trim();
+        const finalUrl = url.trim();
+        const finalName = name.trim();
+
+        if (!finalName || !finalApiKey) {
+            showToast(t('providers.error_required', '请填写名称和 API Key'), 'error');
+            return;
+        }
+
+        setSaving(true);
+        try {
+            const data = {
+                name: finalName,
+                appType,
+                apiKey: finalApiKey,
+                url: finalUrl || undefined,
+                defaultSonnetModel: defaultSonnetModel.trim() || undefined,
+                defaultOpusModel: defaultOpusModel.trim() || undefined,
+                defaultHaikuModel: defaultHaikuModel.trim() || undefined,
+                defaultReasoningModel: defaultReasoningModel.trim() || undefined,
+                description: description.trim() || undefined,
+                tags: tags.length > 0 ? tags : undefined,
+                settingsConfig: (() => {
+                    // 只保存白名单内的已知字段，排除历史残留
+                    const clean: Record<string, any> = {};
+                    if (internalSettings) {
+                        for (const k of CLAUDE_SETTING_KEYS) {
+                            if (k in internalSettings) clean[k] = internalSettings[k];
+                        }
+                    }
+                    return Object.keys(clean).length > 0 ? clean : undefined;
+                })(),
+                proxyConfig: proxyConfig.enabled ? proxyConfig : undefined,
+            };
+
+            if (isEditing && editingProvider) {
+                await updateProvider(editingProvider.id, data);
+                showToast(t('providers.update_success', 'Provider 更新成功'), 'success');
+            } else {
+                await addProvider(data);
+                showToast(t('providers.add_success', 'Provider 添加成功'), 'success');
+            }
+            onClose();
+        } catch (error) {
+            showToast((isEditing ? '更新失败: ' : '添加失败: ') + error, 'error');
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    const handleCheckboxChange = (field: string, checked: boolean) => {
+        setInternalSettings((prev: any) => ({
+            ...prev,
+            [field]: checked
+        }));
+    };
+
+    // ============================================
+    // 实时配置预览 - 调用后端获取原始 + 预览内容，逐行 diff 高亮
+    // ============================================
+    const [previewData, setPreviewData] = useState<{ title: string; content: string; originalContent: string }[]>([]);
+    // 首次打开表单时的初始预览，作为 diff baseline（对比用户在表单中做的变更）
+    const initialPreviewRef = useRef<Record<string, string>>({});
+
+    // 构建用于预览的 Provider 对象（仅包含已知配置字段，排除历史残留字段）
+    const buildPreviewProvider = useCallback(() => {
+        // 白名单：只有这些字段可以写入 settingsConfig 传给后端
+        const filteredSettings: Record<string, any> = {};
+        if (internalSettings) {
+            for (const [k, v] of Object.entries(internalSettings)) {
+                if (!(k in CLAUDE_SETTINGS_DEFAULTS)) continue; // 跳过不在白名单中的字段（如历史残留的 enabledPlugins）
+                const def = CLAUDE_SETTINGS_DEFAULTS[k as keyof InternalSettings];
+                if (typeof def === 'boolean') {
+                    filteredSettings[k] = v; // 布尔字段始终发送，确保 true/false 都能明确生效
+                } else if (typeof def === 'string' && v && (v as string).trim() !== '') {
+                    filteredSettings[k] = v;
+                }
+            }
+        }
+
+        return {
+            id: editingProvider?.id || '__preview__',
+            name: name || 'Preview',
+            appType,
+            apiKey: apiKey || 'your-api-key-here',
+            url: url.trim() || undefined,
+            defaultSonnetModel: defaultSonnetModel.trim() || undefined,
+            defaultOpusModel: defaultOpusModel.trim() || undefined,
+            defaultHaikuModel: defaultHaikuModel.trim() || undefined,
+            defaultReasoningModel: defaultReasoningModel.trim() || undefined,
+            settingsConfig: Object.keys(filteredSettings).length > 0 ? filteredSettings : undefined,
+            isActive: false,
+            createdAt: editingProvider?.createdAt || new Date().toISOString(),
+        };
+    }, [editingProvider, name, appType, apiKey, url, defaultSonnetModel, defaultOpusModel, defaultHaikuModel, defaultReasoningModel, internalSettings]);
+
+    // 防抖调用后端：获取预览结果，首次结果作为 baseline
+    useEffect(() => {
+        if (!isOpen) {
+            // 表单关闭时重置初始预览
+            initialPreviewRef.current = {};
+            return;
+        }
+
+        const timer = setTimeout(async () => {
+            try {
+                const provider = buildPreviewProvider();
+                const files = await invoke<[string, string, string][]>('preview_provider_sync', { provider });
+                const isFirstLoad = Object.keys(initialPreviewRef.current).length === 0;
+
+                if (isFirstLoad) {
+                    // 首次加载：保存当前预览内容作为 baseline
+                    const baselineMap: Record<string, string> = {};
+                    files.forEach(([title, content]) => {
+                        baselineMap[title] = content;
+                    });
+                    initialPreviewRef.current = baselineMap;
+                }
+
+                setPreviewData(files.map(([title, content]) => ({
+                    title,
+                    content,
+                    // baseline 使用首次加载时的预览（而非当前文件内容）
+                    originalContent: initialPreviewRef.current[title] || content,
+                })));
+            } catch (err) {
+                console.warn('Preview failed:', err);
+            }
+        }, 300);
+
+        return () => clearTimeout(timer);
+    }, [isOpen, buildPreviewProvider]);
+
+    return (
+        <ModalDialog
+            isOpen={isOpen}
+            title={isEditing ? t('providers.edit_title', '编辑 Provider') : t('providers.add_title', '添加 Provider')}
+            onConfirm={handleSave}
+            onCancel={onClose}
+            onClose={onClose}
+            confirmText={saving ? t('common.saving', '保存中...') : t('common.save', '保存')}
+            maxWidthClass="max-w-[1400px]"
+        >
+            {/* 预设选择 */}
+            {!isEditing && (
+                <div className="flex gap-2 mb-4">
+                    {PRESETS.map((preset) => (
+                        <button
+                            key={preset.label}
+                            type="button"
+                            onClick={() => applyPreset(preset)}
+                            className="inline-flex h-7 items-center justify-center rounded-md border border-gray-300 dark:border-slate-700 bg-gray-50 dark:bg-slate-900/50 px-3 text-xs font-medium shadow-sm transition-colors hover:bg-gray-100 dark:hover:bg-slate-800 hover:text-gray-900 dark:hover:text-slate-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-blue-500"
+                        >
+                            {preset.label}
+                        </button>
+                    ))}
+                </div>
+            )}
+
+            <div className="flex flex-col lg:flex-row gap-8 min-h-[500px]">
+                {/* 左侧：基本配置和模型 */}
+                <div className="flex-[0.9] min-w-0 space-y-5">
+                    {/* 名称和应用类型 */}
+                    <div className="grid grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                            <LabelText>{t('providers.field_name', '名称')}</LabelText>
+                            <TextInput
+                                placeholder="My Provider"
+                                value={name}
+                                onChange={(e: any) => setName(e.target.value)}
+                            />
+                        </div>
+                        <div className="space-y-2">
+                            <LabelText>{t('providers.field_app_type', '应用类型')}</LabelText>
+                            <select
+                                className="flex h-9 w-full items-center justify-between rounded-md border border-gray-300 dark:border-slate-700 bg-white dark:bg-slate-900/50 px-3 py-2 text-sm text-gray-900 dark:text-slate-200 shadow-sm ring-offset-background placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+                                value={appType}
+                                onChange={(e) => setAppType(e.target.value as AppType)}
+                            >
+                                {VISIBLE_APP_TYPES.map((type) => (
+                                    <option key={type} value={type} className="bg-white dark:bg-slate-900">{APP_LABELS[type]}</option>
+                                ))}
+                            </select>
+                        </div>
+                    </div>
+
+                    {/* API Key */}
+                    <div className="space-y-2">
+                        <LabelText>API Key</LabelText>
+                        <div className="relative">
+                            <TextInput
+                                type={showKey ? 'text' : 'password'}
+                                className="font-mono pr-10"
+                                placeholder="sk-..."
+                                value={apiKey}
+                                onChange={(e: any) => setApiKey(e.target.value)}
+                            />
+                            <button
+                                type="button"
+                                onClick={() => setShowKey(!showKey)}
+                                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 dark:text-slate-400 hover:text-gray-600 dark:hover:text-slate-200"
+                            >
+                                {showKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* URL */}
+                    <div className="space-y-2">
+                        <LabelText>URL</LabelText>
+                        <div className="relative">
+                            <TextInput
+                                type="text"
+                                className="font-mono pr-10"
+                                placeholder="https://api.anthropic.com"
+                                value={url}
+                                onChange={(e: any) => setUrl(e.target.value)}
+                            />
+                            {url.trim() && (
+                                <button
+                                    type="button"
+                                    tabIndex={-1}
+                                    className="absolute right-3 top-1/2 -translate-y-1/2 text-blue-400/60 hover:text-blue-400 transition-colors"
+                                    title={t('providers.openUrl', '在浏览器中打开')}
+                                    onClick={() => {
+                                        try {
+                                            const u = url.trim();
+                                            if (u.startsWith('http://') || u.startsWith('https://')) {
+                                                window.open(u, '_blank');
+                                            }
+                                        } catch { /* ignore */ }
+                                    }}
+                                >
+                                    <ExternalLink className="w-4 h-4" />
+                                </button>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* 模型配置区 */}
+                    <div className="space-y-3 pt-2">
+                        <div className="flex items-center justify-between">
+                            <LabelText>{t('providers.modelConfig', '模型配置')}</LabelText>
+                            <div className="flex items-center gap-2">
+                                <button
+                                    type="button"
+                                    onClick={handleTestConnectivity}
+                                    disabled={testLoading || !url.trim() || !apiKey.trim()}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all duration-200 border border-green-500/60 text-green-400 hover:bg-green-500/20 hover:text-green-300 hover:border-green-400 disabled:opacity-40 disabled:cursor-not-allowed"
+                                >
+                                    {testLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <HeartPulse className="w-3.5 h-3.5" />}
+                                    {t('providers.test_connectivity')}
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={async () => {
+                                        if (!url.trim() || !apiKey.trim()) {
+                                            showToast(t('providers.fetchModelsNeedUrlKey', '请先填写 URL 和 API Key'), 'error');
+                                            return;
+                                        }
+                                        setFetchModelsLoading(true);
+                                        try {
+                                            const models = await invoke<string[]>('fetch_models', { url: url.trim(), apiKey: apiKey.trim() });
+                                            setFetchedModels(models);
+                                            showToast(t('providers.fetchModelsSuccess', { count: models.length }), 'success');
+                                        } catch (error) {
+                                            showToast(`${t('providers.fetchModelsFailed', '获取模型失败')}: ${String(error)}`, 'error');
+                                        } finally {
+                                            setFetchModelsLoading(false);
+                                        }
+                                    }}
+                                    disabled={fetchModelsLoading || !url.trim() || !apiKey.trim()}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all duration-200 border border-blue-500/60 text-blue-400 hover:bg-blue-500/20 hover:text-blue-300 hover:border-blue-400 disabled:opacity-40 disabled:cursor-not-allowed"
+                                >
+                                    {fetchModelsLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                                    {t('providers.fetchModels', '获取模型')}
+                                </button>
+                            </div>
+                        </div>
+                        {testResult && (
+                            <div className={`text-xs px-1 ${testResult.success ? 'text-green-500' : 'text-red-500'}`}>
+                                {testResult.success
+                                    ? t('providers.test_connectivity_success', { latency: testResult.latencyMs })
+                                    : t('providers.test_connectivity_failed', { error: testResult.error?.substring(0, 100) })
+                                }
+                            </div>
+                        )}
+                        
+                        <div className="grid grid-cols-2 gap-x-4 gap-y-3">
+                            {/* We maintain only the original 4 models to match what the user expected */}
+                            <ModelComboBox
+                                label="Sonnet Model"
+                                placeholder="claude-sonnet-4-..."
+                                value={defaultSonnetModel}
+                                onChange={(v) => setDefaultSonnetModel(v)}
+                                options={fetchedModels}
+                            />
+                            <ModelComboBox
+                                label="Opus Model"
+                                placeholder="claude-opus-4-..."
+                                value={defaultOpusModel}
+                                onChange={(v) => setDefaultOpusModel(v)}
+                                options={fetchedModels}
+                            />
+                            <ModelComboBox
+                                label="Haiku Model"
+                                placeholder="claude-haiku-..."
+                                value={defaultHaikuModel}
+                                onChange={(v) => setDefaultHaikuModel(v)}
+                                options={fetchedModels}
+                            />
+                            <ModelComboBox
+                                label={t('providers.reasoningModel', '推理模型 (Thinking)')}
+                                placeholder="claude-sonnet-4-..."
+                                value={defaultReasoningModel}
+                                onChange={(v) => setDefaultReasoningModel(v)}
+                                options={fetchedModels}
+                            />
+                        </div>
+                    </div>
+
+                    {/* 标签 */}
+                    <div className="space-y-2 pt-2">
+                        <LabelText>{t('providers.tags', '标签')}</LabelText>
+                        <TagInput
+                            tags={tags}
+                            onChange={setTags}
+                            placeholder={t('providers.tagPlaceholder', '输入标签后回车添加')}
+                        />
+                    </div>
+
+                    {/* 描述 */}
+                    <div className="space-y-2 pt-2">
+                        <LabelText>{t('providers.field_description', '描述')}</LabelText>
+                        <textarea
+                            className="flex min-h-[60px] w-full rounded-md border border-gray-300 dark:border-slate-700 bg-white dark:bg-slate-900/50 px-3 py-2 text-sm text-gray-900 dark:text-slate-200 shadow-sm placeholder:text-gray-400 dark:placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-blue-500"
+                            placeholder={t('providers.desc_placeholder', '可选描述...')}
+                            rows={2}
+                            value={description}
+                            onChange={(e) => setDescription(e.target.value)}
+                        />
+                    </div>
+
+                    {/* 代理配置 */}
+                    <ProviderProxyConfigInput
+                        value={proxyConfig}
+                        onChange={setProxyConfig}
+                    />
+                </div>
+
+                {/* 右侧：生成预览 */}
+                <div className="flex-[1.1] min-w-0 flex flex-col pt-2 lg:pt-0 pb-1">
+                    <div className="flex items-center justify-between mb-4 mt-4 lg:mt-0">
+                        <LabelText className="font-bold">配置预览 (切换后完整文件内容)</LabelText>
+                    </div>
+
+                    {/* 快捷配置按钮组 */}
+                    {appType === 'claude' && (
+                        <div className="mb-4 rounded-md border border-gray-200 bg-gray-50 px-4 py-3 dark:border-slate-700/50 dark:bg-slate-800/50">
+                            <div className="space-y-3">
+                                {CLAUDE_SETTING_GROUPS.map((group) => (
+                                    <div key={group.title} className="space-y-1.5">
+                                        <div className="text-[11px] font-medium text-gray-500 dark:text-slate-400">{group.title}</div>
+                                        <div className="grid grid-cols-2 gap-x-4 gap-y-1 xl:grid-cols-3">
+                                            {group.title === '执行与性能' && (
+                                                <label className={cn(CLAUDE_SETTING_CONTROL_CLASS, "gap-2 group col-span-2 xl:col-span-1")}>
+                                                    <span className="whitespace-nowrap text-xs leading-5 text-gray-600 dark:text-slate-300" title="USE_BUILTIN_RIPGREP">Ripgrep</span>
+                                                    <select
+                                                        className="h-7 min-w-0 flex-1 rounded border border-gray-300 bg-white px-2 text-xs text-gray-900 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-blue-500 dark:border-slate-600 dark:bg-slate-900/50 dark:text-slate-200"
+                                                        value={internalSettings.ripgrepMode || ''}
+                                                        onChange={(e) => setInternalSettings((prev: any) => ({ ...prev, ripgrepMode: e.target.value }))}
+                                                    >
+                                                        <option value="">默认</option>
+                                                        <option value="builtin">强制内置 rg</option>
+                                                        <option value="system">使用系统 rg</option>
+                                                    </select>
+                                                </label>
+                                            )}
+                                            {group.toggles.map((toggle) => (
+                                                <label key={toggle.key} className={cn(CLAUDE_SETTING_CONTROL_CLASS, "cursor-pointer gap-2 group")}>
+                                                    <input
+                                                        type="checkbox"
+                                                        className="mt-px h-4 w-4 shrink-0 rounded border-gray-300 bg-white text-blue-500 focus:ring-blue-500 focus:ring-offset-white dark:border-slate-600 dark:bg-slate-900/50 dark:focus:ring-offset-slate-900"
+                                                        checked={!!internalSettings[toggle.key]}
+                                                        onChange={(e) => handleCheckboxChange(toggle.key, e.target.checked)}
+                                                    />
+                                                    <span className="min-w-0 text-xs leading-5 text-gray-600 transition-colors group-hover:text-gray-900 dark:text-slate-300 dark:group-hover:text-slate-200" title={toggle.hint}>{toggle.label}</span>
+                                                </label>
+                                            ))}
+                                        </div>
+                                    </div>
+                                ))}
+
+                                <div className="space-y-1.5">
+                                    <div className="text-[11px] font-medium text-gray-500 dark:text-slate-400">模型与限额</div>
+                                    <div className="grid grid-cols-1 gap-2 xl:grid-cols-2">
+                                        <label className={cn(CLAUDE_SETTING_CONTROL_CLASS, "gap-2 group")}>
+                                            <span className="whitespace-nowrap text-xs leading-5 text-gray-600 dark:text-slate-300">Effort Level</span>
+                                            <select
+                                                className="h-7 min-w-0 flex-1 rounded border border-gray-300 bg-white px-2 text-xs text-gray-900 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-blue-500 dark:border-slate-600 dark:bg-slate-900/50 dark:text-slate-200"
+                                                value={internalSettings.effortLevel || ''}
+                                                onChange={(e) => setInternalSettings((prev: any) => ({ ...prev, effortLevel: e.target.value }))}
+                                            >
+                                                <option value="">默认</option>
+                                                <option value="low">low</option>
+                                                <option value="medium">medium</option>
+                                                <option value="high">high</option>
+                                                <option value="max">max</option>
+                                                <option value="xhigh">xhigh</option>
+                                            </select>
+                                        </label>
+                                        {CLAUDE_NUMERIC_INPUTS.map((input) => (
+                                            <label key={input.key} className={cn(CLAUDE_SETTING_CONTROL_CLASS, "gap-2 group")}>
+                                                <span className="whitespace-nowrap text-xs leading-5 text-gray-600 dark:text-slate-300" title={input.hint}>{input.label}</span>
+                                                <input
+                                                    type="text"
+                                                    className="h-7 min-w-0 flex-1 rounded border border-gray-300 bg-white px-2 text-xs text-gray-900 placeholder:text-gray-400 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-blue-500 dark:border-slate-600 dark:bg-slate-900/50 dark:text-slate-200 dark:placeholder:text-slate-500"
+                                                    placeholder={input.placeholder}
+                                                    value={(internalSettings[input.key] as string) || ''}
+                                                    onChange={(e) => {
+                                                        const val = e.target.value.replace(/[^0-9]/g, '');
+                                                        setInternalSettings((prev: any) => ({ ...prev, [input.key]: val }));
+                                                    }}
+                                                />
+                                            </label>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                <div className="space-y-1.5">
+                                    <div className="text-[11px] font-medium text-gray-500 dark:text-slate-400">推荐手动维护</div>
+                                    <div className="grid grid-cols-1 gap-2 xl:grid-cols-2">
+                                        {CLAUDE_TEXT_INPUTS.map((input) => (
+                                            <label key={input.key} className={cn(CLAUDE_SETTING_CONTROL_CLASS, "gap-2 group", input.multiline && "items-start xl:col-span-2")}>
+                                                <span className="whitespace-nowrap text-xs leading-7 text-gray-600 dark:text-slate-300" title={input.hint}>{input.label}</span>
+                                                {input.multiline ? (
+                                                    <textarea
+                                                        className="min-h-[54px] min-w-0 flex-1 rounded border border-gray-300 bg-white px-2 py-1.5 text-xs text-gray-900 placeholder:text-gray-400 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-blue-500 dark:border-slate-600 dark:bg-slate-900/50 dark:text-slate-200 dark:placeholder:text-slate-500"
+                                                        placeholder={input.placeholder}
+                                                        value={(internalSettings[input.key] as string) || ''}
+                                                        onChange={(e) => setInternalSettings((prev: any) => ({ ...prev, [input.key]: e.target.value }))}
+                                                    />
+                                                ) : (
+                                                    <input
+                                                        type="text"
+                                                        className="h-7 min-w-0 flex-1 rounded border border-gray-300 bg-white px-2 text-xs text-gray-900 placeholder:text-gray-400 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-blue-500 dark:border-slate-600 dark:bg-slate-900/50 dark:text-slate-200 dark:placeholder:text-slate-500"
+                                                        placeholder={input.placeholder}
+                                                        value={(internalSettings[input.key] as string) || ''}
+                                                        onChange={(e) => setInternalSettings((prev: any) => ({ ...prev, [input.key]: e.target.value }))}
+                                                    />
+                                                )}
+                                            </label>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                {claudeDeprecatedFields.length > 0 && (
+                                    <div className="space-y-1.5">
+                                        <div className="text-[11px] font-medium text-amber-600 dark:text-amber-300">废弃字段</div>
+                                        <div className="flex flex-wrap gap-2">
+                                            {claudeDeprecatedFields.map((field) => (
+                                                <span
+                                                    key={field}
+                                                    className="rounded border border-amber-300 bg-amber-50 px-2 py-1 text-[11px] text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-200"
+                                                    title={`${field} 已废弃，建议确认无用后从 settings.json 手动删除`}
+                                                >
+                                                    {(CLAUDE_DEPRECATED_FIELD_LABELS[field] || field)} 已废弃
+                                                </span>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="flex flex-col gap-4">
+                        {previewData.map((file, idx) => {
+                            const stripComma = (s: string) => s.replace(/,\s*$/, '');
+                            const previewLines = file.content.split('\n');
+                            const originalSet = new Set(file.originalContent.split('\n').map(stripComma));
+                            const changedCount = previewLines.filter(line => !originalSet.has(stripComma(line))).length;
+
+                            return (
+                                <div key={idx} className="relative rounded-md border border-gray-200 dark:border-slate-700 overflow-hidden bg-gray-50 dark:bg-[#1e1e2e]">
+                                    <div className="flex items-center justify-between bg-gray-100 dark:bg-slate-800/80 px-3 py-1.5 border-b border-gray-200 dark:border-slate-700">
+                                        <span className="text-xs font-mono text-gray-600 dark:text-slate-300">{file.title}</span>
+                                        {changedCount > 0 && (
+                                            <span className="text-[10px] font-medium text-emerald-600 dark:text-emerald-400/80 bg-emerald-500/10 px-1.5 py-0.5 rounded">
+                                                {changedCount} 行变更
+                                            </span>
+                                        )}
+                                    </div>
+                                    <div className="p-0 overflow-x-auto">
+                                        {previewLines.map((line, lineIdx) => {
+                                            const isNew = !originalSet.has(stripComma(line));
+
+                                            return (
+                                                <div
+                                                    key={lineIdx}
+                                                    className={cn(
+                                                        "flex font-mono text-[13px] leading-[1.7] border-l-2",
+                                                        isNew
+                                                            ? "bg-emerald-500/10 border-l-emerald-400 text-emerald-700 dark:text-emerald-300"
+                                                            : "border-l-transparent text-gray-800 dark:text-[#cdd6f4]"
+                                                    )}
+                                                >
+                                                    <span className="select-none w-8 shrink-0 text-right pr-2 text-[11px] text-gray-400 dark:text-slate-600 leading-[1.7]">
+                                                        {lineIdx + 1}
+                                                    </span>
+                                                    <span className="px-3 whitespace-pre">{line || ' '}</span>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                </div>
+            </div>
+        </ModalDialog>
+    );
+}
+
+/** Custom styled model combo box with dropdown selection + custom text input */
+function ModelComboBox({ label, placeholder, value, onChange, options }: {
+    label: string;
+    placeholder: string;
+    value: string;
+    onChange: (v: string) => void;
+    options: string[];
+}) {
+    const [open, setOpen] = useState(false);
+    const [filter, setFilter] = useState<string | null>(null);
+    const wrapperRef = useRef<HTMLDivElement>(null);
+
+    // Close dropdown on outside click
+    useEffect(() => {
+        const handleClick = (e: MouseEvent) => {
+            if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
+                setOpen(false);
+                setFilter(null);
+            }
+        };
+        if (open) document.addEventListener('mousedown', handleClick);
+        return () => document.removeEventListener('mousedown', handleClick);
+    }, [open]);
+
+    // When filter is null → show all; when filter is a string → filter by it
+    const filtered = filter === null
+        ? options
+        : options.filter(m => m.toLowerCase().includes(filter.toLowerCase()));
+
+    const hasOptions = options.length > 0;
+
+    return (
+        <div ref={wrapperRef} className="space-y-2 relative">
+            <label className="text-[11px] font-medium leading-none text-gray-600 dark:text-slate-300">{label}</label>
+            <div className="relative">
+                <input
+                    type="text"
+                    className="flex h-9 w-full rounded-md border border-gray-300 dark:border-slate-700 bg-white dark:bg-slate-900/50 px-3 py-1 font-mono text-xs pr-8 text-gray-900 dark:text-slate-200 shadow-sm transition-colors placeholder:text-gray-400 dark:placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-blue-500"
+                    placeholder={placeholder}
+                    value={filter !== null ? filter : value}
+                    onChange={(e) => {
+                        setFilter(e.target.value);
+                        onChange(e.target.value);
+                        if (!open && hasOptions) setOpen(true);
+                    }}
+                    onFocus={() => {
+                        if (hasOptions) {
+                            setOpen(true);
+                            setFilter(null);
+                        }
+                    }}
+                />
+                {hasOptions && (
+                    <button
+                        type="button"
+                        tabIndex={-1}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 dark:text-slate-400 hover:text-gray-600 dark:hover:text-slate-200 transition-transform"
+                        style={{ transform: `translateY(-50%) rotate(${open ? 180 : 0}deg)` }}
+                        onClick={() => { setOpen(!open); setFilter(null); }}
+                    >
+                        <ChevronDown className="w-3.5 h-3.5" />
+                    </button>
+                )}
+            </div>
+            {open && hasOptions && (
+                <div className="absolute z-50 mt-1 w-full rounded-md border border-gray-200 dark:border-slate-700 bg-white dark:bg-slate-800 shadow-lg overflow-hidden">
+                    <ul className="max-h-48 overflow-y-auto py-1 text-xs font-mono">
+                        {filtered.length === 0 ? (
+                            <li className="px-3 py-2 text-gray-400 dark:text-slate-400 text-center">No matching models</li>
+                        ) : (
+                            filtered.map((m) => (
+                                <li
+                                    key={m}
+                                    className={`px-3 py-1.5 cursor-pointer hover:bg-gray-100 dark:hover:bg-slate-700 transition-colors ${m === value ? 'bg-blue-50 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400 font-semibold' : 'text-gray-700 dark:text-slate-300'}`}
+                                    onClick={() => {
+                                        onChange(m);
+                                        setOpen(false);
+                                        setFilter(null);
+                                    }}
+                                >
+                                    {m}
+                                </li>
+                            ))
+                        )}
+                    </ul>
+                </div>
+            )}
+        </div>
+    );
+}
+
+/** 标签输入组件：支持历史标签建议、输入过滤、回车/点击添加 */
+function TagInput({ tags, onChange, placeholder }: {
+    tags: string[];
+    onChange: (tags: string[]) => void;
+    placeholder: string;
+}) {
+    const { providers } = useProviderStore();
+    const [input, setInput] = useState('');
+    const [focused, setFocused] = useState(false);
+    const wrapperRef = useRef<HTMLDivElement>(null);
+
+    // 收集所有 Provider 中使用过的标签（去重 + 排序）
+    const allHistoryTags = useMemo(() => {
+        const set = new Set<string>();
+        providers.forEach(p => p.tags?.forEach(t => set.add(t)));
+        return Array.from(set).sort();
+    }, [providers]);
+
+    // 根据输入过滤建议（排除已选中的）
+    const suggestions = useMemo(() => {
+        const available = allHistoryTags.filter(t => !tags.includes(t));
+        const q = input.trim().toLowerCase();
+        if (!q) return available;
+        return available.filter(t => t.toLowerCase().includes(q));
+    }, [allHistoryTags, tags, input]);
+
+    const addTag = (tag: string) => {
+        const v = tag.trim();
+        if (v && !tags.includes(v)) {
+            onChange([...tags, v]);
+        }
+        setInput('');
+    };
+
+    const removeTag = (tag: string) => {
+        onChange(tags.filter(t => t !== tag));
+    };
+
+    // 点击外部关闭建议
+    useEffect(() => {
+        const handler = (e: MouseEvent) => {
+            if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
+                setFocused(false);
+            }
+        };
+        document.addEventListener('mousedown', handler);
+        return () => document.removeEventListener('mousedown', handler);
+    }, []);
+
+    const showSuggestions = focused && suggestions.length > 0;
+
+    return (
+        <div ref={wrapperRef} className="space-y-2">
+            {/* 输入框 */}
+            <div className="relative">
+                <input
+                    type="text"
+                    className="flex h-9 w-full rounded-md border border-gray-300 dark:border-slate-700 bg-white dark:bg-slate-900/50 px-3 py-1 text-sm text-gray-900 dark:text-slate-200 shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-blue-500"
+                    placeholder={placeholder}
+                    value={input}
+                    onChange={(e) => setInput(e.target.value)}
+                    onFocus={() => setFocused(true)}
+                    onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                            e.preventDefault();
+                            addTag(input);
+                        }
+                    }}
+                />
+                {/* 建议下拉 */}
+                {showSuggestions && (
+                    <div className="absolute z-50 mt-1 w-full rounded-md border border-gray-200 dark:border-slate-700 bg-white dark:bg-slate-800 shadow-lg overflow-hidden">
+                        <ul className="max-h-36 overflow-y-auto py-1">
+                            {suggestions.map((tag) => (
+                                <li
+                                    key={tag}
+                                    className="px-3 py-1.5 text-xs text-gray-700 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700 hover:text-gray-900 dark:hover:text-slate-100 cursor-pointer transition-colors"
+                                    onMouseDown={(e) => {
+                                        e.preventDefault();
+                                        addTag(tag);
+                                    }}
+                                >
+                                    {tag}
+                                </li>
+                            ))}
+                        </ul>
+                    </div>
+                )}
+            </div>
+
+            {/* 已选标签 + 快捷历史标签 */}
+            <div className="flex flex-wrap gap-1.5">
+                {tags.map((tag) => (
+                    <span
+                        key={tag}
+                        className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-blue-500/15 text-blue-400 border border-blue-500/25"
+                    >
+                        {tag}
+                        <button
+                            type="button"
+                            onClick={() => removeTag(tag)}
+                            className="hover:text-blue-300 focus:outline-none"
+                        >
+                            <X className="w-3 h-3" />
+                        </button>
+                    </span>
+                ))}
+                {/* 未选中的历史标签，作为快捷添加 */}
+                {allHistoryTags
+                    .filter(t => !tags.includes(t))
+                    .map((tag) => (
+                        <button
+                            key={tag}
+                            type="button"
+                            onClick={() => addTag(tag)}
+                            className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-gray-100 dark:bg-slate-700/40 text-gray-500 dark:text-slate-500 border border-gray-200 dark:border-slate-600/30 hover:bg-gray-200 dark:hover:bg-slate-700/70 hover:text-gray-700 dark:hover:text-slate-300 hover:border-gray-300 dark:hover:border-slate-500/50 transition-colors"
+                        >
+                            <Plus className="w-2.5 h-2.5" />
+                            {tag}
+                        </button>
+                    ))
+                }
+            </div>
+        </div>
+    );
+}

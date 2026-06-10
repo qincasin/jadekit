@@ -1,0 +1,202 @@
+import { createHashRouter, RouterProvider } from 'react-router-dom';
+import './App.css';
+import Layout from './components/layout/Layout';
+import Dashboard from './pages/Dashboard';
+import { lazy, Suspense } from 'react';
+import ThemeManager from './components/common/ThemeManager';
+import { DeepLinkImportDialog } from './components/providers/DeepLinkImportDialog';
+import { useEffect } from 'react';
+import { useConfigStore } from './stores/useConfigStore';
+import { useTokenStore } from './stores/useTokenStore';
+import { useAboutStore } from './stores/useAboutStore';
+import { useTranslation } from 'react-i18next';
+import { listen } from '@tauri-apps/api/event';
+import { showToast } from './components/common/ToastContainer';
+import { UpdateInfo } from './types/about';
+
+
+// 懒加载非首屏页面，减少 Dashboard 切换到其他页面时的渲染开销
+const ClaudePage = lazy(() => import('./pages/ClaudePage'));
+const AntigravityPage = lazy(() => import('./pages/AntigravityPage'));
+const ProvidersPage = lazy(() => import('./pages/ProvidersPage'));
+const McpPage = lazy(() => import('./pages/McpPage'));
+const PromptsPage = lazy(() => import('./pages/PromptsPage'));
+const SkillsPage = lazy(() => import('./pages/SkillsPage'));
+const SubagentsPage = lazy(() => import('./pages/SubagentsPage'));
+const WorkspacesPage = lazy(() => import('./pages/WorkspacesPage'));
+const Settings = lazy(() => import('./pages/Settings'));
+const ProxyPage = lazy(() => import('./pages/ProxyPage'));
+const UsagePage = lazy(() => import('./pages/UsagePage'));
+
+function SuspenseWrapper({ children }: { children: React.ReactNode }) {
+  return <Suspense fallback={<div className="h-full w-full flex items-center justify-center"><span className="loading loading-spinner loading-sm"></span></div>}>{children}</Suspense>;
+}
+
+const router = createHashRouter([
+  {
+    path: '/',
+    element: <Layout />,
+    children: [
+      {
+        index: true,
+        element: <Dashboard />,
+      },
+      {
+        path: 'claude',
+        element: <SuspenseWrapper><ClaudePage /></SuspenseWrapper>,
+      },
+      {
+        path: 'antigravity',
+        element: <SuspenseWrapper><AntigravityPage /></SuspenseWrapper>,
+      },
+      {
+        path: 'providers',
+        element: <SuspenseWrapper><ProvidersPage /></SuspenseWrapper>,
+      },
+      {
+        path: 'proxy',
+        element: <SuspenseWrapper><ProxyPage /></SuspenseWrapper>,
+      },
+      {
+        path: 'workspaces',
+        element: <SuspenseWrapper><WorkspacesPage /></SuspenseWrapper>,
+      },
+      {
+        path: 'mcp',
+        element: <SuspenseWrapper><McpPage /></SuspenseWrapper>,
+      },
+      {
+        path: 'prompts',
+        element: <SuspenseWrapper><PromptsPage /></SuspenseWrapper>,
+      },
+      {
+        path: 'skills',
+        element: <SuspenseWrapper><SkillsPage /></SuspenseWrapper>,
+      },
+      {
+        path: 'subagents',
+        element: <SuspenseWrapper><SubagentsPage /></SuspenseWrapper>,
+      },
+      {
+        path: 'usage',
+        element: <SuspenseWrapper><UsagePage /></SuspenseWrapper>,
+      },
+      {
+        path: 'settings',
+        element: <SuspenseWrapper><Settings /></SuspenseWrapper>,
+      },
+    ],
+  },
+]);
+
+function App() {
+  const { config, loadConfig } = useConfigStore();
+  const { i18n } = useTranslation();
+
+  useEffect(() => {
+    loadConfig();
+  }, [loadConfig]);
+
+  // Sync language from config
+  useEffect(() => {
+    if (config?.language) {
+      i18n.changeLanguage(config.language);
+    }
+  }, [config?.language, i18n]);
+
+  // 预热 Claude token 数据，减少从 Dashboard 切换时的首屏卡顿
+  useEffect(() => {
+    const warmup = () => {
+      void useTokenStore.getState().loadTokens();
+    };
+
+    if ('requestIdleCallback' in window) {
+      const idleId = (window as any).requestIdleCallback(warmup, { timeout: 1500 });
+      return () => (window as any).cancelIdleCallback?.(idleId);
+    }
+
+    const timer = globalThis.setTimeout(warmup, 300);
+    return () => globalThis.clearTimeout(timer);
+  }, []);
+
+  // 预热工具版本数据 + 初始化事件监听
+  useEffect(() => {
+    const warmup = () => {
+      useAboutStore.getState().initEventListeners();
+      void useAboutStore.getState().fetchToolVersions();
+    };
+
+    if ('requestIdleCallback' in window) {
+      const idleId = (window as any).requestIdleCallback(warmup, { timeout: 3000 });
+      return () => (window as any).cancelIdleCallback?.(idleId);
+    }
+
+    const timer = globalThis.setTimeout(warmup, 500);
+    return () => globalThis.clearTimeout(timer);
+  }, []);
+
+  // 监听后端推送的自动更新事件
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    
+    const setupListener = async () => {
+      unlisten = await listen<UpdateInfo>('auto-update-available', (event) => {
+        const info = event.payload;
+        showToast(
+          `${i18n.t('about.update_available')}\nv${info.latestVersion}`,
+          'info',
+          8000,
+          () => {
+            window.location.hash = '/settings?tab=about';
+          }
+        );
+      });
+    };
+
+    setupListener();
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [i18n]);
+
+  // Native shell actions, e.g. tray menu "Settings".
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+
+    const setupListener = async () => {
+      unlisten = await listen<string>('navigate-to-route', (event) => {
+        if (event.payload.startsWith('/')) {
+          window.location.hash = event.payload;
+        }
+      });
+    };
+
+    setupListener();
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  // macOS convention: Command+, opens Preferences/Settings while the app is focused.
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.metaKey && event.key === ',') {
+        event.preventDefault();
+        window.location.hash = '/settings';
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  return (
+    <>
+      <ThemeManager />
+      <DeepLinkImportDialog />
+      <RouterProvider router={router} />
+    </>
+  );
+}
+
+export default App;

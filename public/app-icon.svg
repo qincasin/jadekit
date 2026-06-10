@@ -1,0 +1,38 @@
+<svg width="512" height="512" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bgGrad" x1="4" y1="4" x2="36" y2="36" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#042F2E" />
+      <stop offset="52%" stop-color="#0F766E" />
+      <stop offset="100%" stop-color="#22C55E" />
+    </linearGradient>
+    <linearGradient id="jadeGrad" x1="10" y1="8" x2="30" y2="31" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ECFDF5" />
+      <stop offset="45%" stop-color="#5EEAD4" />
+      <stop offset="100%" stop-color="#10B981" />
+    </linearGradient>
+    <linearGradient id="edgeGrad" x1="12" y1="10" x2="29" y2="28" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F0FDFA" />
+      <stop offset="100%" stop-color="#A7F3D0" />
+    </linearGradient>
+    <filter id="markShadow" x="4" y="4" width="32" height="32" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="1.4" stdDeviation="1.4" flood-color="#022C22" flood-opacity="0.42" />
+    </filter>
+    <clipPath id="bgClip">
+      <rect width="40" height="40" rx="10" />
+    </clipPath>
+  </defs>
+  <g transform="translate(5.2 5.2) scale(0.74)">
+    <g clip-path="url(#bgClip)">
+      <rect width="40" height="40" rx="10" fill="url(#bgGrad)" />
+      <path d="M3 30L30 3H40V11L11 40H3V30Z" fill="#ECFDF5" opacity="0.08" />
+      <path d="M0 11L11 0H24L0 24V11Z" fill="#99F6E4" opacity="0.11" />
+    </g>
+    <g filter="url(#markShadow)">
+      <path d="M20 7.5L30.5 14.2L26.5 28.4L20 32.5L13.5 28.4L9.5 14.2L20 7.5Z" fill="url(#jadeGrad)" />
+      <path d="M20 7.5L30.5 14.2L26.5 28.4L20 32.5L13.5 28.4L9.5 14.2L20 7.5Z" stroke="url(#edgeGrad)" stroke-width="1.1" stroke-linejoin="round" />
+      <path d="M9.5 14.2H30.5M13.5 28.4L20 14.2L26.5 28.4M20 7.5V14.2M20 32.5V14.2" stroke="#064E3B" stroke-opacity="0.28" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" />
+      <path d="M15.1 17.2V22.2C15.1 24.3 14 25.5 12.3 25.5" stroke="#F0FDFA" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+      <path d="M19.8 25.4V16.8M19.8 21L25.9 16.8M22.4 20.7L26.8 25.4" stroke="#F0FDFA" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+    </g>
+  </g>
+</svg>
