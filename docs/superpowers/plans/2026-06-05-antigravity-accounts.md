@@ -1,3 +1,4 @@
+{% raw %}
 # Antigravity Account Management Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -2005,3 +2006,5 @@ git commit -m "fix(antigravity): integration testing fixes"
 - [x] `AntigravityQuotaData` fields match between Rust and TypeScript
 - [x] Command names consistent: `ag_*` prefix used throughout commands (Task 4) and store (Task 6)
 - [x] camelCase in TypeScript ↔ snake_case in Rust (serde handles conversion)
+
+{% endraw %}
