@@ -25,6 +25,7 @@
 
 无论你是独立开发者还是多项目维护者，JadeKit 让你：
 - 一键切换 API Key 和服务商，告别手动编辑环境变量
+- 管理多个 Antigravity（Google Cloud Code）账号，自动刷新 Token 和监控配额
 - 通过内置本地代理透明转发和加速 API 请求
 - 在图形界面中管理 MCP 服务器、Prompt 预设、技能和子代理
 - 统一查看多个 AI 工具的用量统计和会话记录
@@ -35,6 +36,18 @@
 - 表格/卡片双视图展示，支持搜索、排序、拖拽排序
 - 一键切换活跃 Provider，自动写入对应工具的配置文件
 - 支持 Deep Link 一键导入 Provider（`jadekit://` 和 `ccswitch://`）
+
+### 🛡️ Antigravity 账号管理
+- **多账号统一管理**：支持添加、切换、禁用/启用多个 Antigravity（Google Cloud Code）账号
+- **OAuth 浏览器登录**：集成 Google OAuth2 流程，一键授权添加新账号
+- **Token 自动刷新**：自动检测 Token 过期并刷新，保持连接可用
+- **配额实时监控**：查看每个账号的模型配额余量（百分比），配额低于阈值自动告警
+- **订阅层级识别**：自动识别 FREE / PRO / ULTRA 订阅等级，按层级筛选账号
+- **账号预热**：一键预热账号，激活 Token 确保可用性
+- **批量操作**：批量删除、批量刷新配额、批量预热
+- **一键导入**：从已有 Manager 配置中批量导入账号
+- **操作日志**：记录所有账号操作历史，便于审计追踪
+- **卡片/列表双视图**：灵活切换展示模式
 
 ### 🌐 内置本地代理服务器
 - 基于 Rust + Axum 构建的高性能 HTTP 反向代理
@@ -92,7 +105,7 @@
 | 后端 | Rust (edition 2021) · Tauri 2 |
 | 网络 | Axum 0.8 · Hyper 1 · Tokio · Reqwest 0.12 |
 | 存储 | SQLite (rusqlite) · serde + serde_json |
-| 其他 | arboard (剪贴板) · sysinfo · chrono · WebDAAV |
+| 其他 | arboard (剪贴板) · sysinfo · chrono · WebDAV |
 
 ## 项目结构
 
@@ -102,6 +115,7 @@ src/                              # React 前端
 ├── pages/                        # 页面组件
 │   ├── Dashboard.tsx             # 统计概览、活跃度、项目列表
 │   ├── ClaudePage.tsx            # API Token 管理
+│   ├── AntigravityPage.tsx       # Antigravity 账号管理
 │   ├── ProvidersPage.tsx         # 多服务商统一管理
 │   ├── ProxyPage.tsx             # 本地代理配置与监控
 │   ├── McpPage.tsx               # MCP 服务器管理
@@ -110,7 +124,6 @@ src/                              # React 前端
 │   ├── SubagentsPage.tsx         # 子代理管理
 │   ├── WorkspacesPage.tsx        # 工作区管理
 │   ├── UsagePage.tsx             # 用量统计
-│   ├── AntigravityPage.tsx       # Antigravity 账号管理
 │   └── Settings.tsx              # 设置（主题、语言、备份、更新）
 ├── components/                   # 组件
 │   ├── layout/                   # 布局 (Layout, Navbar)
@@ -120,7 +133,7 @@ src/                              # React 前端
 │   ├── mcp/                      # MCP 相关组件
 │   ├── settings/                 # 设置相关组件
 │   ├── dashboard/                # 仪表盘组件
-│   ├── antigravity/              # Antigravity 组件
+│   ├── antigravity/              # Antigravity 账号组件
 │   └── usage/                    # 用量组件
 ├── stores/                       # Zustand 状态管理
 ├── locales/                      # i18n 翻译 (zh.json / en.json)
@@ -151,11 +164,12 @@ src-tauri/src/                    # Rust 后端
 │   ├── subagent.rs               # 子代理
 │   ├── proxy.rs                  # 代理配置
 │   ├── usage.rs                  # 用量统计
-│   └── antigravity.rs            # Antigravity 账号
+│   └── antigravity.rs            # Antigravity 账号 + 配额 + 操作日志
 ├── services/                     # 业务逻辑层
 │   ├── proxy_service.rs          # 代理生命周期管理
 │   ├── provider_service.rs       # Provider 配置读写
 │   ├── token_service.rs          # Token CRUD + 切换
+│   ├── antigravity_service.rs    # Antigravity OAuth / Token / 配额 / 预热
 │   ├── mcp_service.rs            # MCP 配置同步
 │   ├── prompt_service.rs / _v2   # Prompt 管理 (文件 + 数据库)
 │   ├── skill_service.rs / _v2    # 技能管理
@@ -250,11 +264,12 @@ npm run bump major "重大更新"    # x: 1.0.0 → 2.0.0
 
 ## Overview
 
-**JadeKit** is a cross-platform desktop app that provides unified configuration management for AI CLI tools like Claude Code, Codex CLI, and Gemini CLI. It offers a seamless GUI to manage API keys, local proxies, MCP servers, prompts, skills, subagents, and usage stats — without ever touching dotfiles.
+**JadeKit** is a cross-platform desktop app that provides unified configuration management for AI CLI tools like Claude Code, Codex CLI, and Gemini CLI. It offers a seamless GUI to manage API keys, Antigravity accounts, local proxies, MCP servers, prompts, skills, subagents, and usage stats — without ever touching dotfiles.
 
 ### Highlights
 
 - **Multi-Provider Management** — One-click switching between API providers (official, Azure, third-party proxies) with table/card dual views and drag-and-drop reordering
+- **Antigravity Account Management** — Manage multiple Google Cloud Code (Antigravity) accounts with OAuth browser login, automatic token refresh, real-time quota monitoring, tier detection (FREE/PRO/ULTRA), account warmup, batch operations, and operation logs
 - **Built-in Rust Proxy** — High-performance local reverse proxy (Axum + Hyper) with health checks, circuit breaker, failover, model mapping, and thinking budget rectification
 - **MCP Integration** — Visual MCP server management with cross-tool sync (Claude / Codex / Gemini)
 - **Prompt / Skill / Subagent** — Full CRUD with workspace-level distribution and cross-app sync
