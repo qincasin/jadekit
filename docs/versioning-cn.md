@@ -56,7 +56,7 @@ npm run bump 1.1.0-SNAPSHOT minor "开始下一个功能版本"
 - `src-tauri/Cargo.toml`
 - `src-tauri/Cargo.lock`
 - `src-tauri/tauri.conf.json`
-- `website/src/pages/Changelog.tsx`
+- `CHANGELOG.md`
 
 除非用户明确要求做一次性修正，否则不要手动分散修改这些版本号。
 

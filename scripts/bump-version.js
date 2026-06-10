@@ -19,7 +19,7 @@
  * - src-tauri/Cargo.toml
  * - src-tauri/Cargo.lock
  * - src-tauri/tauri.conf.json
- * - website/src/pages/Changelog.tsx (新增版本条目)
+ * - CHANGELOG.md (新增版本条目)
  *
  * 脚本会生成 git tag 消息模板，可用于 GitHub Release
  *
@@ -156,51 +156,55 @@ function incrementVersion(currentVersion, releaseType) {
   }
 }
 
-// 更新 Changelog.tsx
+function getChangelogSectionTitle(releaseType) {
+  switch (releaseType) {
+    case 'major': return 'Added';
+    case 'minor': return 'Added';
+    case 'patch': return 'Fixed';
+    default: return 'Improved';
+  }
+}
+
+// 更新 CHANGELOG.md
 function updateChangelog(version, type, description) {
-  const changelogPath = path.join(rootDir, 'website', 'src', 'pages', 'Changelog.tsx');
+  const changelogPath = path.join(rootDir, 'CHANGELOG.md');
 
   if (!fs.existsSync(changelogPath)) {
-    log(colors.yellow, `  ⚠️  Changelog.tsx 不存在，跳过更新`);
+    log(colors.yellow, `  ⚠️  CHANGELOG.md 不存在，跳过更新`);
     return null;
   }
 
   let content = fs.readFileSync(changelogPath, 'utf-8');
+  if (new RegExp(`^## \\[${version.replace(/\./g, '\\.')}\\]`, 'm').test(content)) {
+    log(colors.yellow, `  ⚠️  CHANGELOG.md 已存在 ${version} 条目，跳过更新`);
+    return null;
+  }
 
   // 获取当前日期
   const today = new Date();
   const dateStr = today.toISOString().split('T')[0]; // YYYY-MM-DD
 
   // 构建新版本条目
-  const newVersionEntry = `  {
-    version: '${version}',
-    date: '${dateStr}',
-    type: '${type}',${description ? `
-    changes: [
-      { type: '${getTypeChangeType(type)}', text: "${description}" }
-    ]` : ''}
-  },`;
+  const sectionTitle = getChangelogSectionTitle(type);
+  const changeText = description || '待补充';
+  const newVersionEntry = `## [${version}] - ${dateStr}
 
-  // 查找 versions 数组的开始位置
-  const versionsArrayStart = content.indexOf('const versions: Version[] = [');
-  if (versionsArrayStart === -1) {
-    log(colors.yellow, `  ⚠️  无法找到 versions 数组，跳过 Changelog 更新`);
-    return null;
-  }
+### ${sectionTitle}
+- ${changeText}
 
-  // 查找第一个版本条目的位置
-  const firstVersionStart = content.indexOf('{\n    version:', versionsArrayStart);
-  if (firstVersionStart === -1) {
-    log(colors.yellow, `  ⚠️  无法找到版本条目，跳过 Changelog 更新`);
+`;
+
+  const titleMatch = content.match(/^#\s+Changelog\s*\n+/);
+  if (!titleMatch) {
+    log(colors.yellow, `  ⚠️  无法找到 CHANGELOG.md 标题，跳过 Changelog 更新`);
     return null;
   }
 
   // 插入新版本条目
   const newContent =
-    content.slice(0, firstVersionStart) +
+    content.slice(0, titleMatch[0].length) +
     newVersionEntry +
-    '\n' +
-    content.slice(firstVersionStart);
+    content.slice(titleMatch[0].length);
 
   fs.writeFileSync(changelogPath, newContent, 'utf-8');
 
@@ -390,7 +394,7 @@ async function main() {
   // 显示后续步骤
   log(colors.cyan, '📝 更新后的后续步骤:\n');
   log(colors.reset, '  1. 检查修改的文件');
-  log(colors.reset, '  2. 补充 Changelog.tsx 中的更新内容（如需要）');
+  log(colors.reset, '  2. 补充 CHANGELOG.md 中的更新内容（如需要）');
   log(colors.reset, `  3. 提交更改: git add . && git commit -m "chore: bump version to ${newVersion}"`);
   log(colors.reset, `  4. 创建 tag: git tag -a v${newVersion} -m "$(cat <<'EOF'\n${tagMessage}\nEOF\n)"`);
   log(colors.reset, `  5. 推送: git push origin main && git push origin v${newVersion}`);
@@ -426,7 +430,7 @@ async function main() {
   log(colors.green, '\n✨ 版本号更新完成！\n');
   log(colors.cyan, '📌 下一步:\n');
   log(colors.reset, '  查看修改: git diff');
-  log(colors.reset, `  补充 Changelog 后提交: git add . && git commit -m "chore: bump version to ${newVersion}"\n`);
+  log(colors.reset, `  补充 CHANGELOG.md 后提交: git add . && git commit -m "chore: bump version to ${newVersion}"\n`);
 }
 
 main().catch((error) => {

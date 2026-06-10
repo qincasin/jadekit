@@ -56,7 +56,7 @@ Or ask the agent to run it. The agent should confirm:
 - `src-tauri/Cargo.toml`
 - `src-tauri/Cargo.lock`
 - `src-tauri/tauri.conf.json`
-- `website/src/pages/Changelog.tsx`
+- `CHANGELOG.md`
 
 Do not hand-edit these version values across files unless the user explicitly asks for a one-off correction.
 

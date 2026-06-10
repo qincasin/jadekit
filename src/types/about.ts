@@ -30,4 +30,5 @@ export interface InstallProgress {
 export interface SourceUpdateInfo {
     repo: string;
     updateInfo: UpdateInfo;
+    error: string | null;
 }
