@@ -144,6 +144,7 @@ pub fn close_antigravity(timeout_secs: u64, target_ide: Option<&str>) -> Result<
 
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         let pids = get_antigravity_pids(target_ide);
         for pid in &pids {
             let _ = Command::new("taskkill")
@@ -791,16 +792,3 @@ pub fn execute_local_switch(
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
-trait CommandExt {
-    fn creation_flags(&mut self, flags: u32) -> &mut Command;
-}
-
-#[cfg(target_os = "windows")]
-impl CommandExt for Command {
-    fn creation_flags(&mut self, flags: u32) -> &mut Command {
-        use std::os::windows::process::CommandExt;
-        self.as_std().creation_flags(flags);
-        self
-    }
-}
