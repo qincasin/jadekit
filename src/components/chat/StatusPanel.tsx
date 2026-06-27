@@ -1,4 +1,4 @@
-import {type KeyboardEvent, type ReactNode, useEffect, useMemo, useState} from 'react';
+import {type KeyboardEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
     Activity,
     AlertTriangle,
@@ -632,25 +632,91 @@ export default function StatusPanel({
         return defaultOrder;
     });
     const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
+    const [dropTargetIndex, setDropTargetIndex] = useState<number | null>(null);
+    const cardRefs = useRef<(HTMLDivElement | null)[]>([]);
+    const isDraggingRef = useRef(false);
+    const dragSourceIndexRef = useRef<number | null>(null);
+    // Snapshot of card midpoints captured at drag start — immune to animation layout shifts
+    const cardMidpointsRef = useRef<number[]>([]);
+    const dropTargetRef = useRef<number | null>(null);
 
-    const handleDragStart = (e: React.DragEvent, index: number) => {
-        e.dataTransfer.effectAllowed = 'move';
+    const handleCardMouseDown = useCallback((e: React.MouseEvent, index: number) => {
+        if ((e.target as HTMLElement).closest('button')) return;
+        e.preventDefault();
+        // Snapshot all card vertical midpoints before any animation starts
+        const midpoints: number[] = [];
+        for (const el of cardRefs.current) {
+            if (el) {
+                const rect = el.getBoundingClientRect();
+                midpoints.push(rect.top + rect.height / 2);
+            } else {
+                midpoints.push(0);
+            }
+        }
+        cardMidpointsRef.current = midpoints;
+        isDraggingRef.current = true;
+        dragSourceIndexRef.current = index;
+        dropTargetRef.current = null;
         setDraggedIndex(index);
-    };
+        setDropTargetIndex(null);
+        document.body.style.cursor = 'grabbing';
+    }, []);
 
-    const handleDragEnter = (index: number) => {
-        if (draggedIndex === null || draggedIndex === index) return;
-        const newOrder = [...cardOrder];
-        const item = newOrder.splice(draggedIndex, 1)[0];
-        newOrder.splice(index, 0, item);
-        setDraggedIndex(index);
-        setCardOrder(newOrder);
-        localStorage.setItem('status-panel-card-order', JSON.stringify(newOrder));
-    };
+    useEffect(() => {
+        const handleMouseMove = (e: MouseEvent) => {
+            if (!isDraggingRef.current || dragSourceIndexRef.current === null) return;
+            const mouseY = e.clientY;
+            const midpoints = cardMidpointsRef.current;
+            // Find closest card midpoint to cursor
+            let targetIdx: number | null = null;
+            let minDist = Infinity;
+            for (let i = 0; i < midpoints.length; i++) {
+                if (i === dragSourceIndexRef.current) continue;
+                const dist = Math.abs(mouseY - midpoints[i]);
+                if (dist < minDist) {
+                    minDist = dist;
+                    targetIdx = i;
+                }
+            }
+            // Only register as target if cursor is reasonably close (within 120px of midpoint)
+            if (targetIdx !== null && minDist > 120) {
+                targetIdx = null;
+            }
+            if (targetIdx !== dropTargetRef.current) {
+                dropTargetRef.current = targetIdx;
+                setDropTargetIndex(targetIdx);
+            }
+        };
 
-    const handleDragEnd = () => {
-        setDraggedIndex(null);
-    };
+        const handleMouseUp = () => {
+            if (!isDraggingRef.current) return;
+            isDraggingRef.current = false;
+            document.body.style.cursor = '';
+            const srcIdx = dragSourceIndexRef.current;
+            const tgtIdx = dropTargetRef.current;
+            dragSourceIndexRef.current = null;
+            dropTargetRef.current = null;
+            cardMidpointsRef.current = [];
+            setDraggedIndex(null);
+            setDropTargetIndex(null);
+            if (srcIdx === null || tgtIdx === null || srcIdx === tgtIdx) return;
+            setCardOrder(prev => {
+                const newOrder = [...prev];
+                const item = newOrder.splice(srcIdx, 1)[0];
+                newOrder.splice(tgtIdx, 0, item);
+                localStorage.setItem('status-panel-card-order', JSON.stringify(newOrder));
+                return newOrder;
+            });
+        };
+
+        document.addEventListener('mousemove', handleMouseMove);
+        document.addEventListener('mouseup', handleMouseUp);
+        return () => {
+            document.removeEventListener('mousemove', handleMouseMove);
+            document.removeEventListener('mouseup', handleMouseUp);
+            document.body.style.cursor = '';
+        };
+    }, []);
     const [expandedTurns, setExpandedTurns] = useState<Record<string, boolean>>({});
     const treeNodes = useMemo(() => buildOutlineTree(messages), [messages]);
 
@@ -1431,34 +1497,42 @@ export default function StatusPanel({
             <div className="min-h-0 flex-1 overflow-y-auto space-y-3 p-2 text-xs text-base-content/60 scrollbar-thin">
                 {cardOrder.map((cardId, index) => {
                     const isDragging = draggedIndex === index;
-                    const dragProps = {
-                        onDragOver: (e: React.DragEvent) => e.preventDefault(),
-                        onDragEnter: () => handleDragEnter(index),
+                    const isDropTarget = dropTargetIndex === index && draggedIndex !== null && draggedIndex !== index;
+                    const isInsertAbove = isDropTarget && draggedIndex > index;
+                    const isInsertBelow = isDropTarget && draggedIndex < index;
+                    const dragWrapperProps = {
+                        ref: (el: HTMLDivElement | null) => { cardRefs.current[index] = el; },
                         className: cn(
-                            "relative transition-opacity duration-150",
-                            isDragging && "opacity-35"
-                        )
+                            "relative transition-all duration-200 ease-out rounded-md",
+                            isDragging && "opacity-30 scale-[0.97]",
+                            isInsertAbove && "mt-8",
+                            isInsertBelow && "mb-8"
+                        ),
+                        style: isDropTarget ? {
+                            boxShadow: isInsertAbove
+                                ? 'inset 0 3px 0 0 hsl(var(--p) / 0.7)'
+                                : 'inset 0 -3px 0 0 hsl(var(--p) / 0.7)'
+                        } : undefined
                     };
 
                     if (cardId === 'session-status') {
                         return (
-                            <div key="session-status" {...dragProps}>
+                            <div key="session-status" {...dragWrapperProps}>
                                 <div className="rounded-md border border-base-300/70 bg-base-100/65 p-2 shadow-sm">
-                                    <div className="mb-1.5 flex items-center justify-between gap-2 font-medium text-base-content/70">
-                                        <div 
-                                            draggable
-                                            onDragStart={(e) => handleDragStart(e, index)}
-                                            onDragEnd={handleDragEnd}
-                                            className="flex items-center gap-1.5 cursor-grab active:cursor-grabbing text-base-content/45 hover:text-base-content select-none min-w-0"
-                                        >
+                                    <div 
+                                        onMouseDown={(e) => handleCardMouseDown(e, index)}
+                                        className="mb-1.5 flex items-center justify-between gap-2 font-medium text-base-content/70 cursor-grab active:cursor-grabbing select-none"
+                                    >
+                                        <div className="flex items-center gap-1.5 text-base-content/45 hover:text-base-content min-w-0">
                                             <GripVertical size={12} className="flex-shrink-0 text-base-content/35 hover:text-base-content/60" />
                                             <Activity size={12} className="text-primary/70 flex-shrink-0" />
-                                            <span className="truncate">{t('chat.status.base') ?? '基本状态'}</span>
+                                            <span className="truncate">{translateWithFallback('chat.status.base', '基本状态')}</span>
                                         </div>
                                         <button
                                             type="button"
                                             className="btn btn-ghost btn-xs h-5 w-5 rounded p-0 text-base-content/40 hover:text-base-content"
                                             title={sessionStatusExpanded ? (t('chat.outline.collapse') ?? '折叠') : (t('chat.outline.expand') ?? '展开')}
+                                            onMouseDown={(e) => e.stopPropagation()}
                                             onClick={() => setSessionStatusExpanded(!sessionStatusExpanded)}
                                         >
                                             {sessionStatusExpanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
@@ -1834,15 +1908,13 @@ export default function StatusPanel({
 
                     if (cardId === 'runtime-context' && hasRuntimeContext) {
                         return (
-                            <div key="runtime-context" {...dragProps}>
+                            <div key="runtime-context" {...dragWrapperProps}>
                                 <div className="status-runtime-context rounded-md border border-base-300/70 bg-base-100/65 p-2 shadow-sm">
-                                    <div className="mb-1.5 flex items-center justify-between gap-2 font-medium text-base-content/70">
-                                        <div 
-                                            draggable
-                                            onDragStart={(e) => handleDragStart(e, index)}
-                                            onDragEnd={handleDragEnd}
-                                            className="flex items-center gap-1.5 cursor-grab active:cursor-grabbing text-base-content/45 hover:text-base-content select-none min-w-0"
-                                        >
+                                    <div 
+                                        onMouseDown={(e) => handleCardMouseDown(e, index)}
+                                        className="mb-1.5 flex items-center justify-between gap-2 font-medium text-base-content/70 cursor-grab active:cursor-grabbing select-none"
+                                    >
+                                        <div className="flex items-center gap-1.5 text-base-content/45 hover:text-base-content min-w-0">
                                             <GripVertical size={12} className="flex-shrink-0 text-base-content/35 hover:text-base-content/60" />
                                             <SlidersHorizontal size={12} className="flex-shrink-0" />
                                             <span>{runtimeContextLabel}</span>
@@ -1930,24 +2002,23 @@ export default function StatusPanel({
 
                     if (cardId === 'session-outline') {
                         return (
-                            <div key="session-outline" {...dragProps}>
+                            <div key="session-outline" {...dragWrapperProps}>
                                 <div className="rounded-md border border-base-300/70 bg-base-100/65 p-2">
-                                    <div className="mb-1.5 flex items-center justify-between gap-2">
-                                        <div 
-                                            draggable
-                                            onDragStart={(e) => handleDragStart(e, index)}
-                                            onDragEnd={handleDragEnd}
-                                            className="flex min-w-0 items-center gap-1.5 cursor-grab active:cursor-grabbing text-base-content/45 hover:text-base-content select-none"
-                                        >
+                                    <div 
+                                        onMouseDown={(e) => handleCardMouseDown(e, index)}
+                                        className="mb-1.5 flex items-center justify-between gap-2 cursor-grab active:cursor-grabbing select-none"
+                                    >
+                                        <div className="flex min-w-0 items-center gap-1.5 text-base-content/45 hover:text-base-content">
                                             <GripVertical size={12} className="flex-shrink-0 text-base-content/35 hover:text-base-content/60" />
                                             <ListTree size={12} className="text-primary/70 flex-shrink-0" />
-                                            <span className="truncate font-medium text-base-content/70">{t('chat.outline.title') ?? '会话大纲'}</span>
+                                            <span className="truncate font-medium text-base-content/70">{translateWithFallback('chat.outline.title', '会话大纲')}</span>
                                             <span className="badge badge-sm badge-ghost text-[9px] px-1 h-3.5 min-h-0 flex-shrink-0">{treeNodes.length} 轮</span>
                                         </div>
                                         <button
                                             type="button"
                                             className="btn btn-ghost btn-xs h-5 w-5 rounded p-0 text-base-content/40 hover:text-base-content"
                                             title={outlineExpanded ? (t('chat.outline.collapse') ?? '折叠导航') : (t('chat.outline.expand') ?? '展开导航')}
+                                            onMouseDown={(e) => e.stopPropagation()}
                                             onClick={() => setOutlineExpanded(!outlineExpanded)}
                                         >
                                             {outlineExpanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
@@ -2090,15 +2161,13 @@ export default function StatusPanel({
 
                     if (cardId === 'current-activity' && shouldShowCurrentActivityCard) {
                         return (
-                            <div key="current-activity" {...dragProps}>
+                            <div key="current-activity" {...dragWrapperProps}>
                                 <div className="rounded-md border border-base-300/70 bg-base-100/65 p-2">
-                                    <div className="mb-1.5 flex items-center justify-between gap-2">
-                                        <div 
-                                            draggable
-                                            onDragStart={(e) => handleDragStart(e, index)}
-                                            onDragEnd={handleDragEnd}
-                                            className="flex min-w-0 items-center gap-1.5 cursor-grab active:cursor-grabbing text-base-content/45 hover:text-base-content select-none"
-                                        >
+                                    <div 
+                                        onMouseDown={(e) => handleCardMouseDown(e, index)}
+                                        className="mb-1.5 flex items-center justify-between gap-2 cursor-grab active:cursor-grabbing select-none"
+                                    >
+                                        <div className="flex min-w-0 items-center gap-1.5 text-base-content/45 hover:text-base-content">
                                             <GripVertical size={12} className="flex-shrink-0 text-base-content/35 hover:text-base-content/60" />
                                             <Sparkles size={12} className="flex-shrink-0" />
                                             <span className="truncate font-medium text-base-content/70">{currentActivityLabel}</span>
@@ -2243,20 +2312,18 @@ export default function StatusPanel({
 
                     if (cardId === 'recent-edits' && shouldShowRecentEditsCard) {
                         return (
-                            <div key="recent-edits" {...dragProps}>
+                            <div key="recent-edits" {...dragWrapperProps}>
                                 <div className="rounded-md border border-base-300/70 bg-base-100/65 p-2">
-                                    <div className="mb-1.5 flex items-center justify-between gap-2">
-                                        <div 
-                                            draggable
-                                            onDragStart={(e) => handleDragStart(e, index)}
-                                            onDragEnd={handleDragEnd}
-                                            className="flex min-w-0 items-center gap-1.5 cursor-grab active:cursor-grabbing text-base-content/45 hover:text-base-content select-none"
-                                        >
+                                    <div 
+                                        onMouseDown={(e) => handleCardMouseDown(e, index)}
+                                        className="mb-1.5 flex items-center justify-between gap-2 cursor-grab active:cursor-grabbing select-none"
+                                    >
+                                        <div className="flex min-w-0 items-center gap-1.5 text-base-content/45 hover:text-base-content">
                                             <GripVertical size={12} className="flex-shrink-0 text-base-content/35 hover:text-base-content/60" />
                                             <FilePenLine size={12} className="flex-shrink-0" />
                                             <span className="truncate font-medium text-base-content/70">{recentEditsLabel}</span>
                                         </div>
-                                        <div className="flex min-w-0 items-center justify-end gap-1.5">
+                                        <div className="flex min-w-0 items-center justify-end gap-1.5" onMouseDown={(e) => e.stopPropagation()}>
                                             <div
                                                 className="max-w-[9rem] truncate text-right text-[10px] text-base-content/45"
                                                 title={editSummaryLabel}
@@ -2307,19 +2374,17 @@ export default function StatusPanel({
 
                     if (cardId === 'active-anchor' && activeAnchorLabel) {
                         return (
-                            <div key="active-anchor" {...dragProps}>
+                            <div key="active-anchor" {...dragWrapperProps}>
                                 <div
                                     className="rounded-md border border-base-300/70 bg-base-100/60 p-2"
                                     title={activeAnchorTargetLabel}
                                     aria-label={activeAnchorTargetLabel}
                                 >
-                                    <div className="mb-1 flex items-center justify-between gap-2">
-                                        <div 
-                                            draggable
-                                            onDragStart={(e) => handleDragStart(e, index)}
-                                            onDragEnd={handleDragEnd}
-                                            className="flex min-w-0 items-center gap-1.5 cursor-grab active:cursor-grabbing text-base-content/45 hover:text-base-content select-none"
-                                        >
+                                    <div 
+                                        onMouseDown={(e) => handleCardMouseDown(e, index)}
+                                        className="mb-1 flex items-center justify-between gap-2 cursor-grab active:cursor-grabbing select-none"
+                                    >
+                                        <div className="flex min-w-0 items-center gap-1.5 text-base-content/45 hover:text-base-content">
                                             <GripVertical size={12} className="flex-shrink-0 text-base-content/35 hover:text-base-content/60" />
                                             <span className="h-1.5 w-1.5 rounded-full bg-success/70 flex-shrink-0" />
                                             <span className="truncate font-medium text-base-content/70">{currentAnchorLabel}</span>
