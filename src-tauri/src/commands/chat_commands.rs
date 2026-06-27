@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::{AppHandle, State};
 
-use crate::chat::{ChatManager, DEFAULT_AGENT_ID};
+use crate::chat::ChatManager;
 
 /// 当前聊天工作目录的只读工作区状态。
 #[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
@@ -327,45 +327,68 @@ fn list_chat_git_branches_for_path(cwd: &Path) -> Result<Vec<ChatGitBranch>, Str
     Ok(branches)
 }
 
+/// 解析命令入参 agent_id：None 或空 → 默认 agent；否则归一化（去空白/路径分隔符）。
+fn resolve_agent_id(agent_id: Option<String>) -> crate::chat::AgentId {
+    crate::chat::sanitize_agent_id(agent_id.as_deref().unwrap_or(crate::chat::DEFAULT_AGENT_ID))
+}
+
+/// 计算某 session（= agent）的 permission 响应目录：`<permission_root>/<session_id>`。
+/// 多 agent 下每个 daemon 只读自己子目录的响应文件，故响应必须落到对应子目录。
+fn agent_permission_dir(root: &Path, session_id: &str) -> PathBuf {
+    root.join(session_id)
+}
+
 /// Send a chat message and stream the response via "chat://stream"/"chat://done".
 ///
-/// `provider` is "claude" or "codex". `command` is the ai-bridge verb, e.g.
-/// "send". `params` is the payload (message, sessionId, model, cwd, …).
-/// Returns the request id for correlating streamed events.
+/// `agent_id` 缺省回退默认 agent（兼容旧前端）。`provider` is "claude" or "codex".
+/// `command` is the ai-bridge verb, e.g. "send". `params` is the payload
+/// (message, sessionId, model, cwd, …). Returns the request id for correlating
+/// streamed events.
 #[tauri::command]
 pub async fn chat_send(
+    agent_id: Option<String>,
     provider: String,
     command: String,
     params: Value,
     state: State<'_, ChatState>,
 ) -> Result<String, String> {
+    let agent = resolve_agent_id(agent_id);
     let method = format!("{provider}.{command}");
-    // Task 5 将把 agent_id 提升为命令参数；此处临时走默认 agent 以保持编译。
-    state
-        .manager
-        .send(DEFAULT_AGENT_ID.to_string(), method, params)
-        .await
+    state.manager.send(agent, method, params).await
 }
 
-/// Abort the current in-flight turn.
+/// Abort the current in-flight turn for the given agent (`agent_id` 缺省回退默认 agent)。
 #[tauri::command]
-pub async fn chat_abort(state: State<'_, ChatState>) -> Result<(), String> {
-    state.manager.abort(DEFAULT_AGENT_ID.to_string()).await
+pub async fn chat_abort(
+    agent_id: Option<String>,
+    state: State<'_, ChatState>,
+) -> Result<(), String> {
+    let agent = resolve_agent_id(agent_id);
+    state.manager.abort(agent).await
 }
 
-/// Whether the daemon is running.
+/// Whether the given agent's daemon is running (`agent_id` 缺省回退默认 agent)。
 #[tauri::command]
-pub async fn chat_is_running(state: State<'_, ChatState>) -> Result<bool, String> {
-    Ok(state.manager.is_running(&DEFAULT_AGENT_ID.to_string()).await)
+pub async fn chat_is_running(
+    agent_id: Option<String>,
+    state: State<'_, ChatState>,
+) -> Result<bool, String> {
+    let agent = resolve_agent_id(agent_id);
+    Ok(state.manager.is_running(&agent).await)
 }
 
 /// Explicitly start the daemon (otherwise it starts lazily on first send).
+/// `agent_id` 缺省回退默认 agent。
 #[tauri::command]
-pub async fn chat_start_daemon(state: State<'_, ChatState>) -> Result<(), String> {
+pub async fn chat_start_daemon(
+    agent_id: Option<String>,
+    state: State<'_, ChatState>,
+) -> Result<(), String> {
     // A no-op send path: starting happens inside the manager's lazy init.
     // We trigger it via is_running which forces client init only on send, so
     // instead expose a dedicated warm-up by sending a heartbeat-like start.
-    state.manager.warm_up(DEFAULT_AGENT_ID.to_string()).await
+    let agent = resolve_agent_id(agent_id);
+    state.manager.warm_up(agent).await
 }
 
 /// 发送系统级桌面通知，用于聊天任务完成/失败/中断后的右下角提示。
@@ -482,10 +505,15 @@ pub async fn chat_uninstall_sdk(sdk_id: String, state: State<'_, ChatState>) -> 
     state.manager.uninstall_sdk(sdk_id).await
 }
 
-/// 重启 daemon（用于手动刷新）。
+/// 重启 daemon（用于手动刷新 / SDK 安装后）。
+/// `agent_id = None` 重启所有在跑 daemon（deps 目录共享）；指定则只重启该 agent。
 #[tauri::command]
-pub async fn chat_restart_daemon(state: State<'_, ChatState>) -> Result<(), String> {
-    state.manager.restart_daemon(None).await
+pub async fn chat_restart_daemon(
+    agent_id: Option<String>,
+    state: State<'_, ChatState>,
+) -> Result<(), String> {
+    let agent = agent_id.map(|raw| crate::chat::sanitize_agent_id(&raw));
+    state.manager.restart_daemon(agent).await
 }
 
 /// 列出 Slash 命令，用于输入框 `/` 补全。
@@ -521,8 +549,13 @@ pub async fn permission_respond_ask_user_question(
     answers: std::collections::HashMap<String, String>,
     state: State<'_, ChatState>,
 ) -> Result<(), String> {
-    let perm_dir = crate::chat::permission_dir(state.manager.app())?;
     let session_id = crate::chat::permission_response_session_id(session_id);
+    // 多 agent：响应写到该 agent 的 permission 子目录（daemon 只读自己子目录）。
+    let perm_dir = agent_permission_dir(
+        &crate::chat::permission_dir(state.manager.app())?,
+        &session_id,
+    );
+    let _ = std::fs::create_dir_all(&perm_dir);
     crate::chat::write_ask_user_question_response(&perm_dir, &session_id, &request_id, answers)
 }
 
@@ -537,8 +570,12 @@ pub async fn permission_respond_tool(
     allow: bool,
     state: State<'_, ChatState>,
 ) -> Result<(), String> {
-    let perm_dir = crate::chat::permission_dir(state.manager.app())?;
     let session_id = crate::chat::permission_response_session_id(session_id);
+    let perm_dir = agent_permission_dir(
+        &crate::chat::permission_dir(state.manager.app())?,
+        &session_id,
+    );
+    let _ = std::fs::create_dir_all(&perm_dir);
     crate::chat::write_tool_permission_response(&perm_dir, &session_id, &request_id, allow)
 }
 
@@ -665,8 +702,12 @@ pub async fn permission_respond_plan_approval(
     message: Option<String>,
     state: State<'_, ChatState>,
 ) -> Result<(), String> {
-    let perm_dir = crate::chat::permission_dir(state.manager.app())?;
     let session_id = crate::chat::permission_response_session_id(session_id);
+    let perm_dir = agent_permission_dir(
+        &crate::chat::permission_dir(state.manager.app())?,
+        &session_id,
+    );
+    let _ = std::fs::create_dir_all(&perm_dir);
     crate::chat::write_plan_approval_response(
         &perm_dir,
         &session_id,
@@ -852,6 +893,20 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn agent_permission_dir_routes_to_session_subdir() {
+        let root = PathBuf::from("/tmp/perm");
+        // 多 agent：响应文件必须落到该 agent 的 permission 子目录，daemon 才读得到。
+        assert_eq!(
+            agent_permission_dir(&root, "agent-7"),
+            PathBuf::from("/tmp/perm/agent-7")
+        );
+        assert_eq!(
+            agent_permission_dir(&root, "default"),
+            PathBuf::from("/tmp/perm/default")
+        );
+    }
 
     fn unique_test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
