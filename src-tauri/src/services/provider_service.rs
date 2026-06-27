@@ -54,6 +54,39 @@ pub fn is_official_provider(id: &str) -> bool {
     id == CLAUDE_OFFICIAL_PROVIDER_ID || id == CODEX_OFFICIAL_PROVIDER_ID
 }
 
+/// 构造仅用于触发「官方订阅清除分支」的合成 Provider。
+/// 中文注释（安全边界）：该 Provider 不入库、不携带 apikey/base_url，只作为
+/// switch 路径里的状态载体交给 sync 层，让 sync 层清除第三方供应商字段。
+fn build_official_provider(id: &str, app: AppType) -> Provider {
+    Provider {
+        id: id.to_string(),
+        name: match app {
+            AppType::Claude => "Claude 官方订阅".to_string(),
+            AppType::Codex => "Codex 官方订阅".to_string(),
+            _ => "官方订阅".to_string(),
+        },
+        app_type: app,
+        api_key: String::new(),
+        url: None,
+        default_sonnet_model: None,
+        default_opus_model: None,
+        default_haiku_model: None,
+        default_reasoning_model: None,
+        custom_params: None,
+        settings_config: None,
+        meta: None,
+        icon: None,
+        in_failover_queue: false,
+        description: None,
+        tags: None,
+        is_active: true,
+        created_at: chrono::Utc::now(),
+        last_used: Some(chrono::Utc::now()),
+        proxy_config: None,
+        one_m_context: None,
+    }
+}
+
 /// 从 Claude env 对象移除所有供应商字段（幂等：移除不存在的键是 no-op，
 /// 不触碰其他无关键）。
 fn clear_claude_provider_env(env: &mut serde_json::Map<String, serde_json::Value>) {
@@ -183,9 +216,14 @@ pub fn switch_provider_in_db(
     }
 
     // 4. 同步到应用配置
-    let active = db
-        .get_provider(provider_id)?
-        .ok_or_else(|| format!("Provider {} not found", provider_id))?;
+    // 官方订阅是合成 Provider（不在 DB），特判：构造空认证的官方 Provider，
+    // 走 sync 触发清除分支，让 CLI 回落自带 OAuth 订阅登录态。
+    let active = if is_official_provider(provider_id) {
+        build_official_provider(provider_id, app)
+    } else {
+        db.get_provider(provider_id)?
+            .ok_or_else(|| format!("Provider {} not found", provider_id))?
+    };
     sync_provider_to_app_config(&active).map_err(|e| e.to_string())?;
 
     Ok(())
@@ -1412,6 +1450,17 @@ mod tests {
         assert!(is_official_provider(CLAUDE_OFFICIAL_PROVIDER_ID));
         assert!(is_official_provider(CODEX_OFFICIAL_PROVIDER_ID));
         assert!(!is_official_provider("user-123"));
+    }
+
+    #[test]
+    fn test_build_official_provider_uses_empty_credentials() {
+        let provider = build_official_provider(CLAUDE_OFFICIAL_PROVIDER_ID, AppType::Claude);
+
+        assert!(is_official_provider(&provider.id));
+        assert_eq!(provider.app_type, AppType::Claude);
+        assert!(provider.api_key.is_empty());
+        assert!(provider.url.is_none());
+        assert!(provider.is_active);
     }
 
     #[test]
