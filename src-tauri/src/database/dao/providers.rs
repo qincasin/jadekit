@@ -12,7 +12,7 @@ impl Database {
     pub fn list_providers(&self) -> Result<Vec<Provider>, String> {
         let conn = lock_conn!(self.conn);
         let mut stmt = conn
-            .prepare("SELECT id, name, app_type, api_key, url, default_sonnet_model, default_opus_model, default_haiku_model, default_reasoning_model, custom_params, settings_config, meta, icon, in_failover_queue, description, tags, is_active, created_at, last_used, proxy_config FROM providers ORDER BY name ASC")
+            .prepare("SELECT id, name, app_type, api_key, url, default_sonnet_model, default_opus_model, default_haiku_model, default_reasoning_model, custom_params, settings_config, meta, icon, in_failover_queue, description, tags, is_active, created_at, last_used, proxy_config, one_m_context FROM providers ORDER BY name ASC")
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
         let rows = stmt
@@ -22,6 +22,7 @@ impl Database {
                 let meta_str: Option<String> = row.get(11)?;
                 let tags_str: Option<String> = row.get(15)?;
                 let proxy_config_str: Option<String> = row.get(19)?;
+                let one_m_context_str: Option<String> = row.get(20)?;
 
                 Ok(Provider {
                     id: row.get(0)?,
@@ -50,8 +51,8 @@ impl Database {
                     last_used: chrono::DateTime::<Utc>::from_timestamp(row.get::<_, i64>(18)?, 0)
                         .or_else(|| chrono::DateTime::<Utc>::from_timestamp(0, 0)),
                     proxy_config: proxy_config_str.and_then(|s| serde_json::from_str(&s).ok()),
-                    // one_m_context 不入库，读取时默认 None
-                    one_m_context: None,
+                    // 解析持久化的 1M 上下文声明（与 settings_config 同方式）
+                    one_m_context: one_m_context_str.and_then(|s| serde_json::from_str(&s).ok()),
                 })
             })
             .map_err(|e| format!("Failed to query providers: {e}"))?;
@@ -68,7 +69,7 @@ impl Database {
         let conn = lock_conn!(self.conn);
         let provider = conn
             .query_row(
-                "SELECT id, name, app_type, api_key, url, default_sonnet_model, default_opus_model, default_haiku_model, default_reasoning_model, custom_params, settings_config, meta, icon, in_failover_queue, description, tags, is_active, created_at, last_used, proxy_config FROM providers WHERE id = ?1",
+                "SELECT id, name, app_type, api_key, url, default_sonnet_model, default_opus_model, default_haiku_model, default_reasoning_model, custom_params, settings_config, meta, icon, in_failover_queue, description, tags, is_active, created_at, last_used, proxy_config, one_m_context FROM providers WHERE id = ?1",
                 rusqlite::params![id],
                 |row| {
                     let custom_params_str: Option<String> = row.get(9)?;
@@ -76,6 +77,7 @@ impl Database {
                     let meta_str: Option<String> = row.get(11)?;
                     let tags_str: Option<String> = row.get(15)?;
                     let proxy_config_str: Option<String> = row.get(19)?;
+                    let one_m_context_str: Option<String> = row.get(20)?;
 
                     Ok(Provider {
                         id: row.get(0)?,
@@ -98,8 +100,8 @@ impl Database {
                         created_at: chrono::DateTime::<Utc>::from_timestamp(row.get::<_, i64>(17)?, 0).unwrap_or_default(),
                         last_used: chrono::DateTime::<Utc>::from_timestamp(row.get::<_, i64>(18)?, 0).or_else(|| chrono::DateTime::<Utc>::from_timestamp(0, 0)),
                         proxy_config: proxy_config_str.and_then(|s| serde_json::from_str(&s).ok()),
-                        // one_m_context 不入库，读取时默认 None
-                        one_m_context: None,
+                        // 解析持久化的 1M 上下文声明（与 settings_config 同方式）
+                        one_m_context: one_m_context_str.and_then(|s| serde_json::from_str(&s).ok()),
                     })
                 },
             )
@@ -128,9 +130,11 @@ impl Database {
             .proxy_config
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
+        // 1M 上下文声明序列化为 JSON TEXT 落库（与 settings_config 同方式）
+        let one_m_context_str = serde_json::to_string(&provider.one_m_context).ok();
 
         conn.execute(
-            "INSERT OR REPLACE INTO providers (id, name, app_type, api_key, url, default_sonnet_model, default_opus_model, default_haiku_model, default_reasoning_model, custom_params, settings_config, meta, icon, in_failover_queue, description, tags, is_active, created_at, last_used, proxy_config) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            "INSERT OR REPLACE INTO providers (id, name, app_type, api_key, url, default_sonnet_model, default_opus_model, default_haiku_model, default_reasoning_model, custom_params, settings_config, meta, icon, in_failover_queue, description, tags, is_active, created_at, last_used, proxy_config, one_m_context) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             rusqlite::params![
                 provider.id,
                 provider.name,
@@ -152,6 +156,7 @@ impl Database {
                 provider.created_at.timestamp(),
                 provider.last_used.map(|dt| dt.timestamp()).unwrap_or(0),
                 proxy_config_str,
+                one_m_context_str,
             ],
         )
         .map_err(|e| format!("Failed to upsert provider: {e}"))?;
@@ -195,7 +200,7 @@ impl Database {
     pub fn list_providers_by_app(&self, app_type: &str) -> Result<Vec<Provider>, String> {
         let conn = lock_conn!(self.conn);
         let mut stmt = conn
-            .prepare("SELECT id, name, app_type, api_key, url, default_sonnet_model, default_opus_model, default_haiku_model, default_reasoning_model, custom_params, settings_config, meta, icon, in_failover_queue, description, tags, is_active, created_at, last_used, proxy_config FROM providers WHERE app_type = ?1 ORDER BY name ASC")
+            .prepare("SELECT id, name, app_type, api_key, url, default_sonnet_model, default_opus_model, default_haiku_model, default_reasoning_model, custom_params, settings_config, meta, icon, in_failover_queue, description, tags, is_active, created_at, last_used, proxy_config, one_m_context FROM providers WHERE app_type = ?1 ORDER BY name ASC")
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
         let rows = stmt
@@ -205,6 +210,7 @@ impl Database {
                 let meta_str: Option<String> = row.get(11)?;
                 let tags_str: Option<String> = row.get(15)?;
                 let proxy_config_str: Option<String> = row.get(19)?;
+                let one_m_context_str: Option<String> = row.get(20)?;
 
                 Ok(Provider {
                     id: row.get(0)?,
@@ -233,8 +239,8 @@ impl Database {
                     last_used: chrono::DateTime::<Utc>::from_timestamp(row.get::<_, i64>(18)?, 0)
                         .or_else(|| chrono::DateTime::<Utc>::from_timestamp(0, 0)),
                     proxy_config: proxy_config_str.and_then(|s| serde_json::from_str(&s).ok()),
-                    // one_m_context 不入库，读取时默认 None
-                    one_m_context: None,
+                    // 解析持久化的 1M 上下文声明（与 settings_config 同方式）
+                    one_m_context: one_m_context_str.and_then(|s| serde_json::from_str(&s).ok()),
                 })
             })
             .map_err(|e| format!("Failed to query providers by app: {e}"))?;
@@ -255,7 +261,7 @@ impl Database {
         let conn = lock_conn!(self.conn);
         let provider = conn
             .query_row(
-                "SELECT id, name, app_type, api_key, url, default_sonnet_model, default_opus_model, default_haiku_model, default_reasoning_model, custom_params, settings_config, meta, icon, in_failover_queue, description, tags, is_active, created_at, last_used, proxy_config FROM providers WHERE id = ?1 AND app_type = ?2",
+                "SELECT id, name, app_type, api_key, url, default_sonnet_model, default_opus_model, default_haiku_model, default_reasoning_model, custom_params, settings_config, meta, icon, in_failover_queue, description, tags, is_active, created_at, last_used, proxy_config, one_m_context FROM providers WHERE id = ?1 AND app_type = ?2",
                 rusqlite::params![id, app_type],
                 |row| {
                     let custom_params_str: Option<String> = row.get(9)?;
@@ -263,6 +269,7 @@ impl Database {
                     let meta_str: Option<String> = row.get(11)?;
                     let tags_str: Option<String> = row.get(15)?;
                     let proxy_config_str: Option<String> = row.get(19)?;
+                    let one_m_context_str: Option<String> = row.get(20)?;
 
                     Ok(Provider {
                         id: row.get(0)?,
@@ -285,8 +292,8 @@ impl Database {
                         created_at: chrono::DateTime::<Utc>::from_timestamp(row.get::<_, i64>(17)?, 0).unwrap_or_default(),
                         last_used: chrono::DateTime::<Utc>::from_timestamp(row.get::<_, i64>(18)?, 0).or_else(|| chrono::DateTime::<Utc>::from_timestamp(0, 0)),
                         proxy_config: proxy_config_str.and_then(|s| serde_json::from_str(&s).ok()),
-                        // one_m_context 不入库，读取时默认 None
-                        one_m_context: None,
+                        // 解析持久化的 1M 上下文声明（与 settings_config 同方式）
+                        one_m_context: one_m_context_str.and_then(|s| serde_json::from_str(&s).ok()),
                     })
                 },
             )
@@ -341,5 +348,65 @@ impl Database {
             map.insert(provider.id.clone(), provider);
         }
         Ok(map)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::provider::OneMContext;
+
+    /// 构造一个最小可用的 Provider，用于持久化往返测试
+    fn sample_provider(one_m_context: Option<OneMContext>) -> Provider {
+        Provider {
+            id: "p-1m-roundtrip".to_string(),
+            name: "RoundTrip Provider".to_string(),
+            app_type: AppType::Claude,
+            api_key: "sk-test".to_string(),
+            url: Some("https://api.example.com".to_string()),
+            default_sonnet_model: Some("claude-sonnet".to_string()),
+            default_opus_model: None,
+            default_haiku_model: None,
+            default_reasoning_model: None,
+            custom_params: None,
+            settings_config: None,
+            meta: None,
+            icon: None,
+            in_failover_queue: false,
+            description: None,
+            tags: None,
+            is_active: false,
+            created_at: Utc::now(),
+            last_used: None,
+            proxy_config: None,
+            one_m_context,
+        }
+    }
+
+    #[test]
+    fn one_m_context_survives_upsert_get_roundtrip() {
+        let db = Database::in_memory().expect("init in-memory db");
+        // 仅 sonnet 声明 1M 上下文
+        let provider = sample_provider(Some(OneMContext {
+            sonnet: true,
+            opus: false,
+            haiku: false,
+            reasoning: false,
+        }));
+        db.upsert_provider(&provider).expect("upsert provider");
+
+        let loaded = db
+            .get_provider(&provider.id)
+            .expect("get provider")
+            .expect("provider exists");
+
+        // 关键断言：sonnet 的 1M 声明在落库后仍然存活
+        let one_m = loaded
+            .one_m_context
+            .expect("one_m_context should be persisted");
+        assert!(one_m.sonnet);
+        assert!(!one_m.opus);
+        assert!(!one_m.haiku);
+        assert!(!one_m.reasoning);
     }
 }
