@@ -1162,7 +1162,7 @@ pub fn run() {
             // daemon 自身也有父进程监控兜底）。
             if let tauri::RunEvent::Exit = _event {
                 if let Some(chat_state) = _app_handle.try_state::<chat_commands::ChatState>() {
-                    tauri::async_runtime::block_on(chat_state.manager.shutdown());
+                    tauri::async_runtime::block_on(chat_state.manager.shutdown_all());
                 }
             }
 

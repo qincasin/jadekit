@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::{AppHandle, State};
 
-use crate::chat::ChatManager;
+use crate::chat::{ChatManager, DEFAULT_AGENT_ID};
 
 /// 当前聊天工作目录的只读工作区状态。
 #[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
@@ -340,19 +340,23 @@ pub async fn chat_send(
     state: State<'_, ChatState>,
 ) -> Result<String, String> {
     let method = format!("{provider}.{command}");
-    state.manager.send(method, params).await
+    // Task 5 将把 agent_id 提升为命令参数；此处临时走默认 agent 以保持编译。
+    state
+        .manager
+        .send(DEFAULT_AGENT_ID.to_string(), method, params)
+        .await
 }
 
 /// Abort the current in-flight turn.
 #[tauri::command]
 pub async fn chat_abort(state: State<'_, ChatState>) -> Result<(), String> {
-    state.manager.abort().await
+    state.manager.abort(DEFAULT_AGENT_ID.to_string()).await
 }
 
 /// Whether the daemon is running.
 #[tauri::command]
 pub async fn chat_is_running(state: State<'_, ChatState>) -> Result<bool, String> {
-    Ok(state.manager.is_running().await)
+    Ok(state.manager.is_running(&DEFAULT_AGENT_ID.to_string()).await)
 }
 
 /// Explicitly start the daemon (otherwise it starts lazily on first send).
@@ -361,7 +365,7 @@ pub async fn chat_start_daemon(state: State<'_, ChatState>) -> Result<(), String
     // A no-op send path: starting happens inside the manager's lazy init.
     // We trigger it via is_running which forces client init only on send, so
     // instead expose a dedicated warm-up by sending a heartbeat-like start.
-    state.manager.warm_up().await
+    state.manager.warm_up(DEFAULT_AGENT_ID.to_string()).await
 }
 
 /// 发送系统级桌面通知，用于聊天任务完成/失败/中断后的右下角提示。
@@ -481,7 +485,7 @@ pub async fn chat_uninstall_sdk(sdk_id: String, state: State<'_, ChatState>) -> 
 /// 重启 daemon（用于手动刷新）。
 #[tauri::command]
 pub async fn chat_restart_daemon(state: State<'_, ChatState>) -> Result<(), String> {
-    state.manager.restart_daemon().await
+    state.manager.restart_daemon(None).await
 }
 
 /// 列出 Slash 命令，用于输入框 `/` 补全。

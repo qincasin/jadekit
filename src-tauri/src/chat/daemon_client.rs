@@ -22,6 +22,7 @@ use super::resources;
 /// 默认 session id（= 默认 agent 的 CLAUDE_SESSION_ID）。
 /// 多 agent 池下每个 daemon 用各自 agent_id 作为 session；此常量仅为默认 agent 与
 /// 旧调用点保留（见 `agent_id::DEFAULT_AGENT_ID`）。
+#[allow(dead_code)]
 pub const SESSION_ID: &str = "default";
 
 /// Callback invoked for daemon lifecycle/broadcast events (ready, sdk_loaded…).
@@ -115,6 +116,8 @@ impl DaemonClient {
     }
 
     /// 该 daemon 绑定的 session id（= agent_id），用于 permission IPC 匹配。
+    /// 当前 Phase 0 未被直接读取（manager 持有 agent_id），保留供诊断/后续阶段使用。
+    #[allow(dead_code)]
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
