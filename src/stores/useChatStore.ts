@@ -36,6 +36,7 @@ import {
 import {CHAT_DAEMON_READY_TIMEOUT_ERROR_KEY} from '../utils/chatDaemonStatus';
 import {CHAT_MODEL_SELECTION_KEY_PREFIX, getDefaultChatModelId,} from '../utils/chatModels';
 import {getNextTabAfterClose} from '../utils/chatUiBehavior';
+import {resolveTabForEvent} from './chatEventRouting';
 
 const DRAFT_KEY_PREFIX = 'ccg-chat-draft:';
 const REASONING_KEY = 'ccg-chat-reasoning';
@@ -304,6 +305,8 @@ type ChatTabStatus = 'idle' | 'loading' | 'running' | 'queued' | 'error';
 
 export interface ChatSessionTab {
     key: string;
+    /** 该 tab 绑定的 agent id（daemon 池键），创建时生成、生命周期内稳定。 */
+    agentId: string;
     messages: ChatMessage[];
     provider: ChatProvider;
     permissionMode: PermissionMode;
@@ -364,6 +367,8 @@ interface ChatState {
     activeRequestId: string | null;
     /** 当前会话 id（由 daemon 的 SESSION_ID 回填） */
     sessionId: string | null;
+    /** 当前活跃 tab 绑定的 agent id（daemon 池键）；顶层状态是活跃 tab 的投影。 */
+    agentId: string;
     /** 当前会话关联的工作目录，供 @ 文件补全和 daemon cwd 使用 */
     currentCwd: string | null;
     /** 当前从历史中载入的会话元信息 */
@@ -445,6 +450,11 @@ function newId(): string {
     return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** 生成一个稳定的 agent id（daemon 池键）。crypto.randomUUID 在 WebView 与 Node 测试环境均可用。 */
+function createAgentId(): string {
+    return crypto.randomUUID();
+}
+
 function createDraftTabKey(): string {
     return `draft:${newId()}`;
 }
@@ -457,6 +467,7 @@ function createTabFromState(
     const now = overrides.updatedAt ?? overrides.createdAt ?? 0;
     return {
         key,
+        agentId: state.agentId,
         messages: state.messages,
         provider: state.provider,
         permissionMode: state.permissionMode,
@@ -490,6 +501,7 @@ function createEmptyTabFromState(
 ): ChatSessionTab {
     return {
         key,
+        agentId: createAgentId(),
         messages: [],
         provider: state.provider,
         permissionMode: state.permissionMode,
@@ -528,6 +540,7 @@ function projectTabToState(tab: ChatSessionTab): Partial<ChatState> {
         contextMaxTokens: tab.contextMaxTokens,
         activeRequestId: tab.activeRequestId,
         sessionId: tab.sessionId,
+        agentId: tab.agentId,
         currentCwd: tab.currentCwd,
         activeSession: tab.activeSession,
         pendingSessionKey: tab.pendingSessionKey,
@@ -565,15 +578,21 @@ function saveActiveProjection(state: ChatState): ChatSessionTab[] {
     return upsertTab(state.openTabs, currentTopLevelTab(state));
 }
 
-function requestTargetTabKey(state: ChatState, requestId: string | null | undefined): string | null {
+function requestTargetTabKey(state: ChatState, requestId: string | null | undefined, agentId?: string): string | null {
+    // 优先按 agentId / requestId 解析（多 agent 池下 agentId 是每 tab 稳定标识）。
+    const resolved = resolveTabForEvent(
+        state.openTabs,
+        {agentId, requestId: requestId ?? undefined},
+        requestTabKeys,
+    );
+    if (resolved) return resolved;
     if (!requestId) return null;
-    return requestTabKeys.get(requestId)
-        ?? state.openTabs.find((tab) => tab.activeRequestId === requestId)?.key
+    return state.openTabs.find((tab) => tab.activeRequestId === requestId)?.key
         ?? (state.activeRequestId === requestId ? state.activeTabKey : null);
 }
 
-function requestTargetTab(state: ChatState, requestId: string | null | undefined): ChatSessionTab | null {
-    const targetKey = requestTargetTabKey(state, requestId);
+function requestTargetTab(state: ChatState, requestId: string | null | undefined, agentId?: string): ChatSessionTab | null {
+    const targetKey = requestTargetTabKey(state, requestId, agentId);
     if (!targetKey) return null;
     if (state.activeTabKey === targetKey) return currentTopLevelTab(state);
     return state.openTabs.find((tab) => tab.key === targetKey) ?? null;
@@ -583,8 +602,9 @@ function updateRequestTabState(
     state: ChatState,
     requestId: string,
     updater: (tab: ChatSessionTab) => ChatSessionTab,
+    agentId?: string,
 ): Partial<ChatState> {
-    const targetKey = requestTargetTabKey(state, requestId);
+    const targetKey = requestTargetTabKey(state, requestId, agentId);
     if (!targetKey && state.activeRequestId === requestId) {
         const legacy = createTabFromState(createDraftTabKey(), state);
         const updated = updater(legacy);
@@ -830,10 +850,10 @@ function stopStreamingAssistantMessages(
     ));
 }
 
-function shouldAcceptRequestEvent(state: ChatState, requestId: string | null | undefined): boolean {
+function shouldAcceptRequestEvent(state: ChatState, requestId: string | null | undefined, agentId?: string): boolean {
     if (!requestId) return false;
     if (retiredRequestIds.has(requestId)) return false;
-    if (requestTargetTab(state, requestId)) return true;
+    if (requestTargetTab(state, requestId, agentId)) return true;
     if (state.activeRequestId) return state.activeRequestId === requestId;
     return hasStreamingAssistant(state.messages);
 }
@@ -842,9 +862,24 @@ function bindPendingRequestIfNeeded(
     set: (state: Partial<ChatState>) => void,
     state: ChatState,
     requestId: string,
+    agentId?: string,
 ): void {
     if (retiredRequestIds.has(requestId)) return;
     if (requestTabKeys.has(requestId)) return;
+
+    // 优先按 agentId 把 requestId 绑到对应 tab（多 agent 池下稳定归属）。
+    if (agentId) {
+        const agentTab = state.openTabs.find((tab) => tab.agentId === agentId);
+        if (agentTab) {
+            requestTabKeys.set(requestId, agentTab.key);
+            set(updateTabStateByKey(state, agentTab.key, (tab) => ({
+                ...tab,
+                activeRequestId: requestId,
+                status: 'running',
+            })));
+            return;
+        }
+    }
 
     const activeKey = state.activeTabKey;
     if (activeKey && !state.activeRequestId && hasStreamingAssistant(state.messages)) {
@@ -1116,7 +1151,7 @@ async function abortActiveRequestIfNeeded(
 
     let abortError: string | null = null;
     try {
-        await invoke('chat_abort');
+        await invoke('chat_abort', { agentId: state.agentId });
     } catch (e) {
         abortError = String(e);
         set({ error: abortError });
@@ -1158,6 +1193,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     daemonLogs: [],
     activeRequestId: null,
     sessionId: null,
+    agentId: createAgentId(),
     currentCwd: null,
     activeSession: null,
     pendingSessionKey: null,
@@ -1195,10 +1231,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         unlisteners = [];
 
         const streamUn = await listen<ChatStreamEvent>('chat://stream', (event) => {
-            const { requestId, text } = event.payload;
+            const { requestId, text, agentId } = event.payload;
             const stateBeforeStream = get();
-            if (!shouldAcceptRequestEvent(stateBeforeStream, requestId)) return;
-            bindPendingRequestIfNeeded(set, stateBeforeStream, requestId);
+            if (!shouldAcceptRequestEvent(stateBeforeStream, requestId, agentId)) return;
+            bindPendingRequestIfNeeded(set, stateBeforeStream, requestId, agentId);
 
             // 解析 daemon 的标签化输出。daemon stdout 每行都带标签前缀，
             // 只有 [CONTENT_DELTA] 是真正要显示的回复文本，其余（[DEBUG]、
@@ -1293,11 +1329,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         });
 
         const doneUn = await listen<ChatDoneEvent>('chat://done', (event) => {
-            const { requestId, success, error } = event.payload;
+            const { requestId, success, error, agentId } = event.payload;
             const stateBeforeDone = get();
-            if (!shouldAcceptRequestEvent(stateBeforeDone, requestId)) return;
-            bindPendingRequestIfNeeded(set, stateBeforeDone, requestId);
-            const targetBeforeDone = requestTargetTab(get(), requestId) ?? stateBeforeDone;
+            if (!shouldAcceptRequestEvent(stateBeforeDone, requestId, agentId)) return;
+            bindPendingRequestIfNeeded(set, stateBeforeDone, requestId, agentId);
+            const targetBeforeDone = requestTargetTab(get(), requestId, agentId) ?? stateBeforeDone;
             notifyStoppedRequestOnce(
                 requestId,
                 success ? 'success' : 'error',
@@ -1379,10 +1415,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // 监听 chat://message 事件（工具调用可视化）
         const messageUn = await listen<ChatMessageEvent>('chat://message', (event) => {
             try {
-                const { requestId } = event.payload;
+                const { requestId, agentId } = event.payload;
                 const stateBeforeMessage = get();
-                if (!shouldAcceptRequestEvent(stateBeforeMessage, requestId)) return;
-                bindPendingRequestIfNeeded(set, stateBeforeMessage, requestId);
+                if (!shouldAcceptRequestEvent(stateBeforeMessage, requestId, agentId)) return;
+                bindPendingRequestIfNeeded(set, stateBeforeMessage, requestId, agentId);
                 const raw = JSON.parse(event.payload.json) as MessageRaw;
 
                 // 子代理消息(带 parent_tool_use_id)不进主 transcript，
@@ -1416,12 +1452,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // 子代理(Task)消息走专用通道，按 parentToolUseId 路由进对应卡片的 subagentRuns。
         const subagentMessageUn = await listen<SubagentMessageEvent>('chat://subagent-message', (event) => {
             try {
-                const { requestId, parentToolUseId } = event.payload;
+                const { requestId, parentToolUseId, agentId } = event.payload;
                 const trimmedParent = parentToolUseId?.trim();
                 if (!trimmedParent) return;
                 const stateBeforeMessage = get();
-                if (!shouldAcceptRequestEvent(stateBeforeMessage, requestId)) return;
-                bindPendingRequestIfNeeded(set, stateBeforeMessage, requestId);
+                if (!shouldAcceptRequestEvent(stateBeforeMessage, requestId, agentId)) return;
+                bindPendingRequestIfNeeded(set, stateBeforeMessage, requestId, agentId);
                 const raw = JSON.parse(event.payload.json) as MessageRaw;
                 set((state) => updateRequestTabState(state, requestId, (tab) => ({
                     ...tab,
@@ -1436,7 +1472,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
         // 预热 daemon（懒启动也可，但提前启动可减少首条消息延迟）
         try {
-            await invoke('chat_start_daemon');
+            await invoke('chat_start_daemon', { agentId: get().agentId });
             if (!get().daemonReady && get().daemonStatus === 'starting') {
                 scheduleDaemonReadyTimeout(get, set);
             }
@@ -1460,7 +1496,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             error: null,
         });
         try {
-            await invoke('chat_start_daemon');
+            await invoke('chat_start_daemon', { agentId: get().agentId });
             scheduleDaemonReadyTimeout(get, set);
         } catch (e) {
             clearDaemonReadyTimeout();
@@ -1746,6 +1782,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 scheduleDaemonReadyTimeout(get, set);
             }
             const requestId = await invoke<string>('chat_send', {
+                agentId: sendState.agentId,
                 provider,
                 command: provider === 'claude' && hasAttachments ? 'sendWithAttachments' : 'send',
                 params,
@@ -2302,7 +2339,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         prepareChatTurnStoppedNotificationPermission();
 
         try {
-            await invoke('chat_abort');
+            await invoke('chat_abort', { agentId: stateBeforeAbort.agentId });
             notifyStoppedRequestOnce(
                 activeRequestId,
                 'aborted',

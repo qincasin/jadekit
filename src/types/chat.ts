@@ -111,6 +111,8 @@ export interface ChatStreamEvent {
     requestId: string;
     kind: 'line' | 'stderr';
     text: string;
+    /** 产出该事件的 agent id（多 agent 池）；旧事件可能缺省。 */
+    agentId?: string;
 }
 
 /** 后端 "chat://done" 事件载荷 */
@@ -118,12 +120,16 @@ export interface ChatDoneEvent {
     requestId: string;
     success: boolean;
     error?: string | null;
+    /** 产出该事件的 agent id（多 agent 池）；旧事件可能缺省。 */
+    agentId?: string;
 }
 
 /** 后端 "chat://message" 事件载荷，包含结构化 raw 消息。 */
 export interface ChatMessageEvent {
     requestId: string;
     json: string;
+    /** 产出该事件的 agent id（多 agent 池）；旧事件可能缺省。 */
+    agentId?: string;
 }
 
 /**
@@ -134,6 +140,8 @@ export interface SubagentMessageEvent {
     requestId: string;
     parentToolUseId: string;
     json: string;
+    /** 产出该事件的 agent id（多 agent 池）；旧事件可能缺省。 */
+    agentId?: string;
 }
 
 /** 后端 "chat://daemon" 生命周期事件载荷 */
