@@ -1,5 +1,9 @@
+use crate::models::app_type::AppType;
+use crate::proxy::circuit_breaker;
 use crate::proxy::error::ProxyError;
+use crate::proxy::failover_switch;
 use crate::proxy::http_client;
+use crate::proxy::model_mapper;
 use crate::proxy::provider_router;
 use crate::proxy::server;
 use crate::proxy::thinking_rectifier;
@@ -33,8 +37,26 @@ pub async fn proxy_handler(req: Request<Body>) -> Result<Response, ProxyError> {
         _ => body_bytes,
     };
 
-    // 解析上游路由
-    let route = provider_router::resolve_upstream(&request_path)?;
+    let config = circuit_breaker::default_config();
+    // 热更新核心：每个请求建立前都重新读取当前可用 provider，运行中的 CLI 会话无需重启。
+    let provider = failover_switch::get_available_provider(AppType::Claude)?;
+
+    let json_body: serde_json::Value =
+        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+    let (mapped_json, _original_model, _outbound_model) = if json_body.is_object() {
+        model_mapper::apply_model_mapping(json_body, &provider)
+    } else {
+        (serde_json::Value::Null, None, None)
+    };
+    let forward_body = if mapped_json.is_null() {
+        body_bytes.clone()
+    } else {
+        serde_json::to_vec(&mapped_json)
+            .map(bytes::Bytes::from)
+            .unwrap_or_else(|_| body_bytes.clone())
+    };
+
+    let route = provider_router::build_route(&provider, &request_path)?;
 
     // 合并请求头：路由头优先，保留原始请求中的非冲突头
     let mut forward_headers = route.headers;
@@ -56,10 +78,24 @@ pub async fn proxy_handler(req: Request<Body>) -> Result<Response, ProxyError> {
     let method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| ProxyError::InvalidRequest(e.to_string()))?;
 
-    let upstream_resp =
-        http_client::forward_request(method, &route.target_url, forward_headers, body_bytes)
-            .await
-            .map_err(|e| ProxyError::ForwardFailed(e.to_string()))?;
+    let upstream_resp = match http_client::forward_request(
+        method,
+        &route.target_url,
+        forward_headers,
+        forward_body,
+    )
+    .await
+    {
+        Ok(resp) => {
+            failover_switch::on_success(&provider.id, &config);
+            resp
+        }
+        Err(e) => {
+            // 只在请求建立阶段记录失败；一旦拿到响应体并开始流式转发，就不再切换 provider。
+            let _ = failover_switch::on_failure(AppType::Claude, &provider.id, &config);
+            return Err(ProxyError::ForwardFailed(e.to_string()));
+        }
+    };
 
     // 递增请求计数
     server::increment_request_count();
