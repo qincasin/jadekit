@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "JadeKit",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "identifier": "com.jadekit.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
