@@ -20,6 +20,7 @@ mod daemon_client;
 mod manager;
 mod node_runtime;
 mod permission_watcher;
+mod pool;
 mod protocol;
 mod resources;
 mod sdk_installer;

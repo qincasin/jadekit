@@ -27,7 +27,7 @@ use super::resources;
 type ClientFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type ClientResultFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
-trait ManagerDaemonClient: Send + Sync {
+pub(crate) trait ManagerDaemonClient: Send + Sync {
     fn is_running(&self) -> bool;
     fn set_event_sink(&self, sink: EventSink) -> ClientFuture<'_, ()>;
     fn start(&self) -> ClientResultFuture<'_, ()>;
@@ -559,21 +559,22 @@ impl ChatManager {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::mpsc;
 
-    struct FakeDaemonClient {
-        running: AtomicBool,
-        restart_calls: AtomicUsize,
-        stop_calls: AtomicUsize,
-        config_update_calls: AtomicUsize,
-        fail_restart: bool,
+    /// 测试用最小 fake daemon client。字段 pub，便于 manager 内测试断言计数。
+    pub struct FakeDaemonClient {
+        pub running: AtomicBool,
+        pub restart_calls: AtomicUsize,
+        pub stop_calls: AtomicUsize,
+        pub config_update_calls: AtomicUsize,
+        pub fail_restart: bool,
     }
 
     impl FakeDaemonClient {
-        fn new(running: bool) -> Self {
+        pub fn new(running: bool) -> Self {
             Self {
                 running: AtomicBool::new(running),
                 restart_calls: AtomicUsize::new(0),
@@ -583,7 +584,7 @@ mod tests {
             }
         }
 
-        fn with_restart_failure() -> Self {
+        pub fn with_restart_failure() -> Self {
             Self {
                 running: AtomicBool::new(false),
                 restart_calls: AtomicUsize::new(0),
@@ -657,6 +658,18 @@ mod tests {
             })
         }
     }
+
+    /// 构造一个最小 fake daemon client（默认 running），供 pool/manager 测试复用。
+    pub fn fake_client() -> std::sync::Arc<dyn ManagerDaemonClient> {
+        std::sync::Arc::new(FakeDaemonClient::new(true))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::FakeDaemonClient;
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn sdk_uninstall_stops_cached_daemon_before_removing_dependencies() {
