@@ -382,6 +382,8 @@
     "tagPlaceholder": "Type a tag and press Enter to add",
     "openUrl": "Open in browser",
     "reasoningModel": "Reasoning Model (Thinking)",
+    "oneMHint": "Declare that this model supports 1M context (appends a [1M] suffix on write; requires upstream support)",
+    "oneMLabel": "Declare 1M support",
     "proxyConfig": "Proxy Configuration",
     "proxyConfigDesc": "Configure a dedicated proxy for this provider. When disabled, system or global proxy settings will be used.",
     "useCustomProxy": "Use custom proxy",

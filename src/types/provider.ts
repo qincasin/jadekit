@@ -28,6 +28,13 @@ export interface Provider {
     defaultOpusModel?: string;
     defaultHaikuModel?: string;
     defaultReasoningModel?: string;
+    /** 每个模型角色是否声明 1M 上下文（写入时拼 [1M] 后缀） */
+    oneMContext?: {
+        sonnet?: boolean;
+        opus?: boolean;
+        haiku?: boolean;
+        reasoning?: boolean;
+    };
     customParams?: Record<string, any>;
     settingsConfig?: any;
     meta?: Record<string, string>;

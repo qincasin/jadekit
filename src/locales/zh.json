@@ -269,6 +269,8 @@
     "tagPlaceholder": "输入标签后回车添加",
     "openUrl": "在浏览器中打开",
     "reasoningModel": "推理模型 (Thinking)",
+    "oneMHint": "声明该模型支持 1M 上下文（写入时拼 [1M] 后缀，需上游支持）",
+    "oneMLabel": "声明支持 1M",
     "proxyConfig": "代理配置",
     "proxyConfigDesc": "为此服务商配置单独的网络代理，不启用时使用系统代理或全局设置。",
     "useCustomProxy": "使用单独代理",

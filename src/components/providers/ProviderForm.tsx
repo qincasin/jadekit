@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo, type Dispatch, type SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Eye, EyeOff, Loader2, RefreshCw, ExternalLink, HeartPulse, ChevronDown, X, Plus } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
@@ -168,10 +168,20 @@ const CLAUDE_DEPRECATED_FIELD_LABELS: Record<string, string> = {
 
 const CLAUDE_SETTING_CONTROL_CLASS = "flex min-h-[36px] items-center rounded-md border border-transparent px-2";
 
+// 1M 上下文模型角色 key（集中定义，避免散落魔法字符串）
+type OneMRole = 'sonnet' | 'opus' | 'haiku' | 'reasoning';
+
 // ── 预设配置 ──────────────────────────────────────────────
 
-const PRESETS = [
-    { label: 'Claude Official', url: 'https://api.anthropic.com', appType: 'claude' as AppType },
+const PRESETS: Array<{
+    label: string;
+    url: string;
+    appType: AppType;
+    // 可选：预设默认声明 1M 上下文的模型角色
+    oneMContext?: Provider['oneMContext'];
+}> = [
+    // 官方 Sonnet/Opus 支持 1M 上下文，默认勾选
+    { label: 'Claude Official', url: 'https://api.anthropic.com', appType: 'claude' as AppType, oneMContext: { sonnet: true, opus: true } },
     { label: 'OpenRouter', url: 'https://openrouter.ai/api', appType: 'claude' as AppType },
 ];
 
@@ -181,6 +191,10 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
     const { t } = useTranslation();
     const { addProvider, updateProvider } = useProviderStore();
     const isEditing = !!editingProvider;
+
+    // 1M 上下文勾选框的 hint 与标签文案（i18n）
+    const oneMHint = t('providers.oneMHint', '声明该模型支持 1M 上下文（写入时拼 [1M] 后缀，需上游支持）');
+    const oneMLabel = t('providers.oneMLabel', '声明支持 1M');
 
     // 基本配置
     const [name, setName] = useState(editingProvider?.name || '');
@@ -193,6 +207,9 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
     const [defaultOpusModel, setDefaultOpusModel] = useState(editingProvider?.defaultOpusModel || '');
     const [defaultHaikuModel, setDefaultHaikuModel] = useState(editingProvider?.defaultHaikuModel || '');
     const [defaultReasoningModel, setDefaultReasoningModel] = useState(editingProvider?.defaultReasoningModel || '');
+
+    // 每个模型角色是否声明 1M 上下文（写入时由后端拼 [1M] 后缀）
+    const [oneMContext, setOneMContext] = useState<Provider['oneMContext']>(editingProvider?.oneMContext || {});
 
     // 其他配置
     const [description, setDescription] = useState(editingProvider?.description || '');
@@ -231,6 +248,7 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
             setDefaultOpusModel(editingProvider?.defaultOpusModel || '');
             setDefaultHaikuModel(editingProvider?.defaultHaikuModel || '');
             setDefaultReasoningModel(editingProvider?.defaultReasoningModel || '');
+            setOneMContext(editingProvider?.oneMContext || {});
             setDescription(editingProvider?.description || '');
             setTags(editingProvider?.tags || []);
             if (editingProvider?.proxyConfig) {
@@ -278,6 +296,10 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
             setUrl(preset.url);
         }
         setAppType(preset.appType);
+        // 预设若声明了 1M 默认值则应用，否则保持当前
+        if (preset.oneMContext) {
+            setOneMContext(preset.oneMContext);
+        }
     };
 
     const handleTestConnectivity = async () => {
@@ -335,6 +357,8 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
                 defaultOpusModel: defaultOpusModel.trim() || undefined,
                 defaultHaikuModel: defaultHaikuModel.trim() || undefined,
                 defaultReasoningModel: defaultReasoningModel.trim() || undefined,
+                // 至少有一个角色声明 1M 才保存，全 false/空则不写
+                oneMContext: oneMContext && Object.values(oneMContext).some(Boolean) ? oneMContext : undefined,
                 description: description.trim() || undefined,
                 tags: tags.length > 0 ? tags : undefined,
                 settingsConfig: (() => {
@@ -405,11 +429,13 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
             defaultOpusModel: defaultOpusModel.trim() || undefined,
             defaultHaikuModel: defaultHaikuModel.trim() || undefined,
             defaultReasoningModel: defaultReasoningModel.trim() || undefined,
+            // 预览必须带上 oneMContext，否则预览看不到 [1M] 后缀
+            oneMContext: oneMContext && Object.values(oneMContext).some(Boolean) ? oneMContext : undefined,
             settingsConfig: Object.keys(filteredSettings).length > 0 ? filteredSettings : undefined,
             isActive: false,
             createdAt: editingProvider?.createdAt || new Date().toISOString(),
         };
-    }, [editingProvider, name, appType, apiKey, url, defaultSonnetModel, defaultOpusModel, defaultHaikuModel, defaultReasoningModel, internalSettings]);
+    }, [editingProvider, name, appType, apiKey, url, defaultSonnetModel, defaultOpusModel, defaultHaikuModel, defaultReasoningModel, oneMContext, internalSettings]);
 
     // 防抖调用后端：获取预览结果，首次结果作为 baseline
     useEffect(() => {
@@ -605,33 +631,58 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
                         
                         <div className="grid grid-cols-2 gap-x-4 gap-y-3">
                             {/* We maintain only the original 4 models to match what the user expected */}
-                            <ModelComboBox
+                            {/* 仅 Claude 类型在每个模型角色旁显示「声明支持 1M」勾选框 */}
+                            <ModelRoleField
                                 label="Sonnet Model"
                                 placeholder="claude-sonnet-4-..."
                                 value={defaultSonnetModel}
                                 onChange={(v) => setDefaultSonnetModel(v)}
                                 options={fetchedModels}
+                                role="sonnet"
+                                showOneM={appType === 'claude'}
+                                oneMContext={oneMContext}
+                                setOneMContext={setOneMContext}
+                                oneMHint={oneMHint}
+                                oneMLabel={oneMLabel}
                             />
-                            <ModelComboBox
+                            <ModelRoleField
                                 label="Opus Model"
                                 placeholder="claude-opus-4-..."
                                 value={defaultOpusModel}
                                 onChange={(v) => setDefaultOpusModel(v)}
                                 options={fetchedModels}
+                                role="opus"
+                                showOneM={appType === 'claude'}
+                                oneMContext={oneMContext}
+                                setOneMContext={setOneMContext}
+                                oneMHint={oneMHint}
+                                oneMLabel={oneMLabel}
                             />
-                            <ModelComboBox
+                            <ModelRoleField
                                 label="Haiku Model"
                                 placeholder="claude-haiku-..."
                                 value={defaultHaikuModel}
                                 onChange={(v) => setDefaultHaikuModel(v)}
                                 options={fetchedModels}
+                                role="haiku"
+                                showOneM={appType === 'claude'}
+                                oneMContext={oneMContext}
+                                setOneMContext={setOneMContext}
+                                oneMHint={oneMHint}
+                                oneMLabel={oneMLabel}
                             />
-                            <ModelComboBox
+                            <ModelRoleField
                                 label={t('providers.reasoningModel', '推理模型 (Thinking)')}
                                 placeholder="claude-sonnet-4-..."
                                 value={defaultReasoningModel}
                                 onChange={(v) => setDefaultReasoningModel(v)}
                                 options={fetchedModels}
+                                role="reasoning"
+                                showOneM={appType === 'claude'}
+                                oneMContext={oneMContext}
+                                setOneMContext={setOneMContext}
+                                oneMHint={oneMHint}
+                                oneMLabel={oneMLabel}
                             />
                         </div>
                     </div>
@@ -841,6 +892,42 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
 }
 
 /** Custom styled model combo box with dropdown selection + custom text input */
+// 模型角色字段：ComboBox + 可选的「声明支持 1M」勾选框
+// 仅 Claude 类型显示勾选框，勾选后由后端在写入模型 env 时拼 [1M] 后缀
+function ModelRoleField({ label, placeholder, value, onChange, options, role, showOneM, oneMContext, setOneMContext, oneMHint, oneMLabel }: {
+    label: string;
+    placeholder: string;
+    value: string;
+    onChange: (v: string) => void;
+    options: string[];
+    role: OneMRole;
+    showOneM: boolean;
+    oneMContext: Provider['oneMContext'];
+    setOneMContext: Dispatch<SetStateAction<Provider['oneMContext']>>;
+    oneMHint: string;
+    oneMLabel: string;
+}) {
+    return (
+        <div className="space-y-1">
+            <ModelComboBox label={label} placeholder={placeholder} value={value} onChange={onChange} options={options} />
+            {showOneM && (
+                <label
+                    className="flex items-center gap-1.5 text-[11px] text-gray-500 dark:text-slate-400 cursor-pointer"
+                    title={oneMHint}
+                >
+                    <input
+                        type="checkbox"
+                        className="h-3.5 w-3.5 rounded border-gray-300 dark:border-slate-600"
+                        checked={!!oneMContext?.[role]}
+                        onChange={(e) => setOneMContext((prev) => ({ ...prev, [role]: e.target.checked }))}
+                    />
+                    <span>{oneMLabel}</span>
+                </label>
+            )}
+        </div>
+    );
+}
+
 function ModelComboBox({ label, placeholder, value, onChange, options }: {
     label: string;
     placeholder: string;
