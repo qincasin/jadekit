@@ -11,6 +11,57 @@ use std::sync::Arc;
 /// 1M 上下文模型后缀（Claude Code 官方机制，匹配前会被剥离）。
 pub const ONE_M_CONTEXT_SUFFIX: &str = "[1M]";
 
+// ── 官方订阅特殊 Provider ────────────────────────────────────
+//
+// 中文注释（安全边界 / 状态流转）：
+// 官方订阅是一类「不写入 apikey/base_url」的特殊 Provider。激活它时，我们要
+// 反向地把此前供应商写进 CLI 配置的字段「清除」掉，让 CLI 找不到第三方 apikey
+// / base_url，从而回落到它自带的 OAuth 订阅登录态（对齐 cc-switch 的
+// is_official_provider / restore-official 行为）。这些 id 与字段清单都集中为
+// 常量，避免在业务代码里散落魔法字符串。
+
+/// 官方订阅特殊 Provider 的固定 id（对齐 cc-switch is_official_provider 思路）。
+/// pub：前端内置官方 Provider 时需要复用同一 id，保证前后端一致。
+pub const CLAUDE_OFFICIAL_PROVIDER_ID: &str = "__claude_official__";
+pub const CODEX_OFFICIAL_PROVIDER_ID: &str = "__codex_official__";
+
+/// 切到 Claude 官方订阅时需从 ~/.claude/settings.json 的 env 移除的供应商字段。
+/// 中文注释：与 `sync_to_claude_settings` / `merge_provider_to_env` 写入的键复用
+/// 同一份语义（含 Task-1 的 `[1M]` 后缀模型，它们用的就是这几个键），移除后
+/// CLI 找不到 apikey/base_url，回落自带 OAuth 订阅登录态。
+const CLAUDE_PROVIDER_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_REASONING_MODEL",
+];
+
+/// 切到 Codex 官方订阅时需从 ~/.codex/auth.json 移除的供应商字段。
+/// 中文注释：`sync_to_codex_config` 往 auth.json 写的就是 OPENAI_API_KEY；
+/// 移除它即让 Codex CLI 回落 OAuth 登录态。
+const CODEX_AUTH_PROVIDER_KEYS: &[&str] = &["OPENAI_API_KEY"];
+
+/// 切到 Codex 官方订阅时需从 ~/.codex/config.toml 顶层移除的供应商字段。
+/// 中文注释：`write_codex_toml_config` 往 config.toml 顶层写 model_provider 与
+/// model，并新增 `[model_providers.newapi]` 表（base_url 等）。移除这三项即抹掉
+/// 第三方供应商指向，让 Codex 回落官方默认。
+const CODEX_CONFIG_PROVIDER_KEYS: &[&str] = &["model_provider", "model", "model_providers"];
+
+/// 判断给定 Provider id 是否为官方订阅特殊 Provider。
+pub fn is_official_provider(id: &str) -> bool {
+    id == CLAUDE_OFFICIAL_PROVIDER_ID || id == CODEX_OFFICIAL_PROVIDER_ID
+}
+
+/// 从 Claude env 对象移除所有供应商字段（幂等：移除不存在的键是 no-op，
+/// 不触碰其他无关键）。
+fn clear_claude_provider_env(env: &mut serde_json::Map<String, serde_json::Value>) {
+    for key in CLAUDE_PROVIDER_ENV_KEYS {
+        env.remove(*key);
+    }
+}
+
 // ── 路径函数 ──────────────────────────────────────────────
 
 fn get_data_dir() -> Result<PathBuf, io::Error> {
@@ -1109,6 +1160,19 @@ fn sync_to_claude_settings(provider: &Provider) -> Result<(), io::Error> {
         serde_json::json!({})
     };
 
+    // 官方订阅：清除供应商 env 字段，让 CLI 回落 OAuth 订阅登录态后直接写回。
+    // 中文注释（状态流转）：在合并任何 provider 配置之前提前分流，避免又把
+    // apikey/base_url 写回去。
+    if is_official_provider(&provider.id) {
+        if settings.get("env").is_none() {
+            settings["env"] = serde_json::json!({});
+        }
+        if let Some(env) = settings["env"].as_object_mut() {
+            clear_claude_provider_env(env);
+        }
+        return crate::services::storage::json_store::write_json(&settings_path, &settings);
+    }
+
     // 合并 settingsConfig 顶层字段
     if let Some(ref sc) = provider.settings_config {
         if let Some(obj) = sc.as_object() {
@@ -1199,11 +1263,54 @@ fn normalize_codex_base_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
 }
 
+/// 从 Codex config.toml 顶层移除供应商字段（幂等，不触碰其他键）。
+/// 中文注释：保留 doc 中用户其他自定义配置，只抹掉指向第三方供应商的字段。
+fn clear_codex_provider_config(config_path: &std::path::Path) -> Result<(), io::Error> {
+    if !config_path.exists() {
+        return Ok(());
+    }
+    let existing = read_file_content(config_path, "");
+    if existing.is_empty() {
+        return Ok(());
+    }
+    let mut doc: toml::Value = toml::from_str(&existing)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    if let toml::Value::Table(ref mut t) = doc {
+        for key in CODEX_CONFIG_PROVIDER_KEYS {
+            t.remove(*key);
+        }
+    }
+    let toml_str = toml::to_string_pretty(&doc)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    fs::write(config_path, toml_str.as_bytes())
+}
+
 fn sync_to_codex_config(provider: &Provider) -> Result<(), io::Error> {
     let home = dirs::home_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Home directory not found"))?;
     let codex_dir = home.join(".codex");
     fs::create_dir_all(&codex_dir)?;
+
+    // 官方订阅：清除供应商写入的 apikey/base_url，让 Codex CLI 回落 OAuth 登录态。
+    // 中文注释（状态流转）：与 Claude 分支同构，在写入任何 provider 配置前分流。
+    if is_official_provider(&provider.id) {
+        // 1) 清 auth.json 里的 OPENAI_API_KEY（保留文件中其他键）。
+        let auth_path = codex_dir.join("auth.json");
+        if auth_path.exists() {
+            let content = fs::read_to_string(&auth_path)?;
+            let mut auth: serde_json::Value =
+                serde_json::from_str(&content).unwrap_or(serde_json::json!({}));
+            if let Some(obj) = auth.as_object_mut() {
+                for key in CODEX_AUTH_PROVIDER_KEYS {
+                    obj.remove(*key);
+                }
+            }
+            crate::services::storage::json_store::write_json(&auth_path, &auth)?;
+        }
+        // 2) 清 config.toml 顶层的供应商字段。
+        clear_codex_provider_config(&codex_dir.join("config.toml"))?;
+        return Ok(());
+    }
 
     // auth.json
     let auth_path = codex_dir.join("auth.json");
@@ -1279,6 +1386,32 @@ mod tests {
             proxy_config: None,
             one_m_context: None,
         }
+    }
+
+    #[test]
+    fn test_official_provider_clears_claude_env() {
+        use serde_json::json;
+        let mut env = json!({
+            "ANTHROPIC_AUTH_TOKEN": "sk-x",
+            "ANTHROPIC_BASE_URL": "https://x",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.6[1M]",
+            "KEEP_ME": "yes"
+        });
+        clear_claude_provider_env(env.as_object_mut().unwrap());
+        assert!(env.get("ANTHROPIC_AUTH_TOKEN").is_none());
+        assert!(env.get("ANTHROPIC_BASE_URL").is_none());
+        assert!(env.get("ANTHROPIC_DEFAULT_SONNET_MODEL").is_none());
+        // 无关字段保留
+        assert_eq!(env.get("KEEP_ME").and_then(|v| v.as_str()), Some("yes"));
+        // 幂等：再清一次不报错
+        clear_claude_provider_env(env.as_object_mut().unwrap());
+    }
+
+    #[test]
+    fn test_is_official_provider() {
+        assert!(is_official_provider(CLAUDE_OFFICIAL_PROVIDER_ID));
+        assert!(is_official_provider(CODEX_OFFICIAL_PROVIDER_ID));
+        assert!(!is_official_provider("user-123"));
     }
 
     #[test]
