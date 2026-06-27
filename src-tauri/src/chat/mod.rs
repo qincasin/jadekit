@@ -15,6 +15,7 @@
 //!   done     (stdout): {"id":"1","done":true,"success":true}
 //!   heartbeat(stdout): {"id":"2","type":"heartbeat","ts":...}
 
+mod agent_id;
 mod daemon_client;
 mod manager;
 mod node_runtime;
@@ -24,6 +25,7 @@ mod resources;
 mod sdk_installer;
 mod slash_commands;
 
+pub use agent_id::{sanitize_agent_id, AgentId, DEFAULT_AGENT_ID};
 pub use manager::ChatManager;
 pub use node_runtime::NodeRuntimeStatus;
 pub use permission_watcher::{
