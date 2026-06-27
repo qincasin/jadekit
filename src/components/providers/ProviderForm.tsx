@@ -8,6 +8,7 @@ import { useProviderStore } from '../../stores/useProviderStore';
 import { Provider, ProviderProxyConfig } from '../../types/provider';
 import { AppType, VISIBLE_APP_TYPES, APP_LABELS } from '../../types/app';
 import ProviderProxyConfigInput from './ProviderProxyConfig';
+import EditablePreview from './EditablePreview';
 import { cn } from '../../utils/cn';
 
 // ── 基础 UI 组件 ──────────────────────────────────────────────
@@ -395,6 +396,122 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
             [field]: checked
         }));
     };
+
+    const readPreviewString = (source: Record<string, any>, key: string) => {
+        const value = source[key];
+        if (typeof value === 'string') return value;
+        if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+        return undefined;
+    };
+
+    const readEnvFlag = (env: Record<string, any>, key: string, enabledValue = '1') => {
+        const value = env[key];
+        if (typeof value === 'boolean') return value;
+        if (typeof value === 'string') return value === enabledValue;
+        if (typeof value === 'number') return String(value) === enabledValue;
+        return undefined;
+    };
+
+    const applyModelFromPreview = (
+        env: Record<string, any>,
+        envKey: string,
+        role: OneMRole,
+        setter: (value: string) => void,
+    ) => {
+        const raw = readPreviewString(env, envKey);
+        if (raw === undefined) return;
+        const oneMSuffix = '[1M]';
+        const supportsOneM = raw.endsWith(oneMSuffix);
+        setter(supportsOneM ? raw.slice(0, -oneMSuffix.length) : raw);
+        setOneMContext(prev => ({ ...prev, [role]: supportsOneM }));
+    };
+
+    const applyPreviewJsonChange = useCallback((title: string, value: unknown) => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+        const doc = value as Record<string, any>;
+
+        if (title.endsWith('auth.json')) {
+            const openAiKey = readPreviewString(doc, 'OPENAI_API_KEY');
+            if (openAiKey !== undefined) setApiKey(openAiKey);
+            return;
+        }
+
+        if (!title.endsWith('settings.json')) return;
+
+        const nextSettings: Partial<InternalSettings> = {};
+        for (const key of CLAUDE_SETTING_KEYS) {
+            if (!(key in doc)) continue;
+            const valueForKey = doc[key];
+            const defaultValue = CLAUDE_SETTINGS_DEFAULTS[key];
+            if (typeof defaultValue === 'boolean' && typeof valueForKey === 'boolean') {
+                nextSettings[key] = valueForKey as never;
+            } else if (typeof defaultValue === 'string' && (typeof valueForKey === 'string' || typeof valueForKey === 'number')) {
+                nextSettings[key] = String(valueForKey) as never;
+            }
+        }
+
+        const env = doc.env && typeof doc.env === 'object' && !Array.isArray(doc.env)
+            ? doc.env as Record<string, any>
+            : undefined;
+
+        if (env) {
+            // 中文注释（白名单回写）：预览编辑只反向覆盖已知字段，避免把任意 env
+            // 或未来未知配置误写进结构化表单。
+            const apiToken = readPreviewString(env, 'ANTHROPIC_AUTH_TOKEN');
+            if (apiToken !== undefined) setApiKey(apiToken);
+            const baseUrl = readPreviewString(env, 'ANTHROPIC_BASE_URL');
+            if (baseUrl !== undefined) setUrl(baseUrl);
+
+            applyModelFromPreview(env, 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'sonnet', setDefaultSonnetModel);
+            applyModelFromPreview(env, 'ANTHROPIC_DEFAULT_OPUS_MODEL', 'opus', setDefaultOpusModel);
+            applyModelFromPreview(env, 'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'haiku', setDefaultHaikuModel);
+            applyModelFromPreview(env, 'ANTHROPIC_REASONING_MODEL', 'reasoning', setDefaultReasoningModel);
+
+            const envBooleanMap: Array<[string, keyof InternalSettings, string?]> = [
+                ['CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS', 'teammatesMode'],
+                ['CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'disableNonessentialTraffic'],
+                ['CLAUDE_CODE_ATTRIBUTION_HEADER', 'disableAttributionHeader', '0'],
+                ['DISABLE_INSTALLATION_CHECKS', 'disableInstallationChecks'],
+                ['ENABLE_TOOL_SEARCH', 'enableToolSearch'],
+                ['CLAUDE_CODE_USE_POWERSHELL_TOOL', 'enablePowerShellTool'],
+                ['DISABLE_TELEMETRY', 'disableTelemetry'],
+                ['DISABLE_BUG_COMMAND', 'disableBugCommand'],
+                ['DISABLE_AUTOUPDATER', 'disableAutoupdater'],
+                ['DISABLE_ERROR_REPORTING', 'disableErrorReporting'],
+            ];
+            for (const [envKey, settingKey, enabledValue] of envBooleanMap) {
+                const flag = readEnvFlag(env, envKey, enabledValue);
+                if (flag !== undefined) nextSettings[settingKey] = flag as never;
+            }
+
+            const envStringMap: Array<[string, keyof InternalSettings]> = [
+                ['CLAUDE_CODE_MAX_OUTPUT_TOKENS', 'maxOutputTokens'],
+                ['CLAUDE_CODE_EFFORT_LEVEL', 'effortLevel'],
+                ['API_TIMEOUT_MS', 'apiTimeoutMs'],
+                ['BASH_DEFAULT_TIMEOUT_MS', 'bashDefaultTimeoutMs'],
+                ['MCP_TIMEOUT', 'mcpTimeoutMs'],
+                ['MCP_TOOL_TIMEOUT', 'mcpToolTimeoutMs'],
+                ['TASK_MAX_OUTPUT_LENGTH', 'taskMaxOutputLength'],
+                ['ANTHROPIC_BETAS', 'anthropicBetas'],
+                ['ANTHROPIC_CUSTOM_HEADERS', 'anthropicCustomHeaders'],
+                ['ANTHROPIC_CUSTOM_MODEL_OPTION', 'customModelOption'],
+                ['ANTHROPIC_CUSTOM_MODEL_OPTION_NAME', 'customModelOptionName'],
+                ['ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION', 'customModelOptionDescription'],
+                ['ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES', 'customModelOptionCapabilities'],
+            ];
+            for (const [envKey, settingKey] of envStringMap) {
+                const envValue = readPreviewString(env, envKey);
+                if (envValue !== undefined) nextSettings[settingKey] = envValue as never;
+            }
+
+            const ripgrepMode = readPreviewString(env, 'USE_BUILTIN_RIPGREP');
+            if (ripgrepMode !== undefined) {
+                nextSettings.ripgrepMode = ripgrepMode === '0' ? 'system' : 'builtin';
+            }
+        }
+
+        setInternalSettings(prev => ({ ...prev, ...nextSettings }));
+    }, []);
 
     // ============================================
     // 实时配置预览 - 调用后端获取原始 + 预览内容，逐行 diff 高亮
@@ -842,49 +959,7 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
                         </div>
                     )}
 
-                    <div className="flex flex-col gap-4">
-                        {previewData.map((file, idx) => {
-                            const stripComma = (s: string) => s.replace(/,\s*$/, '');
-                            const previewLines = file.content.split('\n');
-                            const originalSet = new Set(file.originalContent.split('\n').map(stripComma));
-                            const changedCount = previewLines.filter(line => !originalSet.has(stripComma(line))).length;
-
-                            return (
-                                <div key={idx} className="relative rounded-md border border-gray-200 dark:border-slate-700 overflow-hidden bg-gray-50 dark:bg-[#1e1e2e]">
-                                    <div className="flex items-center justify-between bg-gray-100 dark:bg-slate-800/80 px-3 py-1.5 border-b border-gray-200 dark:border-slate-700">
-                                        <span className="text-xs font-mono text-gray-600 dark:text-slate-300">{file.title}</span>
-                                        {changedCount > 0 && (
-                                            <span className="text-[10px] font-medium text-emerald-600 dark:text-emerald-400/80 bg-emerald-500/10 px-1.5 py-0.5 rounded">
-                                                {changedCount} 行变更
-                                            </span>
-                                        )}
-                                    </div>
-                                    <div className="p-0 overflow-x-auto">
-                                        {previewLines.map((line, lineIdx) => {
-                                            const isNew = !originalSet.has(stripComma(line));
-
-                                            return (
-                                                <div
-                                                    key={lineIdx}
-                                                    className={cn(
-                                                        "flex font-mono text-[13px] leading-[1.7] border-l-2",
-                                                        isNew
-                                                            ? "bg-emerald-500/10 border-l-emerald-400 text-emerald-700 dark:text-emerald-300"
-                                                            : "border-l-transparent text-gray-800 dark:text-[#cdd6f4]"
-                                                    )}
-                                                >
-                                                    <span className="select-none w-8 shrink-0 text-right pr-2 text-[11px] text-gray-400 dark:text-slate-600 leading-[1.7]">
-                                                        {lineIdx + 1}
-                                                    </span>
-                                                    <span className="px-3 whitespace-pre">{line || ' '}</span>
-                                                </div>
-                                            );
-                                        })}
-                                    </div>
-                                </div>
-                            );
-                        })}
-                    </div>
+                    <EditablePreview files={previewData} onJsonChange={applyPreviewJsonChange} />
                 </div>
             </div>
         </ModalDialog>
