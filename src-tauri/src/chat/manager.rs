@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, OnceCell};
 
 use crate::models::chat::ChatMessageEvent;
 
+use super::agent_id::DEFAULT_AGENT_ID;
 use super::daemon_client::{DaemonClient, EventSink, SESSION_ID};
 use super::permission_watcher::PermissionWatcher;
 use super::protocol::StreamLine;
@@ -132,7 +133,7 @@ impl ChatManager {
                 let debug = self.debug_mode();
 
                 let client = Arc::new(DaemonClient::new(
-                    node, bridge, deps, perm_dir, api_key, base_url, debug,
+                    node, bridge, deps, perm_dir, DEFAULT_AGENT_ID.to_string(), api_key, base_url, debug,
                 )) as Arc<dyn ManagerDaemonClient>;
 
                 // Forward lifecycle events to the frontend.
