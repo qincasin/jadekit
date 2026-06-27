@@ -1,7 +1,9 @@
 pub mod advanced_commands;
 pub mod antigravity_commands;
 pub mod backup_commands;
+pub mod chat_commands;
 pub mod deeplink_commands;
+pub mod editor_commands;
 pub mod mcp_commands;
 pub mod prompt_commands;
 pub mod provider_commands;

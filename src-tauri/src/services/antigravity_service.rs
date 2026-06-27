@@ -389,7 +389,26 @@ pub fn check_quota_protection(
 }
 
 pub fn list_accounts(db: &Arc<Database>) -> Result<Vec<AntigravityAccount>, String> {
-    db.list_antigravity_accounts()
+    let mut accounts = db.list_antigravity_accounts()?;
+
+    // 惰性对账:以真相文件为权威,静默修正 DB is_active。
+    // 真相文件缺失/损坏 → get_current_account_id 返回 None → 跳过,返回 DB 现状(兜底,不阻塞)。
+    if let Ok(Some(current_id)) = crate::services::ag_current_account::get_current_account_id() {
+        let needs_fix = accounts
+            .iter()
+            .any(|a| (a.id == current_id) != a.is_active);
+        if needs_fix {
+            if let Err(e) = db.set_active_antigravity_account(&current_id) {
+                tracing::warn!("Failed to reconcile is_active with truth file: {}", e);
+            } else {
+                for a in accounts.iter_mut() {
+                    a.is_active = a.id == current_id;
+                }
+            }
+        }
+    }
+
+    Ok(accounts)
 }
 
 pub fn get_account(db: &Arc<Database>, id: &str) -> Result<AntigravityAccount, String> {
@@ -457,11 +476,19 @@ pub async fn add_account(
     }
 
     let existing = db.list_antigravity_accounts()?;
-    if existing.is_empty() {
+    let is_first = existing.is_empty();
+    if is_first {
         account.is_active = true;
     }
 
     db.upsert_antigravity_account(&account)?;
+    // 首个账号入库时,真相文件指向它(对齐上游「首账号自动成为当前」)。
+    if is_first {
+        if let Err(e) = crate::services::ag_current_account::set_current_account_id(db, &account.id)
+        {
+            tracing::warn!("Failed to set truth file for first account: {}", e);
+        }
+    }
     if let Err(e) = db.log_ag_operation(&account.id, &account.email, "account_added", None) {
         tracing::warn!("Failed to log account_added operation: {}", e);
     }
@@ -473,10 +500,21 @@ pub fn delete_account(db: &Arc<Database>, id: &str) -> Result<(), String> {
         .get_antigravity_account(id)?
         .ok_or_else(|| format!("Account not found: {}", id))?;
 
-    if account.is_active {
+    let is_current =
+        crate::services::ag_current_account::get_current_account_id()?.as_deref() == Some(id);
+
+    if is_current || account.is_active {
         let all = db.list_antigravity_accounts()?;
-        if let Some(next) = all.iter().find(|a| a.id != id) {
-            db.set_active_antigravity_account(&next.id)?;
+        match all.iter().find(|a| a.id != id) {
+            Some(next) => {
+                // 回退到下一个账号:同步真相文件 + DB
+                crate::services::ag_current_account::set_current_account_id(db, &next.id)?;
+            }
+            None => {
+                // 无后继账号:删完清空真相文件 + DB is_active
+                db.clear_antigravity_active()?;
+                crate::services::ag_current_account::clear_current_account_id()?;
+            }
         }
     }
 
@@ -631,7 +669,24 @@ pub async fn refresh_all_quotas(db: &Arc<Database>) -> Result<RefreshStats, Stri
     })
 }
 
-/// 切换账号：刷新 token → 设为活跃 → 本地进程切换（关闭→注入→重启）→ 更新 accounts.json。
+/// 确保账号有设备指纹:无则生成、绑定并存 DB;有则复用。
+/// 对齐上游 account.rs:1082-1095。
+fn ensure_device_profile(
+    db: &Arc<Database>,
+    account: &mut AntigravityAccount,
+) -> Result<(), String> {
+    if account.device_profile.is_none() {
+        tracing::info!(
+            "Account {} has no bound fingerprint, generating new one for isolation...",
+            account.email
+        );
+        account.device_profile = Some(crate::services::ag_device::generate_profile());
+        db.upsert_antigravity_account(account)?;
+    }
+    Ok(())
+}
+
+/// 切换账号：刷新 token → 本地进程切换（关闭→注入→重启）→ 原子写真相文件 + 刷 DB。
 pub async fn switch_account(
     db: &Arc<Database>,
     id: &str,
@@ -648,27 +703,21 @@ pub async fn switch_account(
         account = refresh_account_token(db, id).await?;
     }
 
-    // 2. Update Antigravity Manager's accounts.json before restart if it exists.
-    // Antigravity may read this file during startup, so this must happen before
-    // execute_local_switch starts the app again. If the switch fails, restore it.
-    let previous_manager_account_id = match set_antigravity_manager_current_account(&account.email)
-    {
-        Ok(previous) => previous,
-        Err(e) => {
-            tracing::warn!(
-                "Failed to update Antigravity Manager current account: {}",
-                e
-            );
-            None
-        }
-    };
+    // 1.5 确保账号有设备指纹(无则生成 + 存 DB,有则复用)。进程切换前必须就绪,
+    //     因为 execute_local_switch 会把指纹写入 ide 的 storage.json。
+    ensure_device_profile(db, &mut account)?;
 
-    // 3. Execute local app switch: close → inject credentials → restart
+    // 2. Execute local app switch: close → inject credentials → restart
+    //    进程操作在前,失败直接返回 —— 真相文件与 DB 都不动(切换没成功不该改激活态)。
     let switch_data = crate::services::ag_integration::SwitchAccountData {
         email: account.email.clone(),
         access_token: account.access_token.clone(),
         refresh_token: account.refresh_token.clone(),
         expiry_timestamp: account.expiry_timestamp,
+        device_profile: account.device_profile.clone(),
+        project_id: account.project_id.clone(),
+        id_token: None,
+        oauth_client_key: account.oauth_client_key.clone(),
     };
 
     let ide = target_ide.map(|s| s.to_string());
@@ -676,24 +725,12 @@ pub async fn switch_account(
         crate::services::ag_integration::execute_local_switch(&switch_data, ide.as_deref())
     })
     .await
-    .map_err(|e| format!("Switch task panicked: {}", e))
-    .and_then(|result| result)
-    .map_err(|e| {
-        if let Some(previous_id) = previous_manager_account_id {
-            if let Err(restore_error) = restore_antigravity_manager_current_account(&previous_id) {
-                tracing::warn!(
-                    "Failed to restore Antigravity Manager current account after switch error: {}",
-                    restore_error
-                );
-            }
-        }
-        e
-    })?;
+    .map_err(|e| format!("Switch task panicked: {}", e))??;
 
-    // 4. Only mark the account active after the external switch has succeeded.
-    db.set_active_antigravity_account(id)?;
+    // 3. 进程切换成功后,原子写真相文件 + 刷 DB is_active(同一调用内一致)
+    crate::services::ag_current_account::set_current_account_id(db, id)?;
 
-    // 5. Copy refresh_token to system clipboard
+    // 4. Copy refresh_token to system clipboard
     if let Err(e) = copy_refresh_token_to_clipboard(&account.refresh_token) {
         tracing::warn!("Failed to copy refresh token to clipboard: {}", e);
     }
@@ -703,94 +740,6 @@ pub async fn switch_account(
     }
 
     Ok(())
-}
-
-/// Update the `current_account_id` in ~/.antigravity_tools/accounts.json
-/// so the Antigravity app picks up the account switch.
-/// Silently continues if the file doesn't exist or the email isn't found.
-fn set_antigravity_manager_current_account(email: &str) -> Result<Option<String>, String> {
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => return Ok(None),
-    };
-    let accounts_path = home.join(".antigravity_tools").join("accounts.json");
-
-    if !accounts_path.exists() {
-        return Ok(None);
-    }
-
-    let content = std::fs::read_to_string(&accounts_path)
-        .map_err(|e| format!("Could not read accounts.json: {}", e))?;
-
-    let mut accounts_data: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| format!("Could not parse accounts.json: {}", e))?;
-
-    let accounts_array = match accounts_data
-        .get_mut("accounts")
-        .and_then(|v| v.as_array_mut())
-    {
-        Some(arr) => arr,
-        None => return Ok(None),
-    };
-
-    let matched_id = accounts_array.iter().find_map(|entry| {
-        if entry.get("email").and_then(|e| e.as_str()) == Some(email) {
-            entry
-                .get("id")
-                .and_then(|id| id.as_str())
-                .map(|s| s.to_string())
-        } else {
-            None
-        }
-    });
-
-    if let Some(ref matched_id) = matched_id {
-        let previous_id = accounts_data
-            .get("current_account_id")
-            .and_then(|id| id.as_str())
-            .map(|s| s.to_string());
-        if previous_id.as_deref() == Some(matched_id.as_str()) {
-            return Ok(previous_id);
-        }
-
-        accounts_data["current_account_id"] = serde_json::Value::String(matched_id.clone());
-        write_antigravity_manager_accounts(&accounts_path, &accounts_data)?;
-        return Ok(previous_id);
-    }
-
-    Ok(None)
-}
-
-fn restore_antigravity_manager_current_account(account_id: &str) -> Result<(), String> {
-    let home = dirs::home_dir().ok_or_else(|| "Home directory not found".to_string())?;
-    let accounts_path = home.join(".antigravity_tools").join("accounts.json");
-    if !accounts_path.exists() {
-        return Ok(());
-    }
-
-    let content = std::fs::read_to_string(&accounts_path)
-        .map_err(|e| format!("Could not read accounts.json: {}", e))?;
-    let mut accounts_data: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| format!("Could not parse accounts.json: {}", e))?;
-    accounts_data["current_account_id"] = serde_json::Value::String(account_id.to_string());
-    write_antigravity_manager_accounts(&accounts_path, &accounts_data)
-}
-
-fn write_antigravity_manager_accounts(
-    accounts_path: &std::path::Path,
-    accounts_data: &serde_json::Value,
-) -> Result<(), String> {
-    let temp_path = accounts_path.with_extension("json.tmp");
-    let json_bytes = serde_json::to_string_pretty(accounts_data)
-        .map_err(|e| format!("Could not serialize accounts.json: {}", e))?
-        .into_bytes();
-
-    std::fs::write(&temp_path, &json_bytes)
-        .map_err(|e| format!("Could not write temp accounts.json: {}", e))?;
-    std::fs::rename(&temp_path, accounts_path).map_err(|e| {
-        let _ = std::fs::remove_file(&temp_path);
-        format!("Could not rename temp accounts.json: {}", e)
-    })
 }
 
 /// Copy the refresh token to the system clipboard using arboard.
@@ -1622,4 +1571,173 @@ pub fn get_token_status(db: &Arc<Database>, id: &str) -> Result<TokenStatus, Str
         last_refreshed,
         refresh_count,
     })
+}
+
+#[cfg(test)]
+mod active_account_tests {
+    use super::*;
+    use crate::database::Database;
+    use crate::models::antigravity::AntigravityAccount;
+
+    /// 建一个内存 SQLite + 两个账号,A 活跃、B 不活跃。
+    fn setup_two_accounts(
+    ) -> (
+        Arc<Database>,
+        AntigravityAccount,
+        AntigravityAccount,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current-account.json");
+        crate::services::ag_current_account::set_test_override(Some(path));
+        let db = Arc::new(Database::in_memory().expect("in-memory db"));
+        let mut a = base_account("a@x.com");
+        a.is_active = true;
+        let mut b = base_account("b@x.com");
+        b.is_active = false;
+        db.upsert_antigravity_account(&a).unwrap();
+        db.upsert_antigravity_account(&b).unwrap();
+        (db, a, b, dir)
+    }
+
+    fn base_account(email: &str) -> AntigravityAccount {
+        AntigravityAccount {
+            id: email.to_string(), // 测试用 email 当 id,够用
+            email: email.to_string(),
+            name: None,
+            access_token: "tok".into(),
+            refresh_token: "rt".into(),
+            expires_in: 3600,
+            expiry_timestamp: chrono::Utc::now().timestamp() + 3600,
+            oauth_client_key: None,
+            project_id: None,
+            subscription_tier: None,
+            custom_label: None,
+            is_active: false,
+            disabled: false,
+            disabled_reason: None,
+            quota: None,
+            device_profile: None,
+            created_at: 0,
+            last_used: 0,
+            order_index: 0,
+        }
+    }
+
+    #[test]
+    fn list_reconciles_when_truth_file_disagrees() {
+        let (db, _a, b, _dir) = setup_two_accounts();
+        // 真相文件说是 b,DB 说 a —— list_accounts 应把 b 刷成活跃、a 不活跃
+        let path = crate::services::ag_current_account::current_account_file_path().unwrap();
+        let payload = serde_json::json!({"currentAccountId": b.id, "updatedAt": 1});
+        std::fs::write(&path, payload.to_string()).unwrap();
+
+        let accounts = list_accounts(&db).unwrap();
+        let got_b = accounts.iter().find(|a| a.id == b.id).unwrap();
+        let got_a = accounts.iter().find(|a| a.id == "a@x.com").unwrap();
+        assert!(got_b.is_active, "b should be active after reconcile");
+        assert!(!got_a.is_active, "a should be inactive after reconcile");
+
+        // DB 也被静默修正
+        let db_accounts = db.list_antigravity_accounts().unwrap();
+        let db_b = db_accounts.iter().find(|a| a.id == b.id).unwrap();
+        assert!(db_b.is_active, "DB should also reflect b active");
+    }
+
+    #[test]
+    fn list_falls_back_to_db_when_truth_file_missing() {
+        let (db, _a, _b, _dir) = setup_two_accounts();
+        // 不写真相文件 → get_current_account_id 返回 None → 返回 DB 现状
+        let accounts = list_accounts(&db).unwrap();
+        let got_a = accounts.iter().find(|a| a.id == "a@x.com").unwrap();
+        assert!(got_a.is_active, "fall back to DB is_active, a stays active");
+    }
+
+    #[test]
+    fn switch_updates_truth_file_and_db_atomically() {
+        let (db, _a, b, _dir) = setup_two_accounts();
+        // 直接验证「写真相」这一步的对外效果:set_current_account_id 后文件与 DB 一致
+        crate::services::ag_current_account::set_current_account_id(&db, &b.id).unwrap();
+
+        // 真相文件 = b
+        let cid = crate::services::ag_current_account::get_current_account_id().unwrap();
+        assert_eq!(cid.as_deref(), Some(b.id.as_str()));
+        // DB = b 活跃、a 不活跃
+        let db_accounts = db.list_antigravity_accounts().unwrap();
+        assert!(db_accounts.iter().find(|a| a.id == b.id).unwrap().is_active);
+        assert!(!db_accounts
+            .iter()
+            .find(|a| a.id == "a@x.com")
+            .unwrap()
+            .is_active);
+    }
+
+    #[test]
+    fn delete_active_account_falls_back_and_updates_truth_file() {
+        let (db, _a, b, _dir) = setup_two_accounts();
+        // 让 b 成为真相文件的当前账号
+        crate::services::ag_current_account::set_current_account_id(&db, &b.id).unwrap();
+        assert_eq!(
+            crate::services::ag_current_account::get_current_account_id()
+                .unwrap()
+                .as_deref(),
+            Some(b.id.as_str())
+        );
+
+        // 删 b(当前账号)→ 真相文件应回退到剩余账号 a
+        delete_account(&db, &b.id).unwrap();
+
+        let cid = crate::services::ag_current_account::get_current_account_id().unwrap();
+        assert_eq!(
+            cid.as_deref(),
+            Some("a@x.com"),
+            "truth file should fall back to a"
+        );
+    }
+
+    #[test]
+    fn delete_only_account_clears_truth_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current-account.json");
+        crate::services::ag_current_account::set_test_override(Some(path));
+        let db = Arc::new(Database::in_memory().unwrap());
+        let only = base_account("only@x.com");
+        db.upsert_antigravity_account(&only).unwrap();
+        crate::services::ag_current_account::set_current_account_id(&db, &only.id).unwrap();
+
+        delete_account(&db, &only.id).unwrap();
+        assert_eq!(
+            crate::services::ag_current_account::get_current_account_id().unwrap(),
+            None,
+            "no accounts left → truth file cleared"
+        );
+    }
+
+    #[test]
+    fn switch_ensures_device_profile_generated_and_persisted() {
+        let (db, _a, b, _dir) = setup_two_accounts();
+        // b 初始无指纹(base_account 没设 device_profile)
+        let before = db.get_antigravity_account(&b.id).unwrap().unwrap();
+        assert!(before.device_profile.is_none(), "b should start without profile");
+
+        // 调用 switch 的前置步骤:确保指纹(不实际跑进程切换,只测指纹生成绑定)
+        let mut account = b.clone();
+        ensure_device_profile(&db, &mut account).unwrap();
+
+        // 内存中 account 现在有指纹
+        assert!(account.device_profile.is_some(), "account now has profile");
+        // DB 也持久化了
+        let after = db.get_antigravity_account(&b.id).unwrap().unwrap();
+        assert!(after.device_profile.is_some(), "DB persisted the profile");
+
+        // 再次 ensure 不重新生成(复用)
+        let first = account.device_profile.clone().unwrap();
+        let mut again = after.clone();
+        ensure_device_profile(&db, &mut again).unwrap();
+        assert_eq!(
+            again.device_profile.as_ref().unwrap().machine_id,
+            first.machine_id,
+            "second ensure must reuse existing profile, not regenerate"
+        );
+    }
 }

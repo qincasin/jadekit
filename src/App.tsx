@@ -17,6 +17,7 @@ import { UpdateInfo } from './types/about';
 
 // 懒加载非首屏页面，减少 Dashboard 切换到其他页面时的渲染开销
 const ClaudePage = lazy(() => import('./pages/ClaudePage'));
+const ChatPage = lazy(() => import('./pages/ChatPage'));
 const AntigravityPage = lazy(() => import('./pages/AntigravityPage'));
 const ProvidersPage = lazy(() => import('./pages/ProvidersPage'));
 const McpPage = lazy(() => import('./pages/McpPage'));
@@ -44,6 +45,10 @@ const router = createHashRouter([
       {
         path: 'claude',
         element: <SuspenseWrapper><ClaudePage /></SuspenseWrapper>,
+      },
+      {
+        path: 'chat',
+        element: <SuspenseWrapper><ChatPage /></SuspenseWrapper>,
       },
       {
         path: 'antigravity',

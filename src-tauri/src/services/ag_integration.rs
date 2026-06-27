@@ -685,29 +685,6 @@ fn get_db_path(target_ide: Option<&str>) -> Option<PathBuf> {
     None
 }
 
-/// Simple DB injection for older Antigravity versions — just write the onboarding flag
-/// and a simple auth hint. Full protobuf-based injection is in Antigravity-Manager.
-fn inject_db_simple(
-    db_path: &PathBuf,
-    _access_token: &str,
-    _refresh_token: &str,
-    _email: &str,
-) -> Result<(), String> {
-    // For older versions, the primary injection is via protobuf which is complex.
-    // We write the onboarding flag at minimum.
-    let conn = rusqlite::Connection::open(db_path)
-        .map_err(|e| format!("Failed to open Antigravity DB: {}", e))?;
-
-    conn.execute(
-        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
-        ["antigravityOnboarding", "true"],
-    )
-    .map_err(|e| format!("Failed to write onboarding flag: {}", e))?;
-
-    tracing::info!("DB simple injection completed");
-    Ok(())
-}
-
 	// ── 主切换流程 ──
 
 /// 账号切换所需的凭据数据。
@@ -716,6 +693,10 @@ pub struct SwitchAccountData {
     pub access_token: String,
     pub refresh_token: String,
     pub expiry_timestamp: i64,
+    pub device_profile: Option<crate::models::antigravity::AntigravityDeviceProfile>,
+    pub project_id: Option<String>,
+    pub id_token: Option<String>,
+    pub oauth_client_key: Option<String>,
 }
 
 /// 执行完整的本地账号切换：关闭进程 → 注入凭据 → 重启进程。
@@ -740,18 +721,26 @@ pub fn execute_local_switch(
         thread::sleep(Duration::from_millis(500));
     }
 
-    // 2. Determine injection method based on version
-    let use_keyring = match get_antigravity_version(target_ide) {
-        Some(ver) => {
-            tracing::info!("Detected Antigravity version: {}", ver);
-            compare_version(&ver, "2.0.0") != std::cmp::Ordering::Less
-        }
-        None => {
-            // If version detection fails, default to keyring (modern approach)
-            tracing::warn!(
-                "Could not detect Antigravity version, defaulting to Keychain injection"
-            );
-            true
+    // 2. Determine injection method:
+    //    - Antigravity IDE(定制版)→ 永远走 state.vscdb 注入(不读 keychain)
+    //    - 原生 Antigravity → 探测版本,>= 2.0.0 用 keychain,否则 legacy DB
+    let is_ide = target_ide == Some("ide");
+    let use_keyring = if is_ide {
+        tracing::info!("Target is Antigravity IDE, using state.vscdb injection");
+        false
+    } else {
+        match get_antigravity_version(target_ide) {
+            Some(ver) => {
+                tracing::info!("Detected Antigravity version: {}", ver);
+                compare_version(&ver, "2.0.0") != std::cmp::Ordering::Less
+            }
+            None => {
+                // If version detection fails, default to keyring (modern approach)
+                tracing::warn!(
+                    "Could not detect Antigravity version, defaulting to Keychain injection"
+                );
+                true
+            }
         }
     };
 
@@ -762,26 +751,54 @@ pub fn execute_local_switch(
             &account.refresh_token,
             account.expiry_timestamp,
         )?;
+
+        // 写设备指纹到 storage.json(对齐上游 integration.rs:109-114)。
+        write_device_profile_if_any(target_ide, account.device_profile.as_ref());
     } else {
-        // Legacy path: inject into SQLite DB
-        if let Some(db_path) = get_db_path(target_ide) {
-            tracing::info!("Using legacy DB injection at {:?}", db_path);
-            // Backup first
-            let backup_path = db_path.with_extension("vscdb.backup");
-            let _ = std::fs::copy(&db_path, &backup_path);
-            inject_db_simple(
-                &db_path,
-                &account.access_token,
-                &account.refresh_token,
-                &account.email,
-            )?;
-        } else {
-            tracing::warn!("No DB path found for legacy injection, trying keyring fallback");
-            write_to_system_keyring(
-                &account.access_token,
-                &account.refresh_token,
-                account.expiry_timestamp,
-            )?;
+        // Antigravity IDE 或老版本 Antigravity:state.vscdb protobuf 注入
+        match get_db_path(target_ide) {
+            Some(db_path) => {
+                tracing::info!("Using state.vscdb injection at {:?}", db_path);
+                let backup_path = db_path.with_extension("vscdb.backup");
+                let _ = std::fs::copy(&db_path, &backup_path);
+
+                // 先写设备指纹到 storage.json(对齐上游 integration.rs:117-123,
+                // legacy 分支先写指纹再注入 DB)。IDE 启动时交叉校验
+                // storage.json 指纹与 state.vscdb 凭据,指纹与凭据必须同账号,
+                // 否则 IDE 拒绝登录。
+                write_device_profile_if_any(target_ide, account.device_profile.as_ref());
+
+                crate::services::ag_db_inject::inject_token(
+                    &db_path,
+                    &account.access_token,
+                    &account.refresh_token,
+                    account.expiry_timestamp,
+                    &account.email,
+                    false,
+                    account.project_id.as_deref(),
+                    account.id_token.as_deref(),
+                    account.oauth_client_key.as_deref(),
+                )?;
+
+                // 注入 serviceMachineId(指纹的 mac_machine_id),解决缓存指纹不匹配
+                if let Some(ref profile) = account.device_profile {
+                    let _ = crate::services::ag_db_inject::write_service_machine_id(
+                        &db_path,
+                        &profile.mac_machine_id,
+                    );
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "No state.vscdb found for {:?}, falling back to keychain",
+                    target_ide
+                );
+                write_to_system_keyring(
+                    &account.access_token,
+                    &account.refresh_token,
+                    account.expiry_timestamp,
+                )?;
+            }
         }
     }
 
@@ -790,5 +807,28 @@ pub fn execute_local_switch(
 
     tracing::info!("Local switch completed for {}", account.email);
     Ok(())
+}
+
+/// 把设备指纹写入 ide 的 storage.json(若存在)。
+/// keychain 与 state.vscdb 两条切换路径都会调用:keyring 路径靠它写原生 Antigravity
+/// 的指纹;IDE 路径靠它保证 storage.json 指纹与 state.vscdb 凭据同账号(否则 IDE
+/// 交叉校验失败拒绝登录)。指纹缺失或 storage.json 不存在都不阻断切换。
+fn write_device_profile_if_any(
+    target_ide: Option<&str>,
+    profile: Option<&crate::models::antigravity::AntigravityDeviceProfile>,
+) {
+    let Some(profile) = profile else {
+        return;
+    };
+    match crate::services::ag_device::get_storage_path(target_ide) {
+        Ok(storage_path) => {
+            if let Err(e) = crate::services::ag_device::write_profile(&storage_path, profile) {
+                tracing::warn!("Failed to write device profile to {:?}: {}", storage_path, e);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("storage.json not found for {:?}: {}", target_ide, e);
+        }
+    }
 }
 

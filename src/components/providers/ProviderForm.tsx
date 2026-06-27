@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo, type Dispatch, type SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Eye, EyeOff, Loader2, RefreshCw, ExternalLink, HeartPulse, ChevronDown, X, Plus } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
@@ -8,6 +8,7 @@ import { useProviderStore } from '../../stores/useProviderStore';
 import { Provider, ProviderProxyConfig } from '../../types/provider';
 import { AppType, VISIBLE_APP_TYPES, APP_LABELS } from '../../types/app';
 import ProviderProxyConfigInput from './ProviderProxyConfig';
+import EditablePreview from './EditablePreview';
 import { cn } from '../../utils/cn';
 
 // ── 基础 UI 组件 ──────────────────────────────────────────────
@@ -168,10 +169,20 @@ const CLAUDE_DEPRECATED_FIELD_LABELS: Record<string, string> = {
 
 const CLAUDE_SETTING_CONTROL_CLASS = "flex min-h-[36px] items-center rounded-md border border-transparent px-2";
 
+// 1M 上下文模型角色 key（集中定义，避免散落魔法字符串）
+type OneMRole = 'sonnet' | 'opus' | 'haiku' | 'reasoning';
+
 // ── 预设配置 ──────────────────────────────────────────────
 
-const PRESETS = [
-    { label: 'Claude Official', url: 'https://api.anthropic.com', appType: 'claude' as AppType },
+const PRESETS: Array<{
+    label: string;
+    url: string;
+    appType: AppType;
+    // 可选：预设默认声明 1M 上下文的模型角色
+    oneMContext?: Provider['oneMContext'];
+}> = [
+    // 官方 Sonnet/Opus 支持 1M 上下文，默认勾选
+    { label: 'Claude Official', url: 'https://api.anthropic.com', appType: 'claude' as AppType, oneMContext: { sonnet: true, opus: true } },
     { label: 'OpenRouter', url: 'https://openrouter.ai/api', appType: 'claude' as AppType },
 ];
 
@@ -181,6 +192,10 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
     const { t } = useTranslation();
     const { addProvider, updateProvider } = useProviderStore();
     const isEditing = !!editingProvider;
+
+    // 1M 上下文勾选框的 hint 与标签文案（i18n）
+    const oneMHint = t('providers.oneMHint', '声明该模型支持 1M 上下文（写入时拼 [1M] 后缀，需上游支持）');
+    const oneMLabel = t('providers.oneMLabel', '声明支持 1M');
 
     // 基本配置
     const [name, setName] = useState(editingProvider?.name || '');
@@ -193,6 +208,9 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
     const [defaultOpusModel, setDefaultOpusModel] = useState(editingProvider?.defaultOpusModel || '');
     const [defaultHaikuModel, setDefaultHaikuModel] = useState(editingProvider?.defaultHaikuModel || '');
     const [defaultReasoningModel, setDefaultReasoningModel] = useState(editingProvider?.defaultReasoningModel || '');
+
+    // 每个模型角色是否声明 1M 上下文（写入时由后端拼 [1M] 后缀）
+    const [oneMContext, setOneMContext] = useState<Provider['oneMContext']>(editingProvider?.oneMContext || {});
 
     // 其他配置
     const [description, setDescription] = useState(editingProvider?.description || '');
@@ -231,6 +249,7 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
             setDefaultOpusModel(editingProvider?.defaultOpusModel || '');
             setDefaultHaikuModel(editingProvider?.defaultHaikuModel || '');
             setDefaultReasoningModel(editingProvider?.defaultReasoningModel || '');
+            setOneMContext(editingProvider?.oneMContext || {});
             setDescription(editingProvider?.description || '');
             setTags(editingProvider?.tags || []);
             if (editingProvider?.proxyConfig) {
@@ -278,6 +297,10 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
             setUrl(preset.url);
         }
         setAppType(preset.appType);
+        // 预设若声明了 1M 默认值则应用，否则保持当前
+        if (preset.oneMContext) {
+            setOneMContext(preset.oneMContext);
+        }
     };
 
     const handleTestConnectivity = async () => {
@@ -335,6 +358,8 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
                 defaultOpusModel: defaultOpusModel.trim() || undefined,
                 defaultHaikuModel: defaultHaikuModel.trim() || undefined,
                 defaultReasoningModel: defaultReasoningModel.trim() || undefined,
+                // 至少有一个角色声明 1M 才保存，全 false/空则不写
+                oneMContext: oneMContext && Object.values(oneMContext).some(Boolean) ? oneMContext : undefined,
                 description: description.trim() || undefined,
                 tags: tags.length > 0 ? tags : undefined,
                 settingsConfig: (() => {
@@ -372,6 +397,122 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
         }));
     };
 
+    const readPreviewString = (source: Record<string, any>, key: string) => {
+        const value = source[key];
+        if (typeof value === 'string') return value;
+        if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+        return undefined;
+    };
+
+    const readEnvFlag = (env: Record<string, any>, key: string, enabledValue = '1') => {
+        const value = env[key];
+        if (typeof value === 'boolean') return value;
+        if (typeof value === 'string') return value === enabledValue;
+        if (typeof value === 'number') return String(value) === enabledValue;
+        return undefined;
+    };
+
+    const applyModelFromPreview = (
+        env: Record<string, any>,
+        envKey: string,
+        role: OneMRole,
+        setter: (value: string) => void,
+    ) => {
+        const raw = readPreviewString(env, envKey);
+        if (raw === undefined) return;
+        const oneMSuffix = '[1M]';
+        const supportsOneM = raw.endsWith(oneMSuffix);
+        setter(supportsOneM ? raw.slice(0, -oneMSuffix.length) : raw);
+        setOneMContext(prev => ({ ...prev, [role]: supportsOneM }));
+    };
+
+    const applyPreviewJsonChange = useCallback((title: string, value: unknown) => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+        const doc = value as Record<string, any>;
+
+        if (title.endsWith('auth.json')) {
+            const openAiKey = readPreviewString(doc, 'OPENAI_API_KEY');
+            if (openAiKey !== undefined) setApiKey(openAiKey);
+            return;
+        }
+
+        if (!title.endsWith('settings.json')) return;
+
+        const nextSettings: Partial<InternalSettings> = {};
+        for (const key of CLAUDE_SETTING_KEYS) {
+            if (!(key in doc)) continue;
+            const valueForKey = doc[key];
+            const defaultValue = CLAUDE_SETTINGS_DEFAULTS[key];
+            if (typeof defaultValue === 'boolean' && typeof valueForKey === 'boolean') {
+                nextSettings[key] = valueForKey as never;
+            } else if (typeof defaultValue === 'string' && (typeof valueForKey === 'string' || typeof valueForKey === 'number')) {
+                nextSettings[key] = String(valueForKey) as never;
+            }
+        }
+
+        const env = doc.env && typeof doc.env === 'object' && !Array.isArray(doc.env)
+            ? doc.env as Record<string, any>
+            : undefined;
+
+        if (env) {
+            // 中文注释（白名单回写）：预览编辑只反向覆盖已知字段，避免把任意 env
+            // 或未来未知配置误写进结构化表单。
+            const apiToken = readPreviewString(env, 'ANTHROPIC_AUTH_TOKEN');
+            if (apiToken !== undefined) setApiKey(apiToken);
+            const baseUrl = readPreviewString(env, 'ANTHROPIC_BASE_URL');
+            if (baseUrl !== undefined) setUrl(baseUrl);
+
+            applyModelFromPreview(env, 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'sonnet', setDefaultSonnetModel);
+            applyModelFromPreview(env, 'ANTHROPIC_DEFAULT_OPUS_MODEL', 'opus', setDefaultOpusModel);
+            applyModelFromPreview(env, 'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'haiku', setDefaultHaikuModel);
+            applyModelFromPreview(env, 'ANTHROPIC_REASONING_MODEL', 'reasoning', setDefaultReasoningModel);
+
+            const envBooleanMap: Array<[string, keyof InternalSettings, string?]> = [
+                ['CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS', 'teammatesMode'],
+                ['CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', 'disableNonessentialTraffic'],
+                ['CLAUDE_CODE_ATTRIBUTION_HEADER', 'disableAttributionHeader', '0'],
+                ['DISABLE_INSTALLATION_CHECKS', 'disableInstallationChecks'],
+                ['ENABLE_TOOL_SEARCH', 'enableToolSearch'],
+                ['CLAUDE_CODE_USE_POWERSHELL_TOOL', 'enablePowerShellTool'],
+                ['DISABLE_TELEMETRY', 'disableTelemetry'],
+                ['DISABLE_BUG_COMMAND', 'disableBugCommand'],
+                ['DISABLE_AUTOUPDATER', 'disableAutoupdater'],
+                ['DISABLE_ERROR_REPORTING', 'disableErrorReporting'],
+            ];
+            for (const [envKey, settingKey, enabledValue] of envBooleanMap) {
+                const flag = readEnvFlag(env, envKey, enabledValue);
+                if (flag !== undefined) nextSettings[settingKey] = flag as never;
+            }
+
+            const envStringMap: Array<[string, keyof InternalSettings]> = [
+                ['CLAUDE_CODE_MAX_OUTPUT_TOKENS', 'maxOutputTokens'],
+                ['CLAUDE_CODE_EFFORT_LEVEL', 'effortLevel'],
+                ['API_TIMEOUT_MS', 'apiTimeoutMs'],
+                ['BASH_DEFAULT_TIMEOUT_MS', 'bashDefaultTimeoutMs'],
+                ['MCP_TIMEOUT', 'mcpTimeoutMs'],
+                ['MCP_TOOL_TIMEOUT', 'mcpToolTimeoutMs'],
+                ['TASK_MAX_OUTPUT_LENGTH', 'taskMaxOutputLength'],
+                ['ANTHROPIC_BETAS', 'anthropicBetas'],
+                ['ANTHROPIC_CUSTOM_HEADERS', 'anthropicCustomHeaders'],
+                ['ANTHROPIC_CUSTOM_MODEL_OPTION', 'customModelOption'],
+                ['ANTHROPIC_CUSTOM_MODEL_OPTION_NAME', 'customModelOptionName'],
+                ['ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION', 'customModelOptionDescription'],
+                ['ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES', 'customModelOptionCapabilities'],
+            ];
+            for (const [envKey, settingKey] of envStringMap) {
+                const envValue = readPreviewString(env, envKey);
+                if (envValue !== undefined) nextSettings[settingKey] = envValue as never;
+            }
+
+            const ripgrepMode = readPreviewString(env, 'USE_BUILTIN_RIPGREP');
+            if (ripgrepMode !== undefined) {
+                nextSettings.ripgrepMode = ripgrepMode === '0' ? 'system' : 'builtin';
+            }
+        }
+
+        setInternalSettings(prev => ({ ...prev, ...nextSettings }));
+    }, []);
+
     // ============================================
     // 实时配置预览 - 调用后端获取原始 + 预览内容，逐行 diff 高亮
     // ============================================
@@ -405,11 +546,13 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
             defaultOpusModel: defaultOpusModel.trim() || undefined,
             defaultHaikuModel: defaultHaikuModel.trim() || undefined,
             defaultReasoningModel: defaultReasoningModel.trim() || undefined,
+            // 预览必须带上 oneMContext，否则预览看不到 [1M] 后缀
+            oneMContext: oneMContext && Object.values(oneMContext).some(Boolean) ? oneMContext : undefined,
             settingsConfig: Object.keys(filteredSettings).length > 0 ? filteredSettings : undefined,
             isActive: false,
             createdAt: editingProvider?.createdAt || new Date().toISOString(),
         };
-    }, [editingProvider, name, appType, apiKey, url, defaultSonnetModel, defaultOpusModel, defaultHaikuModel, defaultReasoningModel, internalSettings]);
+    }, [editingProvider, name, appType, apiKey, url, defaultSonnetModel, defaultOpusModel, defaultHaikuModel, defaultReasoningModel, oneMContext, internalSettings]);
 
     // 防抖调用后端：获取预览结果，首次结果作为 baseline
     useEffect(() => {
@@ -605,33 +748,58 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
                         
                         <div className="grid grid-cols-2 gap-x-4 gap-y-3">
                             {/* We maintain only the original 4 models to match what the user expected */}
-                            <ModelComboBox
+                            {/* 仅 Claude 类型在每个模型角色旁显示「声明支持 1M」勾选框 */}
+                            <ModelRoleField
                                 label="Sonnet Model"
                                 placeholder="claude-sonnet-4-..."
                                 value={defaultSonnetModel}
                                 onChange={(v) => setDefaultSonnetModel(v)}
                                 options={fetchedModels}
+                                role="sonnet"
+                                showOneM={appType === 'claude'}
+                                oneMContext={oneMContext}
+                                setOneMContext={setOneMContext}
+                                oneMHint={oneMHint}
+                                oneMLabel={oneMLabel}
                             />
-                            <ModelComboBox
+                            <ModelRoleField
                                 label="Opus Model"
                                 placeholder="claude-opus-4-..."
                                 value={defaultOpusModel}
                                 onChange={(v) => setDefaultOpusModel(v)}
                                 options={fetchedModels}
+                                role="opus"
+                                showOneM={appType === 'claude'}
+                                oneMContext={oneMContext}
+                                setOneMContext={setOneMContext}
+                                oneMHint={oneMHint}
+                                oneMLabel={oneMLabel}
                             />
-                            <ModelComboBox
+                            <ModelRoleField
                                 label="Haiku Model"
                                 placeholder="claude-haiku-..."
                                 value={defaultHaikuModel}
                                 onChange={(v) => setDefaultHaikuModel(v)}
                                 options={fetchedModels}
+                                role="haiku"
+                                showOneM={appType === 'claude'}
+                                oneMContext={oneMContext}
+                                setOneMContext={setOneMContext}
+                                oneMHint={oneMHint}
+                                oneMLabel={oneMLabel}
                             />
-                            <ModelComboBox
+                            <ModelRoleField
                                 label={t('providers.reasoningModel', '推理模型 (Thinking)')}
                                 placeholder="claude-sonnet-4-..."
                                 value={defaultReasoningModel}
                                 onChange={(v) => setDefaultReasoningModel(v)}
                                 options={fetchedModels}
+                                role="reasoning"
+                                showOneM={appType === 'claude'}
+                                oneMContext={oneMContext}
+                                setOneMContext={setOneMContext}
+                                oneMHint={oneMHint}
+                                oneMLabel={oneMLabel}
                             />
                         </div>
                     </div>
@@ -791,49 +959,7 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
                         </div>
                     )}
 
-                    <div className="flex flex-col gap-4">
-                        {previewData.map((file, idx) => {
-                            const stripComma = (s: string) => s.replace(/,\s*$/, '');
-                            const previewLines = file.content.split('\n');
-                            const originalSet = new Set(file.originalContent.split('\n').map(stripComma));
-                            const changedCount = previewLines.filter(line => !originalSet.has(stripComma(line))).length;
-
-                            return (
-                                <div key={idx} className="relative rounded-md border border-gray-200 dark:border-slate-700 overflow-hidden bg-gray-50 dark:bg-[#1e1e2e]">
-                                    <div className="flex items-center justify-between bg-gray-100 dark:bg-slate-800/80 px-3 py-1.5 border-b border-gray-200 dark:border-slate-700">
-                                        <span className="text-xs font-mono text-gray-600 dark:text-slate-300">{file.title}</span>
-                                        {changedCount > 0 && (
-                                            <span className="text-[10px] font-medium text-emerald-600 dark:text-emerald-400/80 bg-emerald-500/10 px-1.5 py-0.5 rounded">
-                                                {changedCount} 行变更
-                                            </span>
-                                        )}
-                                    </div>
-                                    <div className="p-0 overflow-x-auto">
-                                        {previewLines.map((line, lineIdx) => {
-                                            const isNew = !originalSet.has(stripComma(line));
-
-                                            return (
-                                                <div
-                                                    key={lineIdx}
-                                                    className={cn(
-                                                        "flex font-mono text-[13px] leading-[1.7] border-l-2",
-                                                        isNew
-                                                            ? "bg-emerald-500/10 border-l-emerald-400 text-emerald-700 dark:text-emerald-300"
-                                                            : "border-l-transparent text-gray-800 dark:text-[#cdd6f4]"
-                                                    )}
-                                                >
-                                                    <span className="select-none w-8 shrink-0 text-right pr-2 text-[11px] text-gray-400 dark:text-slate-600 leading-[1.7]">
-                                                        {lineIdx + 1}
-                                                    </span>
-                                                    <span className="px-3 whitespace-pre">{line || ' '}</span>
-                                                </div>
-                                            );
-                                        })}
-                                    </div>
-                                </div>
-                            );
-                        })}
-                    </div>
+                    <EditablePreview files={previewData} onJsonChange={applyPreviewJsonChange} />
                 </div>
             </div>
         </ModalDialog>
@@ -841,6 +967,42 @@ export default function ProviderForm({ isOpen, editingProvider, onClose, default
 }
 
 /** Custom styled model combo box with dropdown selection + custom text input */
+// 模型角色字段：ComboBox + 可选的「声明支持 1M」勾选框
+// 仅 Claude 类型显示勾选框，勾选后由后端在写入模型 env 时拼 [1M] 后缀
+function ModelRoleField({ label, placeholder, value, onChange, options, role, showOneM, oneMContext, setOneMContext, oneMHint, oneMLabel }: {
+    label: string;
+    placeholder: string;
+    value: string;
+    onChange: (v: string) => void;
+    options: string[];
+    role: OneMRole;
+    showOneM: boolean;
+    oneMContext: Provider['oneMContext'];
+    setOneMContext: Dispatch<SetStateAction<Provider['oneMContext']>>;
+    oneMHint: string;
+    oneMLabel: string;
+}) {
+    return (
+        <div className="space-y-1">
+            <ModelComboBox label={label} placeholder={placeholder} value={value} onChange={onChange} options={options} />
+            {showOneM && (
+                <label
+                    className="flex items-center gap-1.5 text-[11px] text-gray-500 dark:text-slate-400 cursor-pointer"
+                    title={oneMHint}
+                >
+                    <input
+                        type="checkbox"
+                        className="h-3.5 w-3.5 rounded border-gray-300 dark:border-slate-600"
+                        checked={!!oneMContext?.[role]}
+                        onChange={(e) => setOneMContext((prev) => ({ ...prev, [role]: e.target.checked }))}
+                    />
+                    <span>{oneMLabel}</span>
+                </label>
+            )}
+        </div>
+    );
+}
+
 function ModelComboBox({ label, placeholder, value, onChange, options }: {
     label: string;
     placeholder: string;

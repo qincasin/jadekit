@@ -8,8 +8,8 @@
   "home": {
     "badge": "支持 Claude · Codex · Gemini",
     "title": "JadeKit",
-    "subtitle": "AI CLI 工具的统一配置管理器",
-    "description": "无缝切换 API 密钥环境，彻底告别频繁手动修改终端环境变量的痛苦",
+    "subtitle": "AI Agent Routing Kit",
+    "description": "统一路由 Claude、Codex、Gemini 与本地代理，让多 Agent 工具链保持清爽可控",
     "downloadBtn": "立即下载",
     "githubBtn": "Star on GitHub",
     "features": {
@@ -59,7 +59,7 @@
     },
     "cta": {
       "title": "准备好了吗？",
-      "description": "立即下载 JadeKit，体验流畅的 AI CLI 配置管理",
+      "description": "立即下载 JadeKit，体验更清爽的 AI Agent 路由与工具链管理",
       "download": "免费下载",
       "docs": "查看文档"
     }

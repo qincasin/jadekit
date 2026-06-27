@@ -1,6 +1,32 @@
 use rusqlite::Connection;
 
+/// providers 表新增列的幂等迁移语句（对齐已有 settings_config/proxy_config 的 JSON TEXT 存储方式）。
+/// 旧库通过 `CREATE TABLE IF NOT EXISTS` 不会自动补列，需用 ALTER TABLE 补齐；
+/// 重复执行会触发 "duplicate column" 错误，按幂等处理忽略。
+const PROVIDERS_ADD_COLUMN_MIGRATIONS: &[&str] =
+    &["ALTER TABLE providers ADD COLUMN one_m_context TEXT"];
+
 pub fn create_tables(conn: &Connection) -> Result<(), String> {
+    create_base_tables(conn)?;
+    migrate_provider_columns(conn)?;
+    Ok(())
+}
+
+/// 对旧库补齐 providers 表后加的列；忽略 "duplicate column" 表示列已存在。
+fn migrate_provider_columns(conn: &Connection) -> Result<(), String> {
+    for sql in PROVIDERS_ADD_COLUMN_MIGRATIONS {
+        if let Err(e) = conn.execute(sql, []) {
+            let msg = e.to_string();
+            // 列已存在属于正常的幂等情况，其余错误才向上抛
+            if !msg.contains("duplicate column") {
+                return Err(format!("Failed to migrate provider columns: {msg}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn create_base_tables(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS mcp_servers (
@@ -77,7 +103,8 @@ pub fn create_tables(conn: &Connection) -> Result<(), String> {
             is_active BOOLEAN NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             last_used INTEGER,
-            proxy_config TEXT
+            proxy_config TEXT,
+            one_m_context TEXT
         );
 
         -- 全局代理配置表（单行表）

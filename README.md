@@ -3,7 +3,7 @@
 
   # JadeKit
 
-  **Claude · Codex · Gemini 多工具统一配置管理桌面应用**
+  **AI Agent Routing Kit**
 
   [![Website](https://img.shields.io/badge/🌐-Website-orange?logo=github-pages)](https://qincasin.github.io/jadekit/)
   [![Tauri](https://img.shields.io/badge/Tauri-v2-active?logo=tauri&color=FFC131)](#)
@@ -21,7 +21,7 @@
 
 ## 简介
 
-**JadeKit** 是一个跨平台桌面应用，为 AI CLI 工具（Claude Code、Codex CLI、Gemini CLI 等）提供统一的配置管理与增强体验。
+**JadeKit** 是一个跨平台桌面应用，为 AI CLI 与 Agent 工具链（Claude Code、Codex CLI、Gemini CLI 等）提供统一的路由、配置管理与增强体验。
 
 无论你是独立开发者还是多项目维护者，JadeKit 让你：
 - 一键切换 API Key 和服务商，告别手动编辑环境变量

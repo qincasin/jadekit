@@ -20,8 +20,8 @@ export default function Navbar() {
         <div className="flex items-center justify-between h-16">
           {/* Logo */}
           <Link to="/" className="flex items-center space-x-3 group">
-            <img src={appIcon} alt="JadeKit" className="h-9 w-9 rounded-xl shadow-lg shadow-emerald-500/20 group-hover:shadow-emerald-500/30 transition-shadow" />
-            <span className="font-semibold text-lg text-white group-hover:text-emerald-300 transition-colors">
+            <img src={appIcon} alt="JadeKit" className="h-9 w-9 rounded-xl shadow-lg shadow-slate-500/20 group-hover:shadow-cyan-200/20 transition-shadow" />
+            <span className="font-semibold text-lg text-white group-hover:text-cyan-100 transition-colors">
               JadeKit
             </span>
           </Link>
@@ -40,7 +40,7 @@ export default function Navbar() {
               >
                 {item.label}
                 {location.pathname === item.path && (
-                  <span className="absolute bottom-0 left-1/2 -translate-x-1/2 w-8 h-0.5 bg-gradient-to-r from-emerald-400 to-cyan-400 rounded-full" />
+                  <span className="absolute bottom-0 left-1/2 -translate-x-1/2 w-8 h-0.5 bg-gradient-to-r from-slate-300 to-cyan-200 rounded-full" />
                 )}
               </Link>
             ))}

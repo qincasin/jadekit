@@ -14,11 +14,11 @@ export default function Footer() {
           {/* Logo & Description */}
           <div className="sm:col-span-2">
             <div className="flex items-center space-x-3 mb-4">
-              <img src={appIcon} alt="JadeKit" className="h-10 w-10 rounded-xl shadow-lg shadow-emerald-500/20" />
+              <img src={appIcon} alt="JadeKit" className="h-10 w-10 rounded-xl shadow-lg shadow-slate-500/20" />
               <span className="font-semibold text-lg text-white">JadeKit</span>
             </div>
             <p className="text-gray-500 text-sm mb-4 max-w-md">
-              AI CLI 工具的统一配置管理器 - 支持 Claude、Codex、Gemini 等主流大模型
+              AI Agent Routing Kit - 统一管理 Claude、Codex、Gemini 与本地代理工作流
             </p>
             <div className="flex items-center space-x-6">
               {footerLinks.map((link) => {

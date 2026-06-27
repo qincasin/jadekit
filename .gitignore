@@ -47,3 +47,6 @@ src-tauri/gen
 designs
 
 
+
+# codegraph 本地工具数据库（勿入库）
+.codegraph/

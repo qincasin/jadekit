@@ -22,6 +22,10 @@ fn default_update_source() -> String {
     DEFAULT_UPDATE_SOURCE.to_string()
 }
 
+fn default_debug_mode() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub theme: String,
@@ -39,6 +43,8 @@ pub struct Config {
     pub check_update_interval_hours: u32,
     #[serde(default = "default_update_source", rename = "updateSource")]
     pub update_source: String,
+    #[serde(default = "default_debug_mode", rename = "debugMode")]
+    pub debug_mode: bool,
 }
 
 impl Default for Config {
@@ -51,6 +57,7 @@ impl Default for Config {
             auto_check_update: default_auto_check_update(),
             check_update_interval_hours: default_check_update_interval_hours(),
             update_source: default_update_source(),
+            debug_mode: default_debug_mode(),
         }
     }
 }

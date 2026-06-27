@@ -111,6 +111,14 @@ impl Database {
         Ok(())
     }
 
+    /// 把所有账号 is_active 置 0(删除当前账号且无后继时用)。
+    pub fn clear_antigravity_active(&self) -> Result<(), String> {
+        let conn = lock_conn!(self.conn);
+        conn.execute("UPDATE antigravity_accounts SET is_active = 0", [])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn get_active_antigravity_account(&self) -> Result<Option<AntigravityAccount>, String> {
         let conn = lock_conn!(self.conn);
