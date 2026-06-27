@@ -153,7 +153,17 @@ pub fn get_provider_config_files(app: AppType) -> Result<Vec<(String, String)>, 
 /// 列出指定应用的 providers（从数据库读取）
 pub fn list_providers_from_db(db: &Arc<Database>, app: AppType) -> Result<Vec<Provider>, String> {
     let all = db.list_providers()?;
-    Ok(all.into_iter().filter(|p| p.app_type == app).collect())
+    let mut providers: Vec<Provider> = all.into_iter().filter(|p| p.app_type == app).collect();
+    if matches!(app, AppType::Claude | AppType::Codex) && !providers.iter().any(|p| p.is_active) {
+        let official_id = match app {
+            AppType::Claude => CLAUDE_OFFICIAL_PROVIDER_ID,
+            AppType::Codex => CODEX_OFFICIAL_PROVIDER_ID,
+            _ => unreachable!(),
+        };
+        // 官方订阅不入库；DB 中没有活跃自定义 Provider 时，合成 active 官方项供代理路由识别。
+        providers.push(build_official_provider(official_id, app));
+    }
+    Ok(providers)
 }
 
 /// 列出所有应用的 providers（从数据库读取）
@@ -1491,6 +1501,21 @@ mod tests {
 
         assert_eq!(providers.len(), 2);
         assert!(providers.iter().all(|p| p.app_type == AppType::Claude));
+    }
+
+    #[test]
+    fn test_list_providers_includes_official_when_no_custom_active() {
+        let db = Arc::new(Database::in_memory().expect("init in-memory db"));
+        let mut provider = provider_for_app("claude-a", AppType::Claude);
+        provider.is_active = false;
+        db.upsert_provider(&provider)
+            .expect("insert claude-a");
+
+        let providers = list_providers_from_db(&db, AppType::Claude).expect("list providers");
+
+        assert!(providers
+            .iter()
+            .any(|p| p.id == CLAUDE_OFFICIAL_PROVIDER_ID && p.is_active));
     }
 
     #[test]
