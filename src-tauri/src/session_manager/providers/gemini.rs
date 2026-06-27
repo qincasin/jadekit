@@ -300,6 +300,9 @@ fn parse_session_file(
         last_active_at,
         source_path,
         resume_command: Some(resume_command),
+        pinned: false,
+        archived: false,
+        unread: false,
     })
 }
 
@@ -348,7 +351,12 @@ pub fn load_gemini_messages(source_path: &str) -> Result<Vec<UnifiedSessionMessa
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        result.push(UnifiedSessionMessage { role, content, ts });
+        result.push(UnifiedSessionMessage {
+            role,
+            content,
+            ts,
+            raw: None,
+        });
     }
 
     Ok(result)

@@ -194,99 +194,111 @@ function Dashboard() {
                     </div>
                 )}
 
-                {/* Antigravity Account Summary */}
-                <Link
-                    to="/antigravity"
-                    className="block bg-white dark:bg-base-100 rounded-xl p-5 shadow-sm border border-gray-100 dark:border-base-200 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5 group"
-                >
-                    <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-3">
-                            <div className="p-2.5 rounded-lg bg-violet-50 dark:bg-violet-900/20">
-                                <Users className="w-5 h-5 text-violet-500" />
-                            </div>
-                            <div>
-                                <h2 className="font-semibold text-gray-900 dark:text-base-content">
-                                    {t('dashboard.antigravity_accounts')}
-                                </h2>
-                                <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                                    {t('dashboard.antigravity_desc')}
-                                </p>
-                            </div>
-                        </div>
-                        <ArrowRight className="w-4 h-4 text-gray-400 group-hover:text-violet-500 group-hover:translate-x-0.5 transition-all" />
-                    </div>
-                    <div className="mt-4 flex items-center gap-6">
-                        <div>
-                            <div className="text-2xl font-bold text-gray-900 dark:text-base-content">
-                                {accounts.length}
-                            </div>
-                            <div className="text-xs text-gray-500 dark:text-gray-400">
-                                {t('antigravity.stats_total')}
-                            </div>
-                        </div>
-                        <div className="h-8 w-px bg-gray-200 dark:bg-base-300" />
-                        <div>
-                            <div className="text-sm font-medium text-gray-900 dark:text-base-content truncate max-w-[200px]">
-                                {accounts.find(a => a.isActive)?.email || t('dashboard.antigravity_no_active')}
-                            </div>
-                            <div className="text-xs text-gray-500 dark:text-gray-400">
-                                {t('dashboard.antigravity_active_account')}
-                            </div>
-                        </div>
-                    </div>
-                </Link>
-
-                <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
-                    {recentActivity.length > 0 && (
-                        <div className="xl:col-span-2 bg-white dark:bg-base-100 rounded-xl p-5 pb-3 shadow-sm border border-gray-100 dark:border-base-200 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5 flex flex-col">
-                            <div className="flex items-center gap-2 mb-2">
-                                <BarChart3 className="w-5 h-5 text-gray-500" />
-                                <h2 className="font-semibold text-gray-900 dark:text-base-content">
-                                    {t('dashboard.activity_title')}
-                                </h2>
-                            </div>
-                            <div className="flex flex-1 min-h-[14rem]">
-                                <div className="flex flex-col justify-between pr-2 text-xs text-gray-400 shrink-0">
-                                    <span>{maxCount}</span>
-                                    <span>{Math.round(maxCount / 2)}</span>
-                                    <span>0</span>
+                <div className="grid grid-cols-1 xl:grid-cols-12 gap-4 items-stretch">
+                    {/* Antigravity Account Summary */}
+                    <Link
+                        to="/antigravity"
+                        className="xl:col-span-7 flex min-h-[14rem] flex-col bg-white dark:bg-base-100 rounded-xl p-5 shadow-sm border border-gray-100 dark:border-base-200 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5 group"
+                    >
+                        <div className="flex items-start justify-between gap-4">
+                            <div className="flex items-center gap-3">
+                                <div className="p-2.5 rounded-lg bg-violet-50 dark:bg-violet-900/20">
+                                    <Users className="w-5 h-5 text-violet-500" />
                                 </div>
-                                <div className="flex-1 flex flex-col">
-                                    <div className="flex items-end gap-1 flex-1 min-h-[14rem]">
-                                        {recentActivity.map((entry, i) => {
-                                            const height = Math.max((entry.count / maxCount) * 100, 4);
-                                            return (
-                                                <div key={i} className="flex-1 h-full flex flex-col items-center justify-end group relative">
-                                                    <div className="absolute -top-6 left-1/2 -translate-x-1/2 bg-gray-800 text-white text-xs px-2 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none z-10">
-                                                        {entry.count}
-                                                    </div>
-                                                    <div
-                                                        className="w-full rounded-t bg-gradient-to-t from-blue-500 to-blue-400 dark:from-blue-600 dark:to-blue-400 transition-all duration-200 group-hover:from-blue-600 group-hover:to-blue-500 group-hover:scale-y-105 min-w-[4px]"
-                                                        style={{ height: `${height}%` }}
-                                                    />
+                                <div>
+                                    <h2 className="font-semibold text-gray-900 dark:text-base-content">
+                                        {t('dashboard.antigravity_accounts')}
+                                    </h2>
+                                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                                        {t('dashboard.antigravity_desc')}
+                                    </p>
+                                </div>
+                            </div>
+                            <ArrowRight className="mt-1 w-4 h-4 text-gray-400 group-hover:text-violet-500 group-hover:translate-x-0.5 transition-all" />
+                        </div>
+                        <div className="mt-5 grid flex-1 grid-cols-1 gap-3 sm:grid-cols-3">
+                            <div className="rounded-lg bg-violet-50/70 dark:bg-violet-900/10 p-3">
+                                <div className="text-3xl font-bold text-gray-900 dark:text-base-content">
+                                    {accounts.length}
+                                </div>
+                                <div className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                                    {t('antigravity.stats_total')}
+                                </div>
+                            </div>
+                            <div className="sm:col-span-2 rounded-lg bg-gray-50 dark:bg-base-200/70 p-3">
+                                <div className="text-xs text-gray-500 dark:text-gray-400">
+                                    {t('dashboard.antigravity_active_account')}
+                                </div>
+                                <div className="mt-2 text-sm font-semibold text-gray-900 dark:text-base-content truncate">
+                                    {accounts.find(a => a.isActive)?.email || t('dashboard.antigravity_no_active')}
+                                </div>
+                                <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-gray-200 dark:bg-base-300">
+                                    <div
+                                        className="h-full rounded-full bg-violet-500 transition-all duration-300"
+                                        style={{width: accounts.length > 0 ? '100%' : '8%'}}
+                                    />
+                                </div>
+                            </div>
+                        </div>
+                    </Link>
+
+                    <div className="xl:col-span-5 min-h-[14rem]">
+                        <HourlyClockChart hourData={hourData} maxHourCount={maxHourCount} />
+                    </div>
+                </div>
+
+                <div className="bg-white dark:bg-base-100 rounded-xl p-5 pb-3 shadow-sm border border-gray-100 dark:border-base-200 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5 flex flex-col">
+                    <div className="flex items-center gap-2 mb-2">
+                        <BarChart3 className="w-5 h-5 text-gray-500" />
+                        <h2 className="font-semibold text-gray-900 dark:text-base-content">
+                            {t('dashboard.activity_title')}
+                        </h2>
+                    </div>
+                    {recentActivity.length === 0 ? (
+                        <EmptyCardState
+                            icon={BarChart3}
+                            title={t('token_usage.no_data')}
+                            description={t('dashboard.activity_title')}
+                        />
+                    ) : (
+                        <div className="flex flex-1 min-h-[14rem]">
+                            <div className="flex flex-col justify-between pr-2 text-xs text-gray-400 shrink-0">
+                                <span>{maxCount}</span>
+                                <span>{Math.round(maxCount / 2)}</span>
+                                <span>0</span>
+                            </div>
+                            <div className="flex-1 flex flex-col">
+                                <div className="flex items-end gap-1 flex-1 min-h-[14rem]">
+                                    {recentActivity.map((entry, i) => {
+                                        const height = Math.max((entry.count / maxCount) * 100, 4);
+                                        return (
+                                            <div key={i} className="flex-1 h-full flex flex-col items-center justify-end group relative">
+                                                <div className="absolute -top-6 left-1/2 -translate-x-1/2 bg-gray-800 text-white text-xs px-2 py-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none z-10">
+                                                    {entry.count}
                                                 </div>
-                                            );
-                                        })}
-                                    </div>
-                                    <div className="flex gap-1 mt-1">
-                                        {recentActivity.map((entry, i) => (
-                                            <div key={i} className="flex-1 text-center">
-                                                <span className="text-[10px] text-gray-400">{formatDateLabel(entry.date)}</span>
+                                                <div
+                                                    className="w-full rounded-t bg-gradient-to-t from-blue-500 to-blue-400 dark:from-blue-600 dark:to-blue-400 transition-all duration-200 group-hover:from-blue-600 group-hover:to-blue-500 group-hover:scale-y-105 min-w-[4px]"
+                                                    style={{ height: `${height}%` }}
+                                                />
                                             </div>
-                                        ))}
-                                    </div>
+                                        );
+                                    })}
+                                </div>
+                                <div className="flex gap-1 mt-1">
+                                    {recentActivity.map((entry, i) => (
+                                        <div key={i} className="flex-1 text-center">
+                                            <span className="text-[10px] text-gray-400">{formatDateLabel(entry.date)}</span>
+                                        </div>
+                                    ))}
                                 </div>
                             </div>
                         </div>
                     )}
-
-                    <HourlyClockChart hourData={hourData} maxHourCount={maxHourCount} />
                 </div>
 
                 {/* Token 每日趋势 + 模型占比 */}
-                <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
-                    {dailyTotals.length > 0 && (
-                        <div className="xl:col-span-2 bg-white dark:bg-base-100 rounded-xl p-5 shadow-sm border border-gray-100 dark:border-base-200 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5 flex flex-col overflow-hidden">
+                <div className="grid grid-cols-1 xl:grid-cols-12 gap-4">
+                    <div className="xl:col-span-7 min-h-[22rem] bg-white dark:bg-base-100 rounded-xl p-5 shadow-sm border border-gray-100 dark:border-base-200 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5 flex flex-col overflow-hidden">
                             <div className="flex items-center gap-2 mb-4">
                                 <TrendingUp className="w-5 h-5 text-emerald-500" />
                                 <h2 className="font-semibold text-gray-900 dark:text-base-content">
@@ -304,6 +316,14 @@ function Dashboard() {
                                 </button>
                             </div>
 
+                            {dailyTotals.length === 0 ? (
+                                <EmptyCardState
+                                    icon={TrendingUp}
+                                    title={t('token_usage.no_data')}
+                                    description={t('token_usage.refresh_stats_title')}
+                                />
+                            ) : (
+                                <>
                             {/* 摘要指标 */}
                             <div className="grid grid-cols-3 gap-2 mb-4">
                                 <TrendMetric label={t('token_usage.total_tokens')} value={formatCompactTokens(totalRecentTokens)} />
@@ -406,19 +426,22 @@ function Dashboard() {
                                     ))}
                                 </div>
                             </div>
-                        </div>
-                    )}
+                                </>
+                            )}
+                    </div>
 
-                    <div className={`bg-white dark:bg-base-100 rounded-xl p-5 shadow-sm border border-gray-100 dark:border-base-200 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5 ${dailyTotals.length === 0 ? 'xl:col-span-3' : ''}`}>
+                    <div className="xl:col-span-5 min-h-[22rem] bg-white dark:bg-base-100 rounded-xl p-5 shadow-sm border border-gray-100 dark:border-base-200 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5">
                         <div className="flex items-center gap-2 mb-4">
                             <PieChart className="w-5 h-5 text-teal-500" />
                             <h2 className="font-semibold text-gray-900 dark:text-base-content">{t('token_usage.model_share_title')}</h2>
                         </div>
 
                         {pieData.length === 0 ? (
-                            <div className="h-48 flex items-center justify-center text-sm text-gray-400">
-                                {t('token_usage.no_data')}
-                            </div>
+                            <EmptyCardState
+                                icon={PieChart}
+                                title={t('token_usage.no_data')}
+                                description={t('token_usage.model_usage_title')}
+                            />
                         ) : (
                             <>
                                 <div className="flex justify-center">
@@ -505,14 +528,22 @@ function Dashboard() {
                 </div>
 
                 <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-                    <div className="bg-white dark:bg-base-100 rounded-xl p-5 shadow-sm border border-gray-100 dark:border-base-200 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5">
+                    <div className="min-h-[15rem] bg-white dark:bg-base-100 rounded-xl p-5 shadow-sm border border-gray-100 dark:border-base-200 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5">
                         <div className="flex items-center gap-2 mb-4">
                             <Coins className="w-5 h-5 text-amber-500" />
                             <h2 className="font-semibold text-gray-900 dark:text-base-content">
                                 {t('token_usage.model_usage_title')}
                             </h2>
                         </div>
-                        <div className="overflow-x-auto">
+                        {topModels.length === 0 ? (
+                            <EmptyCardState
+                                icon={Coins}
+                                title={t('token_usage.no_data')}
+                                description={t('token_usage.model_usage_title')}
+                                compact
+                            />
+                        ) : (
+                            <div className="overflow-x-auto">
                             <table className="w-full text-sm">
                                 <thead>
                                     <tr className="text-xs text-gray-500 dark:text-gray-400 border-b border-gray-100 dark:border-base-200">
@@ -537,10 +568,11 @@ function Dashboard() {
                                     ))}
                                 </tbody>
                             </table>
-                        </div>
+                            </div>
+                        )}
                     </div>
 
-                    <div className="bg-white dark:bg-base-100 rounded-xl p-5 shadow-sm border border-gray-100 dark:border-base-200 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5">
+                    <div className="min-h-[15rem] bg-white dark:bg-base-100 rounded-xl p-5 shadow-sm border border-gray-100 dark:border-base-200 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5">
                         <div className="flex items-center gap-2 mb-4">
                             <FolderOpen className="w-5 h-5 text-cyan-500" />
                             <h2 className="font-semibold text-gray-900 dark:text-base-content">
@@ -548,7 +580,12 @@ function Dashboard() {
                             </h2>
                         </div>
                         {topProjects.length === 0 ? (
-                            <div className="text-sm text-gray-400">{t('dashboard.project_token_empty')}</div>
+                            <EmptyCardState
+                                icon={FolderOpen}
+                                title={t('dashboard.project_token_empty')}
+                                description={t('dashboard.project_token_title')}
+                                compact
+                            />
                         ) : (
                             <div className="space-y-2 max-h-[480px] overflow-y-auto pr-1">
                                 {topProjects.map((project) => (
@@ -617,6 +654,28 @@ function TrendMetric({ label, value }: { label: string; value: string }) {
         <div className="rounded-lg border border-gray-100 dark:border-base-300 bg-gray-50 dark:bg-base-200 px-3 py-2">
             <div className="text-[11px] text-gray-400">{label}</div>
             <div className="text-sm font-semibold text-emerald-600 dark:text-emerald-400">{value}</div>
+        </div>
+    );
+}
+
+function EmptyCardState({
+    icon: Icon,
+    title,
+    description,
+    compact = false,
+}: {
+    icon: React.ElementType;
+    title: string;
+    description: string;
+    compact?: boolean;
+}) {
+    return (
+        <div className={`flex flex-col items-center justify-center rounded-lg border border-dashed border-gray-200 dark:border-base-300 bg-gray-50/70 dark:bg-base-200/40 text-center ${compact ? 'min-h-[8rem] p-4' : 'min-h-[14rem] p-6'}`}>
+            <div className="mb-3 rounded-lg bg-white dark:bg-base-100 p-2 shadow-sm">
+                <Icon className="h-5 w-5 text-gray-400" />
+            </div>
+            <div className="text-sm font-medium text-gray-500 dark:text-gray-300">{title}</div>
+            <div className="mt-1 max-w-xs text-xs text-gray-400 dark:text-gray-500">{description}</div>
         </div>
     );
 }
@@ -696,15 +755,15 @@ function HourlyClockChart({ hourData, maxHourCount }: { hourData: { hour: number
     const hourLabels = [0, 3, 6, 9, 12, 15, 18, 21];
 
     return (
-        <div className="bg-white dark:bg-base-100 rounded-xl p-5 pb-3 shadow-sm border border-gray-100 dark:border-base-200 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5">
+        <div className="flex h-full min-h-[14rem] flex-col bg-white dark:bg-base-100 rounded-xl p-5 pb-3 shadow-sm border border-gray-100 dark:border-base-200 transition-all duration-300 hover:shadow-lg hover:-translate-y-0.5">
             <div className="flex items-center gap-2 mb-1">
                 <Clock className="w-5 h-5 text-indigo-500" />
                 <h2 className="font-semibold text-gray-900 dark:text-base-content">
                     {t('token_usage.hourly_title')}
                 </h2>
             </div>
-            <div className="flex items-center justify-center">
-                <svg viewBox="0 0 300 300" className="w-full max-w-[300px]">
+            <div className="flex flex-1 items-center justify-center">
+                <svg viewBox="0 0 300 300" className="w-full max-w-[230px]">
                     {/* 刻度圆环参考线 */}
                     {[0.25, 0.5, 0.75, 1].map((pct) => (
                         <circle

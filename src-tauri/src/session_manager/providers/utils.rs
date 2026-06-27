@@ -116,6 +116,42 @@ pub fn sanitize_session_text(text: &str) -> String {
         .join(" ")
 }
 
+/// 清理会话正文：去除 XML 标签和内部噪声，但保留 Markdown 需要的换行。
+pub fn sanitize_session_markdown_text(text: &str) -> String {
+    let stripped = strip_xml_tags(text).replace('\r', "");
+    let mut lines: Vec<String> = Vec::new();
+    let mut previous_blank = false;
+
+    for raw_line in stripped.lines() {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim();
+
+        if trimmed.contains("\"type\":\"idle_notification\"")
+            || trimmed == "[Request interrupted by user]"
+            || trimmed == "No response requested."
+        {
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            if !lines.is_empty() && !previous_blank {
+                lines.push(String::new());
+                previous_blank = true;
+            }
+            continue;
+        }
+
+        lines.push(line.to_string());
+        previous_blank = false;
+    }
+
+    while lines.last().map(|line| line.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+
+    lines.join("\n")
+}
+
 /// 从消息内容中提取纯文本（支持 string 和 array 格式）
 pub fn extract_message_text(content: &serde_json::Value) -> Option<String> {
     if let Some(text) = content.as_str() {

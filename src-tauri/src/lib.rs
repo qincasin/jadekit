@@ -1,3 +1,4 @@
+mod chat;
 mod commands;
 mod database;
 mod deeplink;
@@ -14,7 +15,9 @@ mod utils;
 use commands::advanced_commands;
 use commands::antigravity_commands;
 use commands::backup_commands;
+use commands::chat_commands;
 use commands::deeplink_commands;
+use commands::editor_commands;
 use commands::mcp_commands;
 use commands::prompt_commands;
 use commands::provider_commands;
@@ -205,6 +208,7 @@ fn refresh_stats_cache() -> Result<StatsCache, String> {
 
 // 在终端中打开目录
 #[tauri::command]
+#[allow(unused_variables)]
 async fn open_in_terminal(
     app: tauri::AppHandle,
     path: String,
@@ -841,6 +845,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
@@ -887,8 +893,44 @@ pub fn run() {
             refresh_stats_cache,
             // Session Manager 命令
             session_commands::list_sessions,
+            session_commands::chat_session_rename,
+            session_commands::chat_project_set_pinned,
+            session_commands::chat_project_set_archived,
+            session_commands::chat_project_remove,
+            session_commands::chat_project_rename,
+            session_commands::chat_project_mark_all_read,
+            session_commands::chat_session_set_pinned,
+            session_commands::chat_session_set_archived,
+            session_commands::chat_session_set_unread,
             session_commands::get_project_provider_map,
+            session_commands::get_unified_session_message_window,
             session_commands::get_unified_session_messages,
+            session_commands::get_claude_subagent_session_messages,
+            // 交互式 Chat 命令
+            chat_commands::chat_send,
+            chat_commands::chat_abort,
+            chat_commands::chat_is_running,
+            chat_commands::chat_start_daemon,
+            chat_commands::chat_sdk_status,
+            chat_commands::chat_node_runtime_status,
+            chat_commands::chat_install_node_runtime,
+            chat_commands::chat_install_sdk,
+            chat_commands::chat_uninstall_sdk,
+            chat_commands::chat_restart_daemon,
+            chat_commands::chat_list_slash_commands,
+            chat_commands::chat_show_system_notification,
+            chat_commands::chat_workspace_status,
+            chat_commands::chat_open_path_in_explorer,
+            chat_commands::chat_git_list_branches,
+            chat_commands::chat_git_create_and_checkout_branch,
+            chat_commands::permission_respond_ask_user_question,
+            chat_commands::permission_respond_tool,
+            chat_commands::permission_respond_plan_approval,
+            chat_commands::chat_open_project_in_terminal,
+            chat_commands::chat_resume_session_in_terminal,
+            chat_commands::chat_list_workspace_files,
+            chat_commands::chat_enhance_prompt,
+            editor_commands::open_file_in_editor,
             open_in_terminal,
             launch_resume_session,
             open_external,
@@ -949,6 +991,7 @@ pub fn run() {
             mcp_commands::delete_mcp_server_v2,
             mcp_commands::toggle_mcp_app,
             mcp_commands::import_mcp_from_apps,
+            mcp_commands::check_mcp_status,
             // Skills v2 (数据库版)
             skill_commands::get_installed_skills,
             skill_commands::install_skill,
@@ -1022,6 +1065,14 @@ pub fn run() {
 
             let state = store::AppState::new(db_arc);
             app.manage(state);
+
+            // 交互式 Chat：注册 ChatState（懒启动 ai-bridge daemon）
+            {
+                let chat_manager = chat::ChatManager::new(app.handle().clone());
+                app.manage(chat_commands::ChatState {
+                    manager: chat_manager,
+                });
+            }
 
             // 自动备份：启动时检查 + 后台定时任务
             {
@@ -1101,6 +1152,14 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app_handle, _event| {
+            // 退出时优雅关闭 ai-bridge daemon（避免遗留孤儿 node 进程；
+            // daemon 自身也有父进程监控兜底）。
+            if let tauri::RunEvent::Exit = _event {
+                if let Some(chat_state) = _app_handle.try_state::<chat_commands::ChatState>() {
+                    tauri::async_runtime::block_on(chat_state.manager.shutdown());
+                }
+            }
+
             // macOS: 点击 dock 图标时恢复隐藏的窗口
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen {

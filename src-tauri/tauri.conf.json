@@ -38,7 +38,10 @@
             "core:default",
             "core:app:allow-set-app-theme",
             "core:window:allow-set-theme",
-            "shell:allow-open"
+            "shell:allow-open",
+            "dialog:default",
+            "dialog:allow-open",
+            "notification:default"
           ]
         }
       ]
@@ -47,6 +50,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": ["resources/ai-bridge/**/*"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
