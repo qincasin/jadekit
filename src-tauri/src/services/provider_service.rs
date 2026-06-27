@@ -2,6 +2,7 @@
 use crate::database::Database;
 use crate::models::app_type::AppType;
 use crate::models::provider::Provider;
+use crate::proxy::takeover;
 use crate::services::app_paths;
 use std::fs;
 use std::io;
@@ -237,7 +238,10 @@ pub fn switch_provider_in_db(
         db.get_provider(provider_id)?
             .ok_or_else(|| format!("Provider {} not found", provider_id))?
     };
-    sync_provider_to_app_config(&active).map_err(|e| e.to_string())?;
+    let takeover_active = takeover::load_backup().is_some();
+    if should_sync_provider_to_app_config(app, takeover_active) {
+        sync_provider_to_app_config(&active).map_err(|e| e.to_string())?;
+    }
 
     Ok(())
 }
@@ -1201,6 +1205,12 @@ fn sync_provider_to_app_config(provider: &Provider) -> Result<(), io::Error> {
     }
 }
 
+fn should_sync_provider_to_app_config(app: AppType, takeover_active: bool) -> bool {
+    // 代理接管 Claude 时，settings.json 必须保持指向本地代理；Provider 热更新由
+    // proxy handler 每请求读取 DB 生效，不能再让切换 Provider 覆盖 BASE_URL。
+    !(app == AppType::Claude && takeover_active)
+}
+
 /// 同步到 Claude ~/.claude/settings.json
 fn sync_to_claude_settings(provider: &Provider) -> Result<(), io::Error> {
     let settings_path = get_claude_settings_path()?;
@@ -1535,6 +1545,13 @@ mod tests {
             model_with_1m(&Some("glm-4.6".to_string()), false),
             Some("glm-4.6".to_string())
         );
+    }
+
+    #[test]
+    fn takeover_active_skips_claude_settings_sync() {
+        assert!(!should_sync_provider_to_app_config(AppType::Claude, true));
+        assert!(should_sync_provider_to_app_config(AppType::Claude, false));
+        assert!(should_sync_provider_to_app_config(AppType::Codex, true));
     }
 
     #[test]
