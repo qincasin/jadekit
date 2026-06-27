@@ -8,8 +8,8 @@
   "home": {
     "badge": "Supports Claude · Codex · Gemini",
     "title": "JadeKit",
-    "subtitle": "Unified Configuration Manager for AI CLI Tools",
-    "description": "Seamlessly switch between API key environments. Say goodbye to manually editing terminal environment variables.",
+    "subtitle": "AI Agent Routing Kit",
+    "description": "Route Claude, Codex, Gemini, and local proxy workflows from one calm desktop control surface.",
     "downloadBtn": "Download Now",
     "githubBtn": "Star on GitHub",
     "features": {
@@ -59,7 +59,7 @@
     },
     "cta": {
       "title": "Ready to Get Started?",
-      "description": "Download JadeKit now and experience seamless AI CLI configuration management",
+      "description": "Download JadeKit and keep AI agent routing, providers, and toolchains cleanly under control",
       "download": "Free Download",
       "docs": "View Docs"
     }

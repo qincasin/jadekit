@@ -122,11 +122,11 @@ export default function Home() {
 
               {/* Tagline */}
               <p className={`text-xl sm:text-2xl text-gray-400 mb-4 max-w-2xl mx-auto transition-all duration-1000 delay-400 ${mounted ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-8'}`}>
-                AI CLI 工具的统一配置管理器
+                AI Agent Routing Kit
               </p>
 
               <p className={`text-base text-gray-500 mb-12 max-w-xl mx-auto transition-all duration-1000 delay-500 ${mounted ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-8'}`}>
-                无缝切换 API 密钥环境，彻底告别频繁手动修改终端环境变量的痛苦
+                统一路由 Claude、Codex、Gemini 与本地代理，让多 Agent 工具链保持清爽可控
               </p>
 
               {/* CTA Buttons */}
