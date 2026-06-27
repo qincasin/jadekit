@@ -153,7 +153,11 @@ pub fn get_provider_config_files(app: AppType) -> Result<Vec<(String, String)>, 
 /// 列出指定应用的 providers（从数据库读取）
 pub fn list_providers_from_db(db: &Arc<Database>, app: AppType) -> Result<Vec<Provider>, String> {
     let all = db.list_providers()?;
-    let mut providers: Vec<Provider> = all.into_iter().filter(|p| p.app_type == app).collect();
+    let providers: Vec<Provider> = all.into_iter().filter(|p| p.app_type == app).collect();
+    Ok(providers)
+}
+
+fn add_official_fallback_if_needed(providers: &mut Vec<Provider>, app: AppType) {
     if matches!(app, AppType::Claude | AppType::Codex) && !providers.iter().any(|p| p.is_active) {
         let official_id = match app {
             AppType::Claude => CLAUDE_OFFICIAL_PROVIDER_ID,
@@ -163,6 +167,14 @@ pub fn list_providers_from_db(db: &Arc<Database>, app: AppType) -> Result<Vec<Pr
         // 官方订阅不入库；DB 中没有活跃自定义 Provider 时，合成 active 官方项供代理路由识别。
         providers.push(build_official_provider(official_id, app));
     }
+}
+
+fn list_providers_for_proxy_from_db(
+    db: &Arc<Database>,
+    app: AppType,
+) -> Result<Vec<Provider>, String> {
+    let mut providers = list_providers_from_db(db, app)?;
+    add_official_fallback_if_needed(&mut providers, app);
     Ok(providers)
 }
 
@@ -286,7 +298,7 @@ pub fn move_provider_in_db(
 pub fn list_providers(app: AppType) -> Result<Vec<Provider>, String> {
     // 代理转发运行在 axum handler 内，没有 Tauri State 注入；这里通过启动时注册的
     // 全局 DB 句柄读取最新 Provider，确保每个请求都能看到前端刚切换的配置。
-    list_providers_from_db(global_db()?, app)
+    list_providers_for_proxy_from_db(global_db()?, app)
 }
 
 /// 列出所有应用的 providers（兼容旧版，使用 DB）
@@ -1504,7 +1516,7 @@ mod tests {
     }
 
     #[test]
-    fn test_list_providers_includes_official_when_no_custom_active() {
+    fn test_list_providers_from_db_excludes_synthetic_official() {
         let db = Arc::new(Database::in_memory().expect("init in-memory db"));
         let mut provider = provider_for_app("claude-a", AppType::Claude);
         provider.is_active = false;
@@ -1512,6 +1524,20 @@ mod tests {
             .expect("insert claude-a");
 
         let providers = list_providers_from_db(&db, AppType::Claude).expect("list providers");
+
+        assert!(!providers.iter().any(|p| p.id == CLAUDE_OFFICIAL_PROVIDER_ID));
+    }
+
+    #[test]
+    fn test_proxy_provider_list_includes_official_when_no_custom_active() {
+        let db = Arc::new(Database::in_memory().expect("init in-memory db"));
+        let mut provider = provider_for_app("claude-a", AppType::Claude);
+        provider.is_active = false;
+        db.upsert_provider(&provider)
+            .expect("insert claude-a");
+
+        let providers =
+            list_providers_for_proxy_from_db(&db, AppType::Claude).expect("list providers");
 
         assert!(providers
             .iter()
