@@ -1052,6 +1052,7 @@ pub fn run() {
             let db = database::Database::init().expect("Failed to initialize database");
             let db_arc = std::sync::Arc::new(db);
             let db_for_backup = db_arc.clone();
+            crate::services::provider_service::set_global_db(db_arc.clone());
 
             // 执行 JadeKit 内部数据 schema 迁移
             if let Err(e) = migration_service::check_and_run_migration() {

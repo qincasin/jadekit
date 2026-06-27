@@ -6,10 +6,23 @@ use crate::services::app_paths;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// 1M 上下文模型后缀（Claude Code 官方机制，匹配前会被剥离）。
 pub const ONE_M_CONTEXT_SUFFIX: &str = "[1M]";
+
+static GLOBAL_DB: OnceLock<Arc<Database>> = OnceLock::new();
+
+/// 注册生产数据库句柄，供没有 Tauri `State` 的代理请求链读取 Provider。
+pub fn set_global_db(db: Arc<Database>) {
+    let _ = GLOBAL_DB.set(db);
+}
+
+fn global_db() -> Result<&'static Arc<Database>, String> {
+    GLOBAL_DB
+        .get()
+        .ok_or_else(|| "Database is not initialized".to_string())
+}
 
 // ── 官方订阅特殊 Provider ────────────────────────────────────
 //
@@ -256,10 +269,10 @@ pub fn move_provider_in_db(
 }
 
 /// 列出指定应用的 providers（兼容旧版，使用 DB）
-pub fn list_providers(_app: AppType) -> Result<Vec<Provider>, String> {
-    // 从全局状态获取 DB（需要调用方通过 State 注入）
-    // TODO: 此函数保留兼容，新代码请使用 list_providers_from_db
-    Ok(vec![])
+pub fn list_providers(app: AppType) -> Result<Vec<Provider>, String> {
+    // 代理转发运行在 axum handler 内，没有 Tauri State 注入；这里通过启动时注册的
+    // 全局 DB 句柄读取最新 Provider，确保每个请求都能看到前端刚切换的配置。
+    list_providers_from_db(global_db()?, app)
 }
 
 /// 列出所有应用的 providers（兼容旧版，使用 DB）
@@ -1424,6 +1437,50 @@ mod tests {
             proxy_config: None,
             one_m_context: None,
         }
+    }
+
+    fn provider_for_app(id: &str, app_type: AppType) -> Provider {
+        Provider {
+            id: id.to_string(),
+            name: id.to_string(),
+            app_type,
+            api_key: format!("sk-{id}"),
+            url: Some("https://api.example.com".to_string()),
+            default_sonnet_model: Some("claude-sonnet-test".to_string()),
+            default_opus_model: None,
+            default_haiku_model: None,
+            default_reasoning_model: None,
+            custom_params: None,
+            settings_config: None,
+            meta: None,
+            icon: None,
+            in_failover_queue: false,
+            description: None,
+            tags: None,
+            is_active: app_type == AppType::Claude,
+            created_at: Utc::now(),
+            last_used: None,
+            proxy_config: None,
+            one_m_context: None,
+        }
+    }
+
+    #[test]
+    fn test_list_providers_returns_app_filtered() {
+        let db = Arc::new(Database::in_memory().expect("init in-memory db"));
+        db.upsert_provider(&provider_for_app("claude-a", AppType::Claude))
+            .expect("insert claude-a");
+        db.upsert_provider(&provider_for_app("claude-b", AppType::Claude))
+            .expect("insert claude-b");
+        db.upsert_provider(&provider_for_app("codex-a", AppType::Codex))
+            .expect("insert codex-a");
+
+        set_global_db(db);
+
+        let providers = list_providers(AppType::Claude).expect("list claude providers");
+
+        assert_eq!(providers.len(), 2);
+        assert!(providers.iter().all(|p| p.app_type == AppType::Claude));
     }
 
     #[test]
