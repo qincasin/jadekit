@@ -7,7 +7,7 @@ import { APP_LABELS } from '../../types/app';
 import ProviderIcon from './ProviderIcon';
 import HealthStatusBadge from './HealthStatusBadge';
 import type { HealthStatus } from '../../hooks/useHealthCheck';
-import { isOfficialProvider } from '../../config/providerConstants';
+import { isHealthCheckableProvider, isOfficialProvider } from '../../config/providerConstants';
 
 interface ProviderCardProps {
     provider: Provider;
@@ -44,6 +44,7 @@ export default function ProviderCard({
     const { t } = useTranslation();
     const [showKey, setShowKey] = useState(false);
     const isOfficial = isOfficialProvider(provider.id);
+    const canHealthCheck = isHealthCheckableProvider(provider);
 
     return (
         <div
@@ -105,7 +106,7 @@ export default function ProviderCard({
                 )}
 
                 {/* Health Status */}
-                {healthStatus && healthStatus.state !== 'idle' && (
+                {canHealthCheck && healthStatus && healthStatus.state !== 'idle' && (
                     <div className="mb-2">
                         <HealthStatusBadge status={healthStatus} />
                     </div>
@@ -205,16 +206,18 @@ export default function ProviderCard({
                             </button>
                         </>
                     )}
-                    <button
-                        onClick={() => onHealthCheck?.(provider.id)}
-                        disabled={healthStatus?.state === 'checking'}
-                        className="btn btn-ghost btn-xs gap-1"
-                        title={t('providers.health_check_single')}
-                    >
-                        {healthStatus?.state === 'checking'
-                            ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                            : <HeartPulse className="w-3.5 h-3.5" />}
-                    </button>
+                    {canHealthCheck && (
+                        <button
+                            onClick={() => onHealthCheck?.(provider.id)}
+                            disabled={healthStatus?.state === 'checking'}
+                            className="btn btn-ghost btn-xs gap-1"
+                            title={t('providers.health_check_single')}
+                        >
+                            {healthStatus?.state === 'checking'
+                                ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                : <HeartPulse className="w-3.5 h-3.5" />}
+                        </button>
+                    )}
                     {!isOfficial && (
                         <button
                             onClick={() => onDelete(provider.id, provider.name)}

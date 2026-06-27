@@ -15,6 +15,12 @@ export function isOfficialProvider(id: string) {
     return OFFICIAL_PROVIDER_ID_SET.has(id);
 }
 
+export function isHealthCheckableProvider(provider: Provider) {
+    // 中文注释：官方订阅使用 CLI 自带 OAuth 登录态，没有 API Key/base URL，
+    // 不应进入自定义 Provider 的连通性探活流程。
+    return !isOfficialProvider(provider.id) && provider.apiKey.trim().length > 0;
+}
+
 function supportsOfficialProvider(app: AppType) {
     return app === 'claude' || app === 'codex';
 }

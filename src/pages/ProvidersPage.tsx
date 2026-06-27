@@ -13,7 +13,7 @@ import ProviderForm from '../components/providers/ProviderForm';
 import ProviderIcon from '../components/providers/ProviderIcon';
 import { useHealthCheck } from '../hooks/useHealthCheck';
 import HealthStatusBadge from '../components/providers/HealthStatusBadge';
-import { isOfficialProvider } from '../config/providerConstants';
+import { isHealthCheckableProvider, isOfficialProvider } from '../config/providerConstants';
 
 type ViewMode = 'card' | 'table';
 
@@ -72,6 +72,11 @@ function ProvidersPage() {
         }
         return result;
     }, [providers, filterApp, filterTag, searchQuery]);
+
+    const healthCheckableProviderIds = useMemo(
+        () => filteredProviders.filter(isHealthCheckableProvider).map(provider => provider.id),
+        [filteredProviders]
+    );
 
     useEffect(() => {
         if (!hasLoaded) {
@@ -297,8 +302,8 @@ function ProvidersPage() {
                             {t('providers.import_config')}
                         </button>
                         <button
-                            onClick={() => checkBatch(filteredProviders.map(p => p.id))}
-                            disabled={isAnyChecking || loading}
+                            onClick={() => checkBatch(healthCheckableProviderIds)}
+                            disabled={isAnyChecking || loading || healthCheckableProviderIds.length === 0}
                             className="btn bg-gradient-to-r from-green-500 to-emerald-500 hover:from-green-600 hover:to-emerald-600 text-white border-none btn-sm gap-2 whitespace-nowrap"
                         >
                             {isAnyChecking ? <Loader2 className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
@@ -564,7 +569,9 @@ function ProvidersPage() {
                                             </div>
                                         </td>
                                         <td className="w-28">
-                                            <HealthStatusBadge status={statuses[provider.id]} compact />
+                                            {!isOfficialProvider(provider.id) && (
+                                                <HealthStatusBadge status={statuses[provider.id]} compact />
+                                            )}
                                         </td>
                                         <td className="w-40 sticky right-0 z-20">
                                             <div className="flex items-center justify-end gap-1">
@@ -585,16 +592,18 @@ function ProvidersPage() {
                                                         </button>
                                                     </>
                                                 )}
-                                                <button
-                                                    onClick={() => checkSingle(provider.id)}
-                                                    disabled={statuses[provider.id]?.state === 'checking'}
-                                                    className="btn btn-ghost btn-xs"
-                                                    title={t('providers.health_check_single')}
-                                                >
-                                                    {statuses[provider.id]?.state === 'checking'
-                                                        ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                                        : <HeartPulse className="w-3.5 h-3.5" />}
-                                                </button>
+                                                {isHealthCheckableProvider(provider) && (
+                                                    <button
+                                                        onClick={() => checkSingle(provider.id)}
+                                                        disabled={statuses[provider.id]?.state === 'checking'}
+                                                        className="btn btn-ghost btn-xs"
+                                                        title={t('providers.health_check_single')}
+                                                    >
+                                                        {statuses[provider.id]?.state === 'checking'
+                                                            ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                                            : <HeartPulse className="w-3.5 h-3.5" />}
+                                                    </button>
+                                                )}
                                                 {!isOfficialProvider(provider.id) && (
                                                     <button
                                                         onClick={() => handleDelete(provider.id, provider.name)}
