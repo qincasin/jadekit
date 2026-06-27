@@ -1067,6 +1067,11 @@ pub fn run() {
             let state = store::AppState::new(db_arc);
             app.manage(state);
 
+            // 崩溃恢复：若上次退出时代理没来得及 stop，Claude settings 可能仍指向本地死代理。
+            if let Err(e) = crate::services::proxy_service::restore_claude_takeover_if_needed() {
+                eprintln!("Proxy takeover restore warning: {e}");
+            }
+
             // 交互式 Chat：注册 ChatState（懒启动 ai-bridge daemon）
             {
                 let chat_manager = chat::ChatManager::new(app.handle().clone());

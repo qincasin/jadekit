@@ -102,7 +102,7 @@ fn apply_claude_takeover(port: u16) -> Result<(), String> {
     Ok(())
 }
 
-fn restore_claude_takeover_if_needed() -> Result<(), String> {
+pub(crate) fn restore_claude_takeover_if_needed() -> Result<(), String> {
     if let Some(backup) = takeover::load_backup() {
         let (settings_path, mut settings) = read_claude_settings()?;
         // 状态流转：关闭代理时先恢复 Claude settings，再清掉崩溃恢复用的备份文件。
