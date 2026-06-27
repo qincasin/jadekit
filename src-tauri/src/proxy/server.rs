@@ -90,8 +90,12 @@ pub async fn start(host: &str, port: u16) -> Result<ProxyState, String> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| format!("Failed to bind {}: {}", addr, e))?;
+    let actual_port = listener
+        .local_addr()
+        .map_err(|e| format!("Failed to read bound address: {e}"))?
+        .port();
 
-    tracing::info!("Proxy server starting on {}", addr);
+    tracing::info!("Proxy server starting on {}:{}", host, actual_port);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -107,12 +111,12 @@ pub async fn start(host: &str, port: u16) -> Result<ProxyState, String> {
     });
 
     guard.host = host.to_string();
-    guard.port = port;
+    guard.port = actual_port;
     guard.shutdown_tx = Some(shutdown_tx);
 
     Ok(ProxyState {
         running: true,
-        port,
+        port: actual_port,
         host: host.to_string(),
         request_count: REQUEST_COUNT.load(Ordering::Relaxed),
     })

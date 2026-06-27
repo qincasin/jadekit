@@ -114,7 +114,7 @@ fn get_data_dir() -> Result<PathBuf, io::Error> {
     app_paths::data_dir()
 }
 
-fn get_claude_settings_path() -> Result<PathBuf, io::Error> {
+pub(crate) fn get_claude_settings_path() -> Result<PathBuf, io::Error> {
     let home = dirs::home_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Home directory not found"))?;
     Ok(home.join(".claude").join("settings.json"))
