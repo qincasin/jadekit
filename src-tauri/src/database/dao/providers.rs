@@ -50,6 +50,8 @@ impl Database {
                     last_used: chrono::DateTime::<Utc>::from_timestamp(row.get::<_, i64>(18)?, 0)
                         .or_else(|| chrono::DateTime::<Utc>::from_timestamp(0, 0)),
                     proxy_config: proxy_config_str.and_then(|s| serde_json::from_str(&s).ok()),
+                    // one_m_context 不入库，读取时默认 None
+                    one_m_context: None,
                 })
             })
             .map_err(|e| format!("Failed to query providers: {e}"))?;
@@ -96,6 +98,8 @@ impl Database {
                         created_at: chrono::DateTime::<Utc>::from_timestamp(row.get::<_, i64>(17)?, 0).unwrap_or_default(),
                         last_used: chrono::DateTime::<Utc>::from_timestamp(row.get::<_, i64>(18)?, 0).or_else(|| chrono::DateTime::<Utc>::from_timestamp(0, 0)),
                         proxy_config: proxy_config_str.and_then(|s| serde_json::from_str(&s).ok()),
+                        // one_m_context 不入库，读取时默认 None
+                        one_m_context: None,
                     })
                 },
             )
@@ -229,6 +233,8 @@ impl Database {
                     last_used: chrono::DateTime::<Utc>::from_timestamp(row.get::<_, i64>(18)?, 0)
                         .or_else(|| chrono::DateTime::<Utc>::from_timestamp(0, 0)),
                     proxy_config: proxy_config_str.and_then(|s| serde_json::from_str(&s).ok()),
+                    // one_m_context 不入库，读取时默认 None
+                    one_m_context: None,
                 })
             })
             .map_err(|e| format!("Failed to query providers by app: {e}"))?;
@@ -279,6 +285,8 @@ impl Database {
                         created_at: chrono::DateTime::<Utc>::from_timestamp(row.get::<_, i64>(17)?, 0).unwrap_or_default(),
                         last_used: chrono::DateTime::<Utc>::from_timestamp(row.get::<_, i64>(18)?, 0).or_else(|| chrono::DateTime::<Utc>::from_timestamp(0, 0)),
                         proxy_config: proxy_config_str.and_then(|s| serde_json::from_str(&s).ok()),
+                        // one_m_context 不入库，读取时默认 None
+                        one_m_context: None,
                     })
                 },
             )

@@ -393,6 +393,7 @@ mod tests {
             created_at: Utc::now(),
             last_used: None,
             proxy_config: None,
+            one_m_context: None,
         }
     }
 

@@ -54,6 +54,8 @@ pub fn build_provider_from_deeplink(request: &DeepLinkImportRequest) -> Result<P
         created_at: chrono::Utc::now(),
         last_used: None,
         proxy_config: None,
+        // deeplink 导入默认不声明 1M 上下文
+        one_m_context: None,
     })
 }
 

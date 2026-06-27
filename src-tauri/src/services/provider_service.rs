@@ -8,6 +8,9 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// 1M 上下文模型后缀（Claude Code 官方机制，匹配前会被剥离）。
+pub const ONE_M_CONTEXT_SUFFIX: &str = "[1M]";
+
 // ── 路径函数 ──────────────────────────────────────────────
 
 fn get_data_dir() -> Result<PathBuf, io::Error> {
@@ -759,6 +762,15 @@ fn build_env_preview(
 // ── 配置同步辅助函数 ──────────────────────────────────────────────
 
 /// 合并 provider 的 API Key 和可选字段到 env 对象
+/// 启用 1M 且模型非空时给模型值拼 `[1M]` 后缀，否则原样返回。
+/// 中文注释：空模型不拼，避免写出孤立的 `[1M]` 触发上游报错。
+fn model_with_1m(model: &Option<String>, enabled: bool) -> Option<String> {
+    match model {
+        Some(m) if enabled && !m.trim().is_empty() => Some(format!("{m}{ONE_M_CONTEXT_SUFFIX}")),
+        other => other.clone(),
+    }
+}
+
 fn merge_provider_to_env(
     env: &mut serde_json::Map<String, serde_json::Value>,
     api_key: &str,
@@ -899,22 +911,18 @@ fn preview_claude_settings(
         .as_object_mut()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "env is not an object"))?;
 
-    // 合并 provider 配置
+    // 合并 provider 配置：按 1M 声明给各模型角色拼 `[1M]` 后缀
+    let one_m = provider.one_m_context.clone().unwrap_or_default();
+    let sonnet = model_with_1m(&provider.default_sonnet_model, one_m.sonnet);
+    let opus = model_with_1m(&provider.default_opus_model, one_m.opus);
+    let haiku = model_with_1m(&provider.default_haiku_model, one_m.haiku);
+    let reasoning = model_with_1m(&provider.default_reasoning_model, one_m.reasoning);
     let optional_fields = [
         ("ANTHROPIC_BASE_URL", &provider.url),
-        (
-            "ANTHROPIC_DEFAULT_SONNET_MODEL",
-            &provider.default_sonnet_model,
-        ),
-        ("ANTHROPIC_DEFAULT_OPUS_MODEL", &provider.default_opus_model),
-        (
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-            &provider.default_haiku_model,
-        ),
-        (
-            "ANTHROPIC_REASONING_MODEL",
-            &provider.default_reasoning_model,
-        ),
+        ("ANTHROPIC_DEFAULT_SONNET_MODEL", &sonnet),
+        ("ANTHROPIC_DEFAULT_OPUS_MODEL", &opus),
+        ("ANTHROPIC_DEFAULT_HAIKU_MODEL", &haiku),
+        ("ANTHROPIC_REASONING_MODEL", &reasoning),
     ];
     merge_provider_to_env(env, &provider.api_key, &optional_fields);
 
@@ -1118,22 +1126,18 @@ fn sync_to_claude_settings(provider: &Provider) -> Result<(), io::Error> {
         .as_object_mut()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "env is not an object"))?;
 
-    // 合并 provider 配置
+    // 合并 provider 配置：按 1M 声明给各模型角色拼 `[1M]` 后缀
+    let one_m = provider.one_m_context.clone().unwrap_or_default();
+    let sonnet = model_with_1m(&provider.default_sonnet_model, one_m.sonnet);
+    let opus = model_with_1m(&provider.default_opus_model, one_m.opus);
+    let haiku = model_with_1m(&provider.default_haiku_model, one_m.haiku);
+    let reasoning = model_with_1m(&provider.default_reasoning_model, one_m.reasoning);
     let optional_fields = [
         ("ANTHROPIC_BASE_URL", &provider.url),
-        (
-            "ANTHROPIC_DEFAULT_SONNET_MODEL",
-            &provider.default_sonnet_model,
-        ),
-        ("ANTHROPIC_DEFAULT_OPUS_MODEL", &provider.default_opus_model),
-        (
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-            &provider.default_haiku_model,
-        ),
-        (
-            "ANTHROPIC_REASONING_MODEL",
-            &provider.default_reasoning_model,
-        ),
+        ("ANTHROPIC_DEFAULT_SONNET_MODEL", &sonnet),
+        ("ANTHROPIC_DEFAULT_OPUS_MODEL", &opus),
+        ("ANTHROPIC_DEFAULT_HAIKU_MODEL", &haiku),
+        ("ANTHROPIC_REASONING_MODEL", &reasoning),
     ];
     merge_provider_to_env(env, &provider.api_key, &optional_fields);
 
@@ -1273,7 +1277,25 @@ mod tests {
             created_at: Utc::now(),
             last_used: None,
             proxy_config: None,
+            one_m_context: None,
         }
+    }
+
+    #[test]
+    fn test_model_with_1m_appends_suffix() {
+        // 启用且模型非空 → 拼后缀
+        assert_eq!(
+            model_with_1m(&Some("glm-4.6".to_string()), true),
+            Some("glm-4.6[1M]".to_string())
+        );
+        // 启用但模型为空 → 不拼（避免孤立 [1M]）
+        assert_eq!(model_with_1m(&None, true), None);
+        assert_eq!(model_with_1m(&Some("".to_string()), true), Some("".to_string()));
+        // 未启用 → 原样
+        assert_eq!(
+            model_with_1m(&Some("glm-4.6".to_string()), false),
+            Some("glm-4.6".to_string())
+        );
     }
 
     #[test]

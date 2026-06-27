@@ -51,6 +51,8 @@ pub fn apply_universal_provider(config: UniversalProviderConfig) -> Result<Vec<S
             created_at: now,
             last_used: None,
             proxy_config: None,
+            // 通用创建默认不声明 1M 上下文
+            one_m_context: None,
         };
 
         provider_service::add_provider(provider)?;
@@ -104,6 +106,8 @@ pub fn switch_universal_provider(provider_name: &str) -> Result<(), String> {
                         created_at: now,
                         last_used: None,
                         proxy_config: ref_provider.proxy_config.clone(),
+                        // 跨应用复制时沿用参考 provider 的 1M 上下文声明
+                        one_m_context: ref_provider.one_m_context.clone(),
                     };
                     provider_service::add_provider(new_provider)?;
                     provider_service::switch_provider(*app_type, &new_id)?;

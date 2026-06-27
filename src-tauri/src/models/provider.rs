@@ -64,6 +64,23 @@ pub struct Provider {
     /// 供应商单独的代理配置
     #[serde(rename = "proxyConfig", skip_serializing_if = "Option::is_none")]
     pub proxy_config: Option<ProviderProxyConfig>,
+    /// 每个模型角色是否声明 1M 上下文能力（写入 Claude env 时拼 `[1M]` 后缀）
+    #[serde(rename = "oneMContext", skip_serializing_if = "Option::is_none")]
+    pub one_m_context: Option<OneMContext>,
+}
+
+/// 每个模型角色是否声明 1M 上下文能力（对齐 cc-switch supports1m）。
+/// 写入 Claude env 时通过给模型名拼 `[1M]` 后缀生效（Claude Code 官方机制）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OneMContext {
+    #[serde(default)]
+    pub sonnet: bool,
+    #[serde(default)]
+    pub opus: bool,
+    #[serde(default)]
+    pub haiku: bool,
+    #[serde(default)]
+    pub reasoning: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +111,8 @@ impl From<ApiToken> for Provider {
             created_at: token.created_at,
             last_used: token.last_used,
             proxy_config: None,
+            // 从旧 ApiToken 转换时默认不声明 1M 上下文
+            one_m_context: None,
         }
     }
 }
