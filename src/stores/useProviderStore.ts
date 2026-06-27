@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { Provider } from '../types/provider';
 import { AppType } from '../types/app';
+import { mergeOfficialProviders } from '../config/providerConstants';
 
 // ── 类型定义 ──────────────────────────────────────────────
 
@@ -33,7 +34,7 @@ export const useProviderStore = create<ProviderState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             const providers = await invoke<Provider[]>('get_providers', { app });
-            set({ providers, loading: false, hasLoaded: true });
+            set({ providers: mergeOfficialProviders(providers, app), loading: false, hasLoaded: true });
         } catch (error) {
             set({ error: String(error), loading: false });
         }
@@ -44,7 +45,7 @@ export const useProviderStore = create<ProviderState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             const providers = await invoke<Provider[]>('get_all_providers');
-            set({ providers, loading: false, hasLoaded: true });
+            set({ providers: mergeOfficialProviders(providers), loading: false, hasLoaded: true });
         } catch (error) {
             set({ error: String(error), loading: false });
         }

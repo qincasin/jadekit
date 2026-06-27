@@ -1,4 +1,4 @@
-import { Zap, Edit2, Trash2, Eye, EyeOff, GripVertical, ExternalLink, Copy, Loader2, HeartPulse } from 'lucide-react';
+import { Zap, Edit2, Trash2, Eye, EyeOff, GripVertical, ExternalLink, Copy, Loader2, HeartPulse, ShieldCheck } from 'lucide-react';
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
@@ -7,6 +7,7 @@ import { APP_LABELS } from '../../types/app';
 import ProviderIcon from './ProviderIcon';
 import HealthStatusBadge from './HealthStatusBadge';
 import type { HealthStatus } from '../../hooks/useHealthCheck';
+import { isOfficialProvider } from '../../config/providerConstants';
 
 interface ProviderCardProps {
     provider: Provider;
@@ -42,6 +43,7 @@ export default function ProviderCard({
 }: ProviderCardProps) {
     const { t } = useTranslation();
     const [showKey, setShowKey] = useState(false);
+    const isOfficial = isOfficialProvider(provider.id);
 
     return (
         <div
@@ -58,15 +60,17 @@ export default function ProviderCard({
             <div className="p-4 flex flex-col flex-1">
                 {/* 顶部：拖拽 + 图标 + 名称 + 状态 */}
                 <div className="flex items-center gap-3 mb-3">
-                    <button
-                        type="button"
-                        onPointerDown={onPointerDragStart}
-                        onClick={(e) => e.preventDefault()}
-                        className="inline-flex h-6 w-6 items-center justify-center rounded text-base-content/40 hover:bg-base-200 cursor-grab active:cursor-grabbing shrink-0"
-                        title="拖拽排序"
-                    >
-                        <GripVertical className="w-4 h-4" />
-                    </button>
+                    {!isOfficial && (
+                        <button
+                            type="button"
+                            onPointerDown={onPointerDragStart}
+                            onClick={(e) => e.preventDefault()}
+                            className="inline-flex h-6 w-6 items-center justify-center rounded text-base-content/40 hover:bg-base-200 cursor-grab active:cursor-grabbing shrink-0"
+                            title={t('providers.drag_sort')}
+                        >
+                            <GripVertical className="w-4 h-4" />
+                        </button>
+                    )}
                     <ProviderIcon appType={provider.appType} size="md" />
                     <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
@@ -74,7 +78,13 @@ export default function ProviderCard({
                             {provider.isActive && (
                                 <span className="badge badge-sm bg-green-500 text-white border-none gap-1 shrink-0">
                                     <Zap className="w-3 h-3" fill="currentColor" />
-                                    Active
+                                    {t('providers.active_badge')}
+                                </span>
+                            )}
+                            {isOfficial && (
+                                <span className="badge badge-sm bg-emerald-500/10 text-emerald-600 border-emerald-500/20 gap-1 shrink-0">
+                                    <ShieldCheck className="w-3 h-3" />
+                                    {t('providers.official_badge')}
                                 </span>
                             )}
                         </div>
@@ -83,14 +93,16 @@ export default function ProviderCard({
                 </div>
 
                 {/* API Key */}
-                <div className="flex items-center gap-2 mb-2">
-                    <code className="font-mono text-xs bg-base-200 px-2 py-1 rounded truncate flex-1">
-                        {showKey ? provider.apiKey : maskApiKey(provider.apiKey)}
-                    </code>
-                    <button onClick={() => setShowKey(!showKey)} className="btn btn-ghost btn-xs">
-                        {showKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                    </button>
-                </div>
+                {!isOfficial && (
+                    <div className="flex items-center gap-2 mb-2">
+                        <code className="font-mono text-xs bg-base-200 px-2 py-1 rounded truncate flex-1">
+                            {showKey ? provider.apiKey : maskApiKey(provider.apiKey)}
+                        </code>
+                        <button onClick={() => setShowKey(!showKey)} className="btn btn-ghost btn-xs">
+                            {showKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                        </button>
+                    </div>
+                )}
 
                 {/* Health Status */}
                 {healthStatus && healthStatus.state !== 'idle' && (
@@ -175,20 +187,24 @@ export default function ProviderCard({
                     >
                         <Zap className="w-3.5 h-3.5" />
                     </button>
-                    <button
-                        onClick={() => onEdit(provider)}
-                        className="btn btn-ghost btn-xs gap-1"
-                        title="编辑"
-                    >
-                        <Edit2 className="w-3.5 h-3.5" />
-                    </button>
-                    <button
-                        onClick={() => onClone(provider)}
-                        className="btn btn-ghost btn-xs gap-1"
-                        title="克隆"
-                    >
-                        <Copy className="w-3.5 h-3.5" />
-                    </button>
+                    {!isOfficial && (
+                        <>
+                            <button
+                                onClick={() => onEdit(provider)}
+                                className="btn btn-ghost btn-xs gap-1"
+                                title={t('common.edit')}
+                            >
+                                <Edit2 className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                                onClick={() => onClone(provider)}
+                                className="btn btn-ghost btn-xs gap-1"
+                                title={t('providers.clone')}
+                            >
+                                <Copy className="w-3.5 h-3.5" />
+                            </button>
+                        </>
+                    )}
                     <button
                         onClick={() => onHealthCheck?.(provider.id)}
                         disabled={healthStatus?.state === 'checking'}
@@ -199,13 +215,15 @@ export default function ProviderCard({
                             ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
                             : <HeartPulse className="w-3.5 h-3.5" />}
                     </button>
-                    <button
-                        onClick={() => onDelete(provider.id, provider.name)}
-                        className="btn btn-ghost btn-xs text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 gap-1 ml-auto"
-                        title="删除"
-                    >
-                        <Trash2 className="w-3.5 h-3.5" />
-                    </button>
+                    {!isOfficial && (
+                        <button
+                            onClick={() => onDelete(provider.id, provider.name)}
+                            className="btn btn-ghost btn-xs text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 gap-1 ml-auto"
+                            title={t('common.delete')}
+                        >
+                            <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                    )}
                 </div>
             </div>
         </div>

@@ -1,5 +1,5 @@
 import { useTranslation } from 'react-i18next';
-import { Plus, RefreshCw, LayoutGrid, List, GripVertical, Zap, Edit2, Trash2, Eye, EyeOff, Search, Layers, Download, Upload, Loader2, Tag, Copy, ExternalLink, Terminal, Activity, HeartPulse } from 'lucide-react';
+import { Plus, RefreshCw, LayoutGrid, List, GripVertical, Zap, Edit2, Trash2, Eye, EyeOff, Search, Layers, Download, Upload, Loader2, Tag, Copy, ExternalLink, Terminal, Activity, HeartPulse, ShieldCheck } from 'lucide-react';
 import { useEffect, useMemo, useState, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useProviderStore } from '../stores/useProviderStore';
@@ -13,6 +13,7 @@ import ProviderForm from '../components/providers/ProviderForm';
 import ProviderIcon from '../components/providers/ProviderIcon';
 import { useHealthCheck } from '../hooks/useHealthCheck';
 import HealthStatusBadge from '../components/providers/HealthStatusBadge';
+import { isOfficialProvider } from '../config/providerConstants';
 
 type ViewMode = 'card' | 'table';
 
@@ -94,7 +95,7 @@ function ProvidersPage() {
         if (!provider) return;
         try {
             await switchProvider(provider.appType, providerId);
-            showToast(t('providers.switch_success'), 'success');
+            showToast(t(isOfficialProvider(providerId) ? 'providers.official_switch_success' : 'providers.switch_success'), 'success');
         } catch (error) {
             showToast(t('providers.switch_failed', { error: String(error) }), 'error');
         }
@@ -191,7 +192,7 @@ function ProvidersPage() {
     };
 
     const handlePointerDragStart = (id: string) => (e: React.PointerEvent<HTMLElement>) => {
-        if (loading || e.button !== 0) return;
+        if (loading || e.button !== 0 || isOfficialProvider(id)) return;
         e.preventDefault();
         e.stopPropagation();
         dragSourceRef.current = id;
@@ -490,14 +491,17 @@ function ProvidersPage() {
                                     >
                                         <td className="w-14">
                                             <div className="flex items-center gap-1">
-                                                <button
-                                                    type="button"
-                                                    onPointerDown={handlePointerDragStart(provider.id)}
-                                                    onClick={(e) => e.preventDefault()}
-                                                    className="inline-flex h-6 w-6 items-center justify-center rounded text-base-content/50 hover:bg-base-200 cursor-grab active:cursor-grabbing"
-                                                >
-                                                    <GripVertical className="w-4 h-4" />
-                                                </button>
+                                                {!isOfficialProvider(provider.id) && (
+                                                    <button
+                                                        type="button"
+                                                        onPointerDown={handlePointerDragStart(provider.id)}
+                                                        onClick={(e) => e.preventDefault()}
+                                                        className="inline-flex h-6 w-6 items-center justify-center rounded text-base-content/50 hover:bg-base-200 cursor-grab active:cursor-grabbing"
+                                                        title={t('providers.drag_sort')}
+                                                    >
+                                                        <GripVertical className="w-4 h-4" />
+                                                    </button>
+                                                )}
                                             </div>
                                         </td>
                                         <td className="w-48">
@@ -510,6 +514,12 @@ function ProvidersPage() {
                                                             <span className="badge badge-sm bg-green-500 text-white border-none gap-1 shrink-0">
                                                                 <Zap className="w-3 h-3" fill="currentColor" />
                                                                 {t('providers.active_badge')}
+                                                            </span>
+                                                        )}
+                                                        {isOfficialProvider(provider.id) && (
+                                                            <span className="badge badge-sm bg-emerald-500/10 text-emerald-600 border-emerald-500/20 gap-1 shrink-0">
+                                                                <ShieldCheck className="w-3 h-3" />
+                                                                {t('providers.official_badge')}
                                                             </span>
                                                         )}
                                                     </div>
@@ -526,14 +536,16 @@ function ProvidersPage() {
                                             </span>
                                         </td>
                                         <td className="w-48">
-                                            <div className="flex items-center gap-2">
-                                                <code className="font-mono text-xs bg-base-200 px-2 py-1 rounded truncate max-w-[140px]">
-                                                    {showKeys[provider.id] ? provider.apiKey : maskApiKey(provider.apiKey)}
-                                                </code>
-                                                <button onClick={() => toggleShowKey(provider.id)} className="btn btn-ghost btn-xs">
-                                                    {showKeys[provider.id] ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                                                </button>
-                                            </div>
+                                            {!isOfficialProvider(provider.id) && (
+                                                <div className="flex items-center gap-2">
+                                                    <code className="font-mono text-xs bg-base-200 px-2 py-1 rounded truncate max-w-[140px]">
+                                                        {showKeys[provider.id] ? provider.apiKey : maskApiKey(provider.apiKey)}
+                                                    </code>
+                                                    <button onClick={() => toggleShowKey(provider.id)} className="btn btn-ghost btn-xs">
+                                                        {showKeys[provider.id] ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                                                    </button>
+                                                </div>
+                                            )}
                                         </td>
                                         <td className="w-64">
                                             <div className="flex items-center gap-1.5 min-w-0">
@@ -563,12 +575,16 @@ function ProvidersPage() {
                                                 >
                                                     <Zap className="w-3.5 h-3.5" />
                                                 </button>
-                                                <button onClick={() => handleEdit(provider)} className="btn btn-ghost btn-xs">
-                                                    <Edit2 className="w-3.5 h-3.5" />
-                                                </button>
-                                                <button onClick={() => handleClone(provider)} className="btn btn-ghost btn-xs">
-                                                    <Copy className="w-3.5 h-3.5" />
-                                                </button>
+                                                {!isOfficialProvider(provider.id) && (
+                                                    <>
+                                                        <button onClick={() => handleEdit(provider)} className="btn btn-ghost btn-xs" title={t('common.edit')}>
+                                                            <Edit2 className="w-3.5 h-3.5" />
+                                                        </button>
+                                                        <button onClick={() => handleClone(provider)} className="btn btn-ghost btn-xs" title={t('providers.clone')}>
+                                                            <Copy className="w-3.5 h-3.5" />
+                                                        </button>
+                                                    </>
+                                                )}
                                                 <button
                                                     onClick={() => checkSingle(provider.id)}
                                                     disabled={statuses[provider.id]?.state === 'checking'}
@@ -579,12 +595,15 @@ function ProvidersPage() {
                                                         ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
                                                         : <HeartPulse className="w-3.5 h-3.5" />}
                                                 </button>
-                                                <button
-                                                    onClick={() => handleDelete(provider.id, provider.name)}
-                                                    className="btn btn-ghost btn-xs text-red-500"
-                                                >
-                                                    <Trash2 className="w-3.5 h-3.5" />
-                                                </button>
+                                                {!isOfficialProvider(provider.id) && (
+                                                    <button
+                                                        onClick={() => handleDelete(provider.id, provider.name)}
+                                                        className="btn btn-ghost btn-xs text-red-500"
+                                                        title={t('common.delete')}
+                                                    >
+                                                        <Trash2 className="w-3.5 h-3.5" />
+                                                    </button>
+                                                )}
                                             </div>
                                         </td>
                                     </tr>
