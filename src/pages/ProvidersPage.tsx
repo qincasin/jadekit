@@ -178,7 +178,11 @@ function ProvidersPage() {
     };
 
     // 拖拽逻辑
-    const getProviderIndex = (id: string) => providers.findIndex(p => p.id === id);
+    // 注意：后端 move_provider 的 target_index 是相对于「DB 真实 providers」的下标，
+    // 而 providers 列表里前置了合成的官方订阅项（不入库）。因此排序下标必须基于
+    // 排除官方项后的列表计算，否则会因官方项偏移导致写入错误的顺序。
+    const getProviderIndex = (id: string) =>
+        providers.filter(p => !isOfficialProvider(p.id)).findIndex(p => p.id === id);
 
     const updateDragOverId = (id: string | null) => {
         dragOverRef.current = id;
@@ -226,6 +230,8 @@ function ProvidersPage() {
             const targetId = dragOverRef.current || resolveProviderIdFromPoint(e.clientX, e.clientY);
             clearDragState();
             if (!targetId || targetId === sourceId) return;
+            // 官方订阅项是合成项、不参与排序，不能作为拖拽放置目标
+            if (isOfficialProvider(sourceId) || isOfficialProvider(targetId)) return;
             const srcIdx = getProviderIndex(sourceId);
             const tgtIdx = getProviderIndex(targetId);
             if (srcIdx < 0 || tgtIdx < 0 || srcIdx === tgtIdx) return;
