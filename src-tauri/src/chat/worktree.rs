@@ -20,6 +20,12 @@ pub struct DiffSummary {
     pub deletions: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    Merged,
+    Conflict,
+}
+
 pub struct WorktreeManager;
 
 impl WorktreeManager {
@@ -126,6 +132,34 @@ impl WorktreeManager {
         }
         Ok(summary)
     }
+
+    /// 把 source_branch 合并进 repo_root 当前分支。冲突则 abort 回滚，返回 Conflict。
+    pub fn merge_into_current(repo_root: &Path, source_branch: &str) -> Result<MergeOutcome, String> {
+        let out = Command::new("git")
+            .current_dir(repo_root)
+            .args(["merge", "--no-ff", source_branch])
+            .output()
+            .map_err(|e| format!("git merge 执行失败: {e}"))?;
+        if out.status.success() {
+            return Ok(MergeOutcome::Merged);
+        }
+
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // 任何 merge 失败都尝试回滚，避免主仓留在冲突态或半完成状态。
+        let _ = Command::new("git")
+            .current_dir(repo_root)
+            .args(["merge", "--abort"])
+            .output();
+        if combined.contains("CONFLICT") || combined.contains("conflict") {
+            Ok(MergeOutcome::Conflict)
+        } else {
+            Err(format!("git merge 失败: {}", combined.trim()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -151,6 +185,12 @@ mod tests {
         std::fs::write(dir.join("README.md"), "hi").unwrap();
         git(dir, &["add", "."]);
         git(dir, &["commit", "-qm", "init"]);
+    }
+
+    fn commit_file(dir: &Path, name: &str, content: &str, msg: &str) {
+        std::fs::write(dir.join(name), content).unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", msg]);
     }
 
     #[test]
@@ -227,5 +267,41 @@ mod tests {
         let s = WorktreeManager::diff_summary(&info.path).unwrap();
         assert!(s.files_changed >= 1, "未跟踪新文件应计入 files_changed");
         assert!(s.insertions >= 2, "未跟踪新文件行数应计入 insertions");
+    }
+
+    #[test]
+    fn merge_clean_brings_worktree_commit_into_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let wts = tmp.path().join("worktrees");
+        let info = WorktreeManager::create(&repo, &wts, "win").unwrap();
+
+        commit_file(&info.path, "feature.txt", "done", "feat");
+
+        let outcome = WorktreeManager::merge_into_current(&repo, &info.branch).unwrap();
+        assert!(matches!(outcome, super::MergeOutcome::Merged));
+        assert!(repo.join("feature.txt").exists(), "赢家改动已合入主仓");
+    }
+
+    #[test]
+    fn merge_conflict_aborts_and_leaves_repo_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let wts = tmp.path().join("worktrees");
+        let info = WorktreeManager::create(&repo, &wts, "conf").unwrap();
+
+        commit_file(&info.path, "README.md", "from-worktree", "wt change");
+        commit_file(&repo, "README.md", "from-main", "main change");
+
+        let outcome = WorktreeManager::merge_into_current(&repo, &info.branch).unwrap();
+        assert!(matches!(outcome, super::MergeOutcome::Conflict));
+        assert!(
+            !WorktreeManager::has_uncommitted_changes(&repo).unwrap(),
+            "冲突已 abort，主仓干净"
+        );
     }
 }
