@@ -625,6 +625,9 @@
       "reconnecting": "重连中…",
       "readyTimeoutError": "守护进程未及时就绪"
     },
+    "worktree": {
+      "createForAgent": "为此 Agent 建独立 worktree"
+    },
     "clear": "清空",
     "empty": "开始与 AI 对话",
     "message": {

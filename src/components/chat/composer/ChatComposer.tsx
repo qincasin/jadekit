@@ -244,6 +244,7 @@ export function ChatComposer({
     const [modelsRefreshing, setModelsRefreshing] = useState(false);
     const [modelsRefreshError, setModelsRefreshError] = useState<string | null>(null);
     const [editorText, setEditorPlainText] = useState(draft);
+    const [createWorktreeForAgent, setCreateWorktreeForAgent] = useState(false);
 
     // Prompt 增强弹窗状态
     const [enhancerOpen, setEnhancerOpen] = useState(false);
@@ -313,6 +314,12 @@ export function ChatComposer({
     useEffect(() => {
         setModelsRefreshError(null);
     }, [providerId, modelRefreshSource?.url]);
+
+    useEffect(() => {
+        if (!workspaceStatus?.isGitRepository) {
+            setCreateWorktreeForAgent(false);
+        }
+    }, [workspaceStatus?.isGitRepository]);
 
     // 自适应高度
     const applyEditorHeight = useCallback((height: number) => {
@@ -472,7 +479,12 @@ export function ChatComposer({
             historyCursorRef.current = null;
 
             // 发送消息（store 内部会清空 draft）
-            const sent = await send(text, { cwd, attachments: sendingAttachments, displayText });
+            const sent = await send(text, {
+                cwd,
+                attachments: sendingAttachments,
+                displayText,
+                createWorktree: createWorktreeForAgent,
+            });
             if (!sent) {
                 setAttachments((current) => restoreFailedSendAttachments(current, sendingAttachments));
                 if (text && !useChatStore.getState().draft.trim()) {
@@ -773,6 +785,11 @@ export function ChatComposer({
         translate: t,
     });
     const hasEditorPromptText = editorText.trim().length > 0;
+    const worktreeToggleLabel = t(
+        'chat.worktree.createForAgent',
+        'Create isolated worktree for this agent',
+    );
+    const worktreeToggleDisabled = !workspaceStatus?.isGitRepository;
 
     return (
         <div className="bg-base-200/20 px-2 pb-4 pt-2 sm:px-3">
@@ -799,6 +816,16 @@ export function ChatComposer({
                     statusPanelExpanded={statusPanelExpanded}
                     onToggleStatusPanel={() => setStatusPanelExpanded((v) => !v)}
                 />
+                <label className="mx-1 mb-1 flex w-fit items-center gap-2 rounded-md px-1.5 py-1 text-xs text-base-content/70 hover:bg-base-200/70">
+                    <input
+                        type="checkbox"
+                        className="checkbox checkbox-primary checkbox-xs"
+                        checked={createWorktreeForAgent}
+                        disabled={worktreeToggleDisabled}
+                        onChange={(event) => setCreateWorktreeForAgent(event.target.checked)}
+                    />
+                    <span>{worktreeToggleLabel}</span>
+                </label>
                 {attachmentNotice && (
                     <div
                         role="alert"

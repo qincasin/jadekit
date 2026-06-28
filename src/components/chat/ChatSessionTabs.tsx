@@ -5,6 +5,7 @@ import type {ChatSessionTab} from '../../stores/useChatStore';
 import {cn} from '../../utils/cn';
 import {sessionTitle} from './chatSessionSidebarUtils';
 import {ProviderBrandIcon} from './composer/ModelIcon';
+import {worktreeBadgeLabel} from '../../stores/worktreeBadge';
 
 interface ChatSessionTabsProps {
     tabs: ChatSessionTab[];
@@ -95,12 +96,15 @@ export default function ChatSessionTabs({
         <div
             role="tablist"
             aria-label={tabListLabel}
-            className="chat-session-tabs-strip relative flex h-8 min-h-8 shrink-0 items-end gap-0.5 overflow-hidden border-b border-base-300 bg-base-100/85 px-1 pt-1"
+            className="chat-session-tabs-strip relative flex h-9 min-h-9 shrink-0 items-end gap-0.5 overflow-hidden border-b border-base-300 bg-base-100/85 px-1 pt-1"
         >
             {tabs.map((tab) => {
                 const active = tab.key === activeTabKey;
                 const title = tabTitle(tab, newChatLabel);
                 const folder = projectFolderName(tab.currentCwd ?? tab.activeSession?.projectDir ?? null);
+                const worktreeBadge = tab.worktreeBranch
+                    ? worktreeBadgeLabel({branch: tab.worktreeBranch, diff: tab.worktreeDiff})
+                    : null;
                 const statusLabel = tabStatusLabel(t, tab.status);
                 const isBusy = tab.status === 'running' || tab.status === 'loading' || tab.status === 'queued';
 
@@ -111,7 +115,7 @@ export default function ChatSessionTabs({
                         aria-selected={active}
                         data-chat-session-tab-key={tab.key}
                         className={cn(
-                            'group flex h-7 min-w-24 w-44 max-w-56 flex-shrink items-center gap-1 rounded-t border px-1.5 text-[11px] transition-colors',
+                            'group flex h-8 min-w-24 w-44 max-w-56 flex-shrink items-center gap-1 rounded-t border px-1.5 text-[11px] transition-colors',
                             active
                                 ? 'border-base-300 border-b-base-100 bg-base-100 text-base-content shadow-sm'
                                 : 'border-transparent bg-base-200/55 text-base-content/65 hover:bg-base-200',
@@ -132,8 +136,13 @@ export default function ChatSessionTabs({
                             title={`${title}${folder ? ` · ${folder}` : ''} · ${statusLabel}`}
                         >
                             <ProviderBrandIcon provider={tab.provider} size={12} colored />
-                            <span className="min-w-0 flex-1 truncate font-medium">
-                                {title}
+                            <span className="flex min-w-0 flex-1 flex-col">
+                                <span className="truncate font-medium">{title}</span>
+                                {worktreeBadge && (
+                                    <span className="truncate text-[10px] leading-3 text-primary/80" dir="ltr">
+                                        {worktreeBadge}
+                                    </span>
+                                )}
                             </span>
                             {isBusy && (
                                 <span

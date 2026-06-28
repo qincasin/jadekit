@@ -36,6 +36,12 @@ import {
 import {CHAT_DAEMON_READY_TIMEOUT_ERROR_KEY} from '../utils/chatDaemonStatus';
 import {CHAT_MODEL_SELECTION_KEY_PREFIX, getDefaultChatModelId,} from '../utils/chatModels';
 import {getNextTabAfterClose} from '../utils/chatUiBehavior';
+import {
+    closeAgent,
+    createWorktree,
+    type HelmDiffSummary,
+    worktreeDiff,
+} from '../services/worktreeService';
 import {resolveSendCwd} from './chatSendCwd';
 import {resolveTabForEvent} from './chatEventRouting';
 
@@ -321,6 +327,8 @@ export interface ChatSessionTab {
     sessionId: string | null;
     currentCwd: string | null;
     worktreePath: string | null;
+    worktreeBranch: string | null;
+    worktreeDiff: HelmDiffSummary | null;
     activeSession: SessionMeta | null;
     pendingSessionKey: string | null;
     lastSessionLoadMetrics: ChatSessionLoadMetrics | null;
@@ -375,6 +383,9 @@ interface ChatState {
     currentCwd: string | null;
     /** 当前 Agent 绑定的独立 worktree 路径；发送时优先作为 daemon cwd。 */
     worktreePath: string | null;
+    /** 当前 Agent worktree 分支名与 diff 摘要，用于 tab 徽章。 */
+    worktreeBranch: string | null;
+    worktreeDiff: HelmDiffSummary | null;
     /** 当前从历史中载入的会话元信息 */
     activeSession: SessionMeta | null;
     /** 当前正在切换/加载中的历史会话 key */
@@ -424,6 +435,7 @@ interface ChatState {
         model?: string;
         attachments?: ChatAttachment[];
         displayText?: string;
+        createWorktree?: boolean;
     }) => Promise<boolean>;
     loadSession: (session: SessionMeta) => Promise<void>;
     loadActiveSessionFullHistory: () => Promise<ChatMessage[] | null>;
@@ -485,6 +497,8 @@ function createTabFromState(
         sessionId: state.sessionId,
         currentCwd: state.currentCwd,
         worktreePath: state.worktreePath,
+        worktreeBranch: state.worktreeBranch,
+        worktreeDiff: state.worktreeDiff,
         activeSession: state.activeSession,
         pendingSessionKey: state.pendingSessionKey,
         lastSessionLoadMetrics: state.lastSessionLoadMetrics,
@@ -520,6 +534,8 @@ function createEmptyTabFromState(
         sessionId: null,
         currentCwd: cwd ?? state.currentCwd,
         worktreePath: null,
+        worktreeBranch: null,
+        worktreeDiff: null,
         activeSession: null,
         pendingSessionKey: null,
         lastSessionLoadMetrics: null,
@@ -549,6 +565,8 @@ function projectTabToState(tab: ChatSessionTab): Partial<ChatState> {
         agentId: tab.agentId,
         currentCwd: tab.currentCwd,
         worktreePath: tab.worktreePath,
+        worktreeBranch: tab.worktreeBranch,
+        worktreeDiff: tab.worktreeDiff,
         activeSession: tab.activeSession,
         pendingSessionKey: tab.pendingSessionKey,
         lastSessionLoadMetrics: tab.lastSessionLoadMetrics,
@@ -567,6 +585,18 @@ function upsertTab(tabs: ChatSessionTab[], tab: ChatSessionTab): ChatSessionTab[
 
 function removeTab(tabs: ChatSessionTab[], key: string): ChatSessionTab[] {
     return tabs.filter((tab) => tab.key !== key);
+}
+
+function closeAgentForTab(tab: ChatSessionTab | null | undefined): void {
+    if (!tab?.agentId) return;
+    void closeAgent({
+        agentId: tab.agentId,
+        removeWorktree: false,
+        repoRoot: tab.currentCwd,
+        worktreePath: tab.worktreePath,
+    }).catch((error) => {
+        console.error('[ChatStore] close agent failed:', error);
+    });
 }
 
 function getActiveTabKey(state: ChatState): string {
@@ -1203,6 +1233,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     agentId: createAgentId(),
     currentCwd: null,
     worktreePath: null,
+    worktreeBranch: null,
+    worktreeDiff: null,
     activeSession: null,
     pendingSessionKey: null,
     lastSessionLoadMetrics: null,
@@ -1645,7 +1677,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         const tabKey = stateBeforeSend.pendingSessionKey
             ? createDraftTabKey()
             : (stateBeforeSend.activeTabKey ?? createDraftTabKey());
-        const sendState = stateBeforeSend.pendingSessionKey
+        let sendState = stateBeforeSend.pendingSessionKey
             ? {
                 ...stateBeforeSend,
                 messages: [],
@@ -1658,6 +1690,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 handoffContextProvider: null,
             }
             : stateBeforeSend;
+
+        if (opts?.createWorktree && !sendState.worktreePath) {
+            const repoRoot = sendState.currentCwd?.trim();
+            if (!repoRoot) {
+                set({error: '创建 worktree 需要先选择 Git 工作目录'});
+                return false;
+            }
+            try {
+                const worktreeName = `agent-${sendState.agentId.slice(0, 8)}`;
+                const info = await createWorktree(repoRoot, worktreeName);
+                const diff = await worktreeDiff(info.path).catch(() => null);
+                sendState = {
+                    ...sendState,
+                    worktreePath: info.path,
+                    worktreeBranch: info.branch,
+                    worktreeDiff: diff,
+                };
+            } catch (e) {
+                set({error: String(e)});
+                return false;
+            }
+        }
+
         const outboundMessage = sendState.handoffContextProvider
             && sendState.handoffContextProvider !== sendState.provider
             && !sendState.sessionId
@@ -1698,6 +1753,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
                     messages: sendState.messages,
                     sessionId: sendState.sessionId,
                     worktreePath: sendState.worktreePath,
+                    worktreeBranch: sendState.worktreeBranch,
+                    worktreeDiff: sendState.worktreeDiff,
                     activeSession: sendState.activeSession,
                     pendingSessionKey: sendState.pendingSessionKey,
                     lastSessionLoadMetrics: sendState.lastSessionLoadMetrics,
@@ -1725,6 +1782,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
             sessionId: sendState.sessionId,
             currentCwd: sendState.currentCwd,
             worktreePath: sendState.worktreePath,
+            worktreeBranch: sendState.worktreeBranch,
+            worktreeDiff: sendState.worktreeDiff,
             activeSession: sendState.activeSession,
             activeRequestId: sendState.activeRequestId,
             contextTokens: sendState.contextTokens,
@@ -2243,6 +2302,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     closeTab: (key) => {
         set((state) => {
             const tabs = saveActiveProjection(state);
+            const closingTab = tabs.find((tab) => tab.key === key);
+            closeAgentForTab(closingTab);
             const remainingTabs = removeTab(tabs, key);
             const nextActiveKey = getNextTabAfterClose({
                 tabs,
@@ -2275,6 +2336,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             const tabs = saveActiveProjection(state);
             const targetTab = tabs.find((tab) => tab.key === key);
             if (!targetTab) return {};
+            tabs.filter((tab) => tab.key !== key).forEach(closeAgentForTab);
 
             return {
                 openTabs: [targetTab],
@@ -2286,6 +2348,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     closeAllTabs: () => {
         set((state) => {
+            saveActiveProjection(state).forEach(closeAgentForTab);
             const emptyTab = createEmptyTabFromState(state, state.currentCwd);
             return {
                 openTabs: [],

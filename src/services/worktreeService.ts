@@ -41,3 +41,19 @@ export async function worktreeDiff(worktreePath: string): Promise<HelmDiffSummar
         worktreePath: worktreePath.trim(),
     });
 }
+
+export async function closeAgent(options: {
+    agentId: string;
+    removeWorktree?: boolean;
+    repoRoot?: string | null;
+    worktreePath?: string | null;
+    force?: boolean;
+}): Promise<void> {
+    await invoke('helm_close_agent', {
+        agentId: options.agentId.trim(),
+        removeWorktree: options.removeWorktree === true,
+        repoRoot: options.repoRoot?.trim() || undefined,
+        worktreePath: options.worktreePath?.trim() || undefined,
+        force: options.force === true,
+    });
+}

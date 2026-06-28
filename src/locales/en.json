@@ -1150,6 +1150,9 @@
       "reconnecting": "Reconnecting…",
       "readyTimeoutError": "Daemon did not become ready in time"
     },
+    "worktree": {
+      "createForAgent": "Create isolated worktree for this agent"
+    },
     "clear": "Clear",
     "empty": "Start a conversation with AI",
     "message": {
