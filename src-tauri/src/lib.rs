@@ -3,6 +3,7 @@ mod commands;
 mod database;
 mod deeplink;
 mod error;
+mod hermes;
 mod mcp;
 mod models;
 mod proxy;
