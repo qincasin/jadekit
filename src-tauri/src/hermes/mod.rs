@@ -16,6 +16,7 @@ pub use runtime::{
     AgentEvent, AgentHandle, AgentRuntime, Liveness, RuntimeCapabilities, RuntimeError,
     RuntimeStartSpec,
 };
+pub use coordinator::{Coordinator, TickOutcome};
 pub use supervisor::{DEFAULT_MAX_TURN_MS, WorkerStatus, WorkerSupervisor};
 pub use sdk_runtime::{parse_stream_line, SdkRuntime};
 pub use cli_runtime::CliRuntime;
