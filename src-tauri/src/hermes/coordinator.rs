@@ -3287,4 +3287,103 @@ mod tests {
             "Sdk task 不应走 Cli 介质"
         );
     }
+
+    // ===== Task 9：异构混跑 e2e —— Sdk×Cli×Sdk 3 task 全 Completed、run 收敛 =====
+    //
+    // Phase 3b 的 DoD 闭环用例：一次 run 内混合 Sdk / Cli 介质，证明 dispatch_one 按
+    // task.assignment.runtime 把每个 task 路由到对的介质，且全部 Done → Completed →
+    // run 收敛。复用 Task 7 的 RecordingRuntime（已在 send 里 emit Done{success:true}，
+    // task 可立刻完成）。与 Task 7 的 dispatch_routes_by_assignment_runtime_kind 区别：
+    // 后者只断言「路由命中」（单轮 tick），本用例断言「全链路收敛」（run() 跑到终态）。
+    #[tokio::test]
+    async fn mixed_run_dispatches_sdk_and_cli_tasks_through_respective_runtimes() {
+        let fx = Fixture::new();
+        // 建 3 个独立 ready task：t1/t3 走 Sdk，t2 走 Cli（无 deps → 全 Ready）。
+        fn task_with_runtime(id: &str, runtime: RuntimeKind) -> Task {
+            Task {
+                id: id.into(),
+                parent_id: None,
+                spec: format!("work {id}"),
+                status: TaskStatus::Pending, // Store 会按 deps 推导覆盖为 Ready
+                deps: vec![],
+                result: None,
+                assignment: Some(AgentAssignment {
+                    runtime,
+                    tool: "tool".into(),
+                    model: "m".into(),
+                }),
+                created_at: "2026-06-28T00:00:00Z".into(),
+                completed_at: None,
+            }
+        }
+        fx.store
+            .create_task(task_with_runtime("t1", RuntimeKind::Sdk))
+            .unwrap();
+        fx.store
+            .create_task(task_with_runtime("t2", RuntimeKind::Cli))
+            .unwrap();
+        fx.store
+            .create_task(task_with_runtime("t3", RuntimeKind::Sdk))
+            .unwrap();
+
+        // 用两个独立 RecordingRuntime，分别登记到 Sdk / Cli（各记录 start 的 agent_id）。
+        let sdk_mock = std::sync::Arc::new(RecordingRuntime::new());
+        let cli_mock = std::sync::Arc::new(RecordingRuntime::new());
+        let registry = RuntimeRegistry::new()
+            .with(
+                RuntimeKind::Sdk,
+                sdk_mock.clone() as Arc<dyn AgentRuntime>,
+            )
+            .with(
+                RuntimeKind::Cli,
+                cli_mock.clone() as Arc<dyn AgentRuntime>,
+            );
+        let run = fx
+            .store
+            .create_run("mixed run", COORDINATOR_HANDLE, 5)
+            .unwrap();
+        let coord = Coordinator::new(
+            fx.store.clone_handle(),
+            registry,
+            fx.repo_root.clone(),
+            fx.worktrees_dir.clone(),
+        )
+        .with_max_concurrent(4);
+        coord.run(&run.id).await.unwrap();
+
+        // 断言：t1/t3 走 Sdk 介质；t2 走 Cli 介质；无交叉。
+        let sdk_started = sdk_mock.started.lock().unwrap().clone();
+        let cli_started = cli_mock.started.lock().unwrap().clone();
+        assert!(
+            sdk_started.iter().any(|a| a == "t1")
+                && sdk_started.iter().any(|a| a == "t3"),
+            "Sdk tasks → Sdk 介质; got {sdk_started:?}"
+        );
+        assert!(
+            cli_started.iter().any(|a| a == "t2"),
+            "Cli task → Cli 介质; got {cli_started:?}"
+        );
+        assert!(
+            !sdk_started.iter().any(|a| a == "t2"),
+            "Cli task 不应走 Sdk 介质; got {sdk_started:?}"
+        );
+        assert!(
+            !cli_started.iter().any(|a| a == "t1" || a == "t3"),
+            "Sdk tasks 不应走 Cli 介质; got {cli_started:?}"
+        );
+
+        // 全部 Completed + run 收敛（不再是 active）。
+        for id in ["t1", "t2", "t3"] {
+            assert_eq!(
+                fx.store.get_task(id).unwrap().unwrap().status,
+                TaskStatus::Completed,
+                "task {id} 必须 Completed"
+            );
+        }
+        assert_eq!(
+            fx.store.get_active_run().unwrap(),
+            None,
+            "run 已收敛，不再是 active"
+        );
+    }
 }
