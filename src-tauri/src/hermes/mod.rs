@@ -4,8 +4,10 @@
 //! 本模块为纯增量，不影响现有 `chat` 代码。
 
 pub mod runtime;
+pub mod sdk_runtime;
 
 pub use runtime::{
     AgentEvent, AgentHandle, AgentRuntime, Liveness, RuntimeCapabilities, RuntimeError,
     RuntimeStartSpec,
 };
+pub use sdk_runtime::{parse_stream_line, SdkRuntime};

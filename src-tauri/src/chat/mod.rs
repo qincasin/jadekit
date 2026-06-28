@@ -30,6 +30,8 @@ mod worktree;
 pub use agent_id::{sanitize_agent_id, AgentId, DEFAULT_AGENT_ID};
 pub use manager::ChatManager;
 pub use node_runtime::NodeRuntimeStatus;
+/// 对外暴露 StreamLine（Hermes 介质适配器等需要消费原始流）。
+pub use protocol::StreamLine;
 pub use permission_watcher::{
     permission_response_session_id, write_ask_user_question_response, write_plan_approval_response,
     write_tool_permission_response,
