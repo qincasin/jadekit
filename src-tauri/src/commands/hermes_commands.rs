@@ -394,13 +394,23 @@ impl HermesEngine {
             let coordinator =
                 Coordinator::new(store.clone_handle(), registry, repo_root, worktrees_dir)
                     .with_max_concurrent(opts.max_concurrent)
+                    // Task 11（3c）：注入取消信号，让 Coordinator 的 run() 每轮 tick 前都检查
+                    // mid-run cancel（置位 → abort 在飞 dispatch + 标 Cancelled）。Phase 2 的
+                    // pre-loop 单次检查（下方 if 分支）保留不变——二者共用同一 `cancel` Arc：
+                    //   * run() 启动前置位 → 下方 pre-loop 分支先命中 → 标 Failed（原语义，不动）；
+                    //   * run() 循环中置位 → run() 内的 tick-top 检查命中 → 标 Cancelled（Task 10）。
+                    // 不注入时 cancel=None → run() 不检查取消，行为与 Phase 2 逐字一致（非回归）。
+                    .with_cancel(cancel_for_task.clone())
                     // Task 4：注入 TauriEventSink——引擎内部 task/agent 级事件经此通道落地。
                     .with_event_sink(
                         sink_for_task.clone() as Arc<dyn crate::hermes::OrchestrationEventSink>,
                     );
 
+            // pre-loop 取消快路径：进入 run() 前就已被 stop_run/cancel 置位。
+            // 保留原 Failed 语义（不动——改 Cancelled 是语义迁移，会影响既有 engine_stop_run_* 测试）。
+            // mid-run 取消（run() 循环中置位）走 Task 10 的 tick-top 检查 → Cancelled。
             let final_status = if cancel_for_task.load(Ordering::SeqCst) {
-                // 在进入循环前就被 cancel——直接置 Failed（保持原语义；Cancelled 是 Task 11 的范围）。
+                // 在进入循环前就被 cancel——直接置 Failed（保持原语义；mid-run Cancelled 由 run() 负责）。
                 let _ = store.update_run(&run_id, RunStatus::Failed);
                 RunStatus::Failed
             } else {
@@ -554,12 +564,31 @@ pub async fn hermes_gate_resolve(
 }
 
 /// 取消指定 run（设置取消标志，spawned 循环会在下一轮 tick 前退出）。
+///
+/// Phase 2 语义：置 `RunHandle.cancel` 标志。`start_run` 的 pre-loop 快路径命中时
+/// 把 run 标 `Failed`；Task 11 起 mid-run 命中（`run()` 循环内置位）则标 `Cancelled`。
+/// 保留作向后兼容别名——前端旧调用无需改动。
 #[tauri::command]
 pub async fn hermes_run_stop(
     run_id: String,
     state: State<'_, HermesEngine>,
 ) -> Result<(), String> {
     // stop_run 是纯内存操作（无 IO），无需 spawn_blocking。
+    state.stop_run(&run_id)
+}
+
+/// 取消指定 run（mid-run）：置 cancel 标志，Coordinator 下一轮 tick 检查到即 abort 在飞
+/// dispatch + 标 `Cancelled`。与 [`hermes_run_stop`] 共用同一取消标志（同一
+/// `RunHandle.cancel`）——区别仅在「置位时刻被谁观测」：run() 启动前置位 → pre-loop 命中
+/// 标 `Failed`（`hermes_run_stop` 既有路径）；run() 循环中置位 → tick-top 命中标 `Cancelled`
+/// （Task 11 经 `with_cancel` 注入实现）。空 / 未知 run_id 由 `stop_run` 报错。
+#[tauri::command]
+pub async fn hermes_run_cancel(
+    run_id: String,
+    state: State<'_, HermesEngine>,
+) -> Result<(), String> {
+    // 复用 stop_run 的取消标志置位逻辑（同一 RunHandle.cancel）。mid-run 行为来自
+    // start_run 内 with_cancel 注入（Task 11），而非本命令自身。
     state.stop_run(&run_id)
 }
 
@@ -810,6 +839,38 @@ mod tests {
 
         // 不存在的 run_id 报错。
         assert!(engine.stop_run("run_does_not_exist").is_err());
+    }
+
+    /// Task 11（3c）：`hermes_run_cancel` 命令薄 delegate 到 `stop_run`——二者置同一
+    /// `RunHandle.cancel` 标志。本测试沿用 `engine_stop_run_*` 模式直测 `stop_run`
+    /// （`hermes_run_cancel` 是 1 行 delegate，`State` 在单测里不便构造，与既有命令测试一致）。
+    /// 与 `engine_stop_run_registers_and_cancels_handle` 的区别：前者覆盖 Phase 2 的
+    /// `hermes_run_stop`；本测试钉死 Task 11 新增的 `hermes_run_cancel` 委托契约——
+    /// 即「置 cancel true + 未知 run_id 报错」两条不变量。
+    #[test]
+    fn engine_run_cancel_sets_cancel_flag() {
+        let engine = build_test_engine();
+        let run = engine
+            .store
+            .create_run("cancel me", COORDINATOR_HANDLE, DEFAULT_POLL_INTERVAL_MS)
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        engine
+            .runs
+            .lock()
+            .unwrap()
+            .insert(run.id.clone(), RunHandle { cancel: cancel.clone() });
+
+        // hermes_run_cancel 走 stop_run，置 cancel true。
+        // （Task 11 的真 mid-run 行为来自 start_run 内 with_cancel 注入——见 coordinator 测试；
+        //  命令层只负责置标志，故这里直测 stop_run 覆盖委托逻辑。）
+        engine.stop_run(&run.id).unwrap();
+        assert!(cancel.load(Ordering::SeqCst));
+
+        // 不存在的 run_id 报错。
+        assert!(engine.stop_run("run_does_not_exist").is_err());
+        // 空 run_id 报错。
+        assert!(engine.stop_run("   ").is_err());
     }
 
     #[test]
