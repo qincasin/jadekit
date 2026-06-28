@@ -11,6 +11,10 @@ export interface HelmDiffSummary {
     deletions: number;
 }
 
+export interface HelmMergeOutcome {
+    outcome: 'merged' | 'conflict';
+}
+
 export async function createWorktree(repoRoot: string, name: string): Promise<HelmWorktreeInfo> {
     return invoke<HelmWorktreeInfo>('helm_worktree_create', {
         repoRoot: repoRoot.trim(),
@@ -39,6 +43,13 @@ export async function listWorktrees(repoRoot: string): Promise<HelmWorktreeInfo[
 export async function worktreeDiff(worktreePath: string): Promise<HelmDiffSummary> {
     return invoke<HelmDiffSummary>('helm_worktree_diff', {
         worktreePath: worktreePath.trim(),
+    });
+}
+
+export async function mergeWorktree(repoRoot: string, sourceBranch: string): Promise<HelmMergeOutcome> {
+    return invoke<HelmMergeOutcome>('helm_worktree_merge', {
+        repoRoot: repoRoot.trim(),
+        sourceBranch: sourceBranch.trim(),
     });
 }
 

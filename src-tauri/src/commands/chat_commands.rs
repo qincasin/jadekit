@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::{AppHandle, State};
 
-use crate::chat::{ChatManager, DiffSummary, WorktreeInfo, WorktreeManager};
+use crate::chat::{ChatManager, DiffSummary, MergeOutcome, WorktreeInfo, WorktreeManager};
 
 const HELM_WORKTREES_DIR_NAME: &str = "helm-worktrees";
 
@@ -43,6 +43,13 @@ pub struct DiffSummaryDto {
     pub files_changed: u32,
     pub insertions: u32,
     pub deletions: u32,
+}
+
+/// worktree merge 的结果；outcome 使用前端稳定字符串。
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeOutcomeDto {
+    pub outcome: String,
 }
 
 /// 一个工作目录文件项（供 `@` 文件引用补全使用）。
@@ -252,6 +259,16 @@ fn diff_summary_dto(summary: DiffSummary) -> DiffSummaryDto {
         files_changed: summary.files_changed,
         insertions: summary.insertions,
         deletions: summary.deletions,
+    }
+}
+
+fn merge_outcome_dto(outcome: MergeOutcome) -> MergeOutcomeDto {
+    let outcome = match outcome {
+        MergeOutcome::Merged => "merged",
+        MergeOutcome::Conflict => "conflict",
+    };
+    MergeOutcomeDto {
+        outcome: outcome.to_string(),
     }
 }
 
@@ -545,6 +562,17 @@ pub fn helm_worktree_list(repo_root: String) -> Result<Vec<WorktreeInfoDto>, Str
 pub fn helm_worktree_diff(worktree_path: String) -> Result<DiffSummaryDto, String> {
     let worktree_path = resolve_existing_chat_directory(worktree_path, "worktree 路径")?;
     WorktreeManager::diff_summary(&worktree_path).map(diff_summary_dto)
+}
+
+/// 把赢家 worktree 分支合并进当前仓库分支；冲突时底层会自动 abort 回滚。
+#[tauri::command]
+pub fn helm_worktree_merge(
+    repo_root: String,
+    source_branch: String,
+) -> Result<MergeOutcomeDto, String> {
+    let cwd = resolve_existing_chat_directory(repo_root, "Git 仓库")?;
+    let (repo_root, _) = resolve_git_repository(&cwd)?;
+    WorktreeManager::merge_into_current(&repo_root, source_branch.trim()).map(merge_outcome_dto)
 }
 
 /// 关闭 Helm agent，并可选删除其 worktree（删除前由 WorktreeManager 做脏检查）。

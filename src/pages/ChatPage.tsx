@@ -19,6 +19,7 @@ import ChatSessionTabs from '../components/chat/ChatSessionTabs';
 import ChatDiffReviewPane from '../components/chat/ChatDiffReviewPane';
 import type {ChatWorkspaceProjectOption} from '../components/chat/composer/ContextBar';
 import {ChatComposer} from '../components/chat/composer/ChatComposer';
+import {FanoutCompareView} from '../components/chat/fanout/FanoutCompareView';
 import ModalDialog from '../components/common/ModalDialog';
 import {
     CONVERSATION_PANE_MAX_WIDTH,
@@ -88,6 +89,7 @@ import {
 } from '../utils/chatSidebarLayout';
 import {getSessionSelectionKey, type SessionMeta} from '../types/session';
 import type {ChatMessage} from '../types/chat';
+import {fanoutTabsOf} from '../stores/fanoutGroup';
 import type {EditDiffPreviewMode} from '../components/toolBlocks/EditDiffPreview';
 import '../styles/toolBlocks.css';
 
@@ -376,6 +378,14 @@ export default function ChatPage() {
     const isStreaming = useMemo(
         () => messages.some((message) => Boolean(message.streaming)),
         [messages],
+    );
+    const activeTab = useMemo(
+        () => openTabs.find((tab) => tab.key === activeTabKey) ?? null,
+        [activeTabKey, openTabs],
+    );
+    const fanoutCompareTabs = useMemo(
+        () => fanoutTabsOf(openTabs, activeTab?.fanoutGroupId),
+        [activeTab?.fanoutGroupId, openTabs],
     );
     const statusMessages = useMemo(() => {
         if (isSearchingTranscript) {
@@ -1024,6 +1034,9 @@ export default function ChatPage() {
                                 <div className="flex h-full flex-col items-center justify-center text-base-content/40">
                                     <p className="text-sm">{t('chat.empty')}</p>
                                 </div>
+                            )}
+                            {fanoutCompareTabs.length > 1 && !searchQuery.trim() && (
+                                <FanoutCompareView tabs={fanoutCompareTabs} />
                             )}
                             <MessageList
                                 messages={searchSourceMessages}

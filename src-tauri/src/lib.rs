@@ -927,6 +927,7 @@ pub fn run() {
             chat_commands::helm_worktree_remove,
             chat_commands::helm_worktree_list,
             chat_commands::helm_worktree_diff,
+            chat_commands::helm_worktree_merge,
             chat_commands::helm_close_agent,
             chat_commands::permission_respond_ask_user_question,
             chat_commands::permission_respond_tool,
