@@ -27,6 +27,7 @@ use crate::hermes::types::{
     DispatchContext, DispatchStatus, Message, MessageType, RunStatus, Task, TaskStatus,
 };
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 // =============================================================================
@@ -89,6 +90,10 @@ pub struct Coordinator {
     /// 每个 worker agent 一个独立 git worktree 的根目录（如 `repo_root/.helm/worktrees`）。
     worktrees_dir: PathBuf,
     max_concurrent: usize,
+    /// 测试仪器：可选的「活跃派发并发采样器」。
+    /// 派发时 current +1 并把 current 推进 peak；watcher 退出时 current -1。
+    /// 生产代码留 `None`（零成本）；并发上限测试通过 [`Self::with_concurrency_sampler`] 注入。
+    active_counter: Option<Arc<ConcurrencySampler>>,
 }
 
 impl Coordinator {
@@ -104,6 +109,7 @@ impl Coordinator {
             repo_root,
             worktrees_dir,
             max_concurrent: MAX_CONCURRENT_DEFAULT,
+            active_counter: None,
         }
     }
 
@@ -111,6 +117,14 @@ impl Coordinator {
     #[allow(dead_code)]
     pub fn with_max_concurrent(mut self, n: usize) -> Self {
         self.max_concurrent = n;
+        self
+    }
+
+    /// 注入并发采样器（测试仪器）。派发时 current+1 & 推进 peak；watcher 退出 dec。
+    /// 生产代码不调用。
+    #[cfg(test)]
+    pub fn with_concurrency_sampler(mut self, sampler: Arc<ConcurrencySampler>) -> Self {
+        self.active_counter = Some(sampler);
         self
     }
 
@@ -131,12 +145,10 @@ impl Coordinator {
     pub async fn tick(&self) -> Result<TickOutcome, String> {
         let mut outcome = TickOutcome::default();
 
-        // ── 阶段 ①：回收 stale 派发 ─────────────────────────────────────────
-        // 当前 Store 未暴露 `list_stale_dispatches`；Task 9 用一条 SQL 兜底
-        // （等价语义：dispatched 状态 + last_heartbeat_at < now - 阈值）。
-        // 测试用 mock 收 Done 很快，这条路径在 Task 9 测试中走不到；这里
-        // 保留为运行时健壮性兜底（Task 10 把它补成正式 API）。
-        let _ = self.reclaim_stale_dispatches().await;
+        // ── 阶段 ①：回收 stale 派发（心跳超时 → fail_dispatch + 熔断级联） ──
+        // Task 10：正式接入 Store::get_stale_dispatches。每条 stale 派发都走
+        // fail_dispatch_with_cascade——熔断器递增；累计达阈值则 task 标 Failed。
+        outcome.failed += self.reclaim_stale_dispatches().await?;
 
         // ── 阶段 ②：排空 inbox ────────────────────────────────────────────
         outcome.completed += self.drain_inbox().await?;
@@ -160,11 +172,37 @@ impl Coordinator {
     }
 
     /// 阶段 ① 的实现：列出心跳超时的 dispatched 上下文，逐条 `fail_dispatch`。
-    /// Task 9：基本兜底（Store 当前无 `get_stale_dispatches`，YAGNI 用内联查询）。
+    ///
+    /// Task 10：通过 [`Store::get_stale_dispatches`] 取回 stale 派发，对每条调用
+    /// [`fail_dispatch_with_cascade`]——
+    /// - 若熔断（3 次累计）→ task 标 Failed；
+    /// - 否则 task 退回 Ready 等待下一轮重派。
+    /// 返回本轮被回收（failed）的派发数。
+    ///
+    /// 阈值用常量 [`STALE_DISPATCH_THRESHOLD_SECS`]（120s），不写魔法串。
     async fn reclaim_stale_dispatches(&self) -> Result<usize, String> {
-        // 当前 Store 未暴露 stale 扫描；Task 9 测试不会走到这条路径。
-        // 保留为 Task 10 正式接入的钩子（届时 Store 会加 `list_stale_dispatches`）。
-        Ok(0)
+        let stale = self
+            .store
+            .get_stale_dispatches(STALE_DISPATCH_THRESHOLD_SECS as u64)?;
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let mut reaped = 0usize;
+        for ctx in stale {
+            // 复用 watcher 的级联逻辑：熔断阈值达 → task=Failed；否则 task=Ready 重派。
+            let error = format!(
+                "stale dispatch: heartbeat timeout (>{secs}s)",
+                secs = STALE_DISPATCH_THRESHOLD_SECS
+            );
+            let _ = fail_dispatch_with_cascade(
+                &self.store,
+                &ctx.id,
+                &ctx.task_id,
+                &error,
+            );
+            reaped += 1;
+        }
+        Ok(reaped)
     }
 
     /// 阶段 ②：读取 `COORDINATOR_HANDLE` 的未读 inbox，按 sequence 顺序处理。
@@ -341,7 +379,15 @@ impl Coordinator {
         let task_id = task.id.clone();
         let agent_id = handle.agent_id.clone();
         let dispatch_id_w = dispatch_id.clone();
+        // 测试仪器：注入时 inc（同时推进 peak），watcher 退出时 dec。
+        // 用 RAII guard 保证无论 watcher 如何结束（正常 None / panic）都 dec。
+        let counter = self.active_counter.clone();
+        if let Some(c) = &counter {
+            c.on_dispatch();
+        }
         tokio::spawn(async move {
+            // RAII guard：watcher 退出时 dec 计数器（若注入）。
+            let _guard = ActiveGuard(counter);
             while let Some(event) = rx.recv().await {
                 match event {
                     AgentEvent::Done { success, .. } => {
@@ -479,6 +525,56 @@ impl Coordinator {
 // =============================================================================
 // 辅助函数
 // =============================================================================
+
+/// 测试仪器：采样 Coordinator 同时活跃的派发数（活跃 = 已派发但 watcher 未退出）。
+///
+/// - `current`：当前活跃数。`on_dispatch` +1，watcher Drop 时 -1。
+/// - `peak`：历史观测到的 `current` 最大值。`on_dispatch` +1 后用 `fetch_max` 推进。
+///
+/// 设计目标：让并发上限测试**确定性**断言「同时活跃派发 ≤ max_concurrent」，
+/// 不依赖任何 `time::sleep` / 时序——纯原子操作。
+pub struct ConcurrencySampler {
+    current: AtomicU32,
+    peak: AtomicU32,
+}
+
+impl ConcurrencySampler {
+    pub fn new() -> Self {
+        Self {
+            current: AtomicU32::new(0),
+            peak: AtomicU32::new(0),
+        }
+    }
+
+    /// 派发时调用：current +1，并把新 current 推进 peak。
+    pub fn on_dispatch(&self) {
+        let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+        // fetch_max 是 stable since 1.45；用 CAS 循环兜底也无必要。
+        self.peak.fetch_max(now, Ordering::SeqCst);
+    }
+
+    /// watcher 退出时调用：current -1。
+    pub fn on_exit(&self) {
+        self.current.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// 测试读取历史观测到的并发峰值。
+    pub fn peak(&self) -> u32 {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+/// watcher 的 RAII 计数器 guard：构造时持有 sampler，Drop 时调 on_exit。
+/// 用于并发上限测试观测「同时活跃的派发数」。生产路径 `None` 是零成本。
+struct ActiveGuard(Option<Arc<ConcurrencySampler>>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        if let Some(c) = self.0.as_ref() {
+            c.on_exit();
+        }
+    }
+}
 
 /// 从 worker_done 消息 payload 中提取 (taskId, result?)。
 /// payload 形如 `{"taskId":"...","dispatchId":"...","result":"..."}`。
@@ -782,7 +878,7 @@ mod tests {
             }],
         );
 
-        let run = fx
+        let _run = fx
             .store
             .create_run("do t1", COORDINATOR_HANDLE, 5)
             .unwrap();
@@ -798,9 +894,6 @@ mod tests {
         let o2 = coord.tick().await.unwrap();
         assert_eq!(o2.completed, 1, "第二轮应完成 1 个任务");
         assert!(o2.converged, "应已收敛");
-
-        let status = coord.run(&run.id).await.unwrap();
-        let _ = status; // run() 在已收敛的快照上会立即返回。
 
         let t1 = fx.store.get_task("t1").unwrap().unwrap();
         assert_eq!(
@@ -1005,5 +1098,184 @@ mod tests {
         let (task_id, result) = parse_worker_done_payload(&payload);
         assert_eq!(task_id.as_deref(), Some("t9"));
         assert!(result.is_none(), "缺 result 字段 → None（task 仍 Completed）");
+    }
+
+    // ── 用例 4：并行波次 —— 同时活跃派发 ≤ max_concurrent，且全部最终 Completed ─
+    //
+    // 并发上限是 Coordinator 的关键不变量。此测试构造 5 个相互独立的 ready 任务，
+    // 把 max_concurrent=2，注入 ConcurrencySampler；驱动 tick → yield → tick 直到收敛，
+    // 断言 sampler.peak() ≤ 2 且 5 个任务全部 Completed。
+    //
+    // 确定性来源：
+    // - MockRuntime 预加载事件 + drop sender → watcher 排空即退出，无 sleep。
+    // - 并发计数通过原子操作捕获 peak，与调度时序无关。
+    #[tokio::test]
+    async fn parallel_dispatch_waves_respect_max_concurrent() {
+        let fx = Fixture::new();
+        // 5 个独立 ready 任务（无依赖），全部会 emit Done{success:true}。
+        for i in 1..=5 {
+            let id = format!("p{i}");
+            fx.create_task(&id, &format!("parallel work {i}"), vec![]);
+            fx.program(
+                &id,
+                vec![AgentEvent::Done {
+                    success: true,
+                    files_modified: vec![],
+                }],
+            );
+        }
+
+        let sampler = Arc::new(ConcurrencySampler::new());
+        let coord = fx
+            .coordinator()
+            .with_max_concurrent(2)
+            .with_concurrency_sampler(sampler.clone());
+
+        // 驱动循环：tick → yield → tick → ... 直到收敛。安全上限防卡死。
+        let mut converged = false;
+        for _ in 0..20 {
+            let o = coord.tick().await.unwrap();
+            fx.yield_for_watchers().await;
+            if o.converged {
+                converged = true;
+                break;
+            }
+        }
+        assert!(converged, "20 轮内必须收敛");
+
+        // 关键不变量：任意时刻同时活跃派发 ≤ max_concurrent(=2)。
+        let peak = sampler.peak();
+        assert!(
+            peak <= 2,
+            "并发上限被违反：peak active = {peak}，max_concurrent = 2"
+        );
+        // 至少应该观测到过 2 个并发（5 个任务、max=2，必定有同时活跃窗口）。
+        // 注：在单线程 mock runtime + yield_now 模型下，最坏只观测到 1（如果 dispatch_one
+        // 严格串行 + watcher 在 yield 前已退出）。我们只断言「不超过」，不断言「至少」，
+        // 因为后者依赖调度器细节而不够确定。
+
+        // 全部 5 个任务必须最终 Completed。
+        for i in 1..=5 {
+            let id = format!("p{i}");
+            let t = fx.store.get_task(&id).unwrap().unwrap();
+            assert_eq!(
+                t.status,
+                TaskStatus::Completed,
+                "任务 {id} 必须最终 Completed"
+            );
+        }
+    }
+
+    // ── 用例 5：形式收敛 —— N 个任务全 Done → run() 后 run=Completed ──────────
+    //
+    // 验证 `run()` 在 `check_convergence` 为 true 时把 run 状态置为 Completed 并退出。
+    #[tokio::test]
+    async fn run_marks_run_completed_on_full_convergence() {
+        let fx = Fixture::new();
+        // 3 个独立任务，全部成功完成。
+        for i in 1..=3 {
+            let id = format!("c{i}");
+            fx.create_task(&id, &format!("conv work {i}"), vec![]);
+            fx.program(
+                &id,
+                vec![AgentEvent::Done {
+                    success: true,
+                    files_modified: vec![],
+                }],
+            );
+        }
+
+        let run = fx
+            .store
+            .create_run("convergence run", COORDINATOR_HANDLE, 5)
+            .unwrap();
+        let coord = fx.coordinator().with_max_concurrent(4);
+
+        let final_status = coord.run(&run.id).await.unwrap();
+
+        // run 状态必须是 Completed（无 Failed 任务 → derive_final_status = Completed）。
+        assert_eq!(
+            final_status,
+            RunStatus::Completed,
+            "全部任务 Done 后 run 必须为 Completed"
+        );
+
+        // 从 Store 直接验证 run 行也被持久化为 Completed。
+        let active = fx.store.get_active_run().unwrap();
+        assert!(
+            active.is_none(),
+            "Completed run 不再是 active（status != Running）"
+        );
+
+        // 全部任务 Completed。
+        for i in 1..=3 {
+            let id = format!("c{i}");
+            let t = fx.store.get_task(&id).unwrap().unwrap();
+            assert_eq!(t.status, TaskStatus::Completed, "任务 {id} 必须 Completed");
+        }
+    }
+
+    // ── 用例 6：stale-dispatch reaping —— 心跳超时派发被 fail_dispatch ─────────
+    //
+    // 构造一个已派发的任务，把它的 last_heartbeat_at 回拨到阈值之外，且 mock **不**
+    // emit Done。tick 阶段 ① 应通过 Store::get_stale_dispatches 把它回收 →
+    // fail_dispatch_with_cascade。断言 dispatch 不再是 Dispatched 状态。
+    #[tokio::test]
+    async fn stale_dispatch_is_reaped_via_heartbeat_timeout() {
+        let fx = Fixture::new();
+        fx.create_task("S", "work that stalls", vec![]);
+        // 关键：不 program Done —— 这个 agent 假死。
+        // （即使 program 为空，MockRuntime.send 仍返回一个立刻关闭的 receiver，
+        // watcher 立刻 None 退出，不会写 worker_done。）
+
+        let coord = fx.coordinator();
+
+        // 第 1 轮：派发 S。watcher 会立刻收到 None 退出（无 worker_done）。
+        let o1 = coord.tick().await.unwrap();
+        assert_eq!(o1.dispatched, 1, "第 1 轮派发 S");
+        fx.yield_for_watchers().await;
+
+        // 找到刚创建的 dispatch，把它的心跳回拨到 STALE 阈值之外。
+        // 阈值 = STALE_DISPATCH_THRESHOLD_SECS = 120s；回拨到 1 小时前。
+        let stale_hb = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        // 心跳未回拨前不应被视为 stale。
+        let fresh = fx
+            .store
+            .get_stale_dispatches(STALE_DISPATCH_THRESHOLD_SECS as u64)
+            .unwrap();
+        assert!(fresh.is_empty(), "心跳未回拨：dispatch 不应被识别为 stale");
+
+        // Coordinator 用 nanos_hex 自动生成 dispatch id（不可预测）；
+        // 通过 Store 的测试 helper 按 task_id 定位当前 dispatched 上下文。
+        let disp_id = fx.store.find_active_dispatch_id_for_test("S").unwrap();
+        fx.store
+            .set_dispatch_heartbeat_for_test(&disp_id, &stale_hb)
+            .unwrap();
+
+        // 现在 get_stale_dispatches 应命中。
+        let stale = fx
+            .store
+            .get_stale_dispatches(STALE_DISPATCH_THRESHOLD_SECS as u64)
+            .unwrap();
+        assert_eq!(stale.len(), 1, "回拨心跳后应识别为 stale");
+        assert_eq!(stale[0].id, disp_id);
+
+        // 第 2 轮 tick：阶段 ① 应回收 stale dispatch。
+        let o2 = coord.tick().await.unwrap();
+        // reclaim_stale_dispatches 计入 outcome.failed（被回收的派发数）。
+        assert!(o2.failed >= 1, "stale dispatch 应被回收（计入 failed）");
+
+        // dispatch 不再是 Dispatched（应为 Failed —— 1 次失败未熔断）。
+        let d = fx.store.get_dispatch(&disp_id).unwrap().unwrap();
+        assert_ne!(
+            d.status,
+            DispatchStatus::Dispatched,
+            "stale dispatch 不应仍为 Dispatched（已被回收）"
+        );
+        assert_eq!(
+            d.status,
+            DispatchStatus::Failed,
+            "首次失败未熔断 → Failed（task 退回 Ready 等重派）"
+        );
     }
 }

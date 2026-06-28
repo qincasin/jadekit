@@ -614,6 +614,97 @@ impl Store {
         Ok(())
     }
 
+    /// 列出心跳超时的派发上下文（Task 10：stale-dispatch reaping）。
+    ///
+    /// 语义：`status='dispatched'` 且 `last_heartbeat_at` 早于 `now - threshold_secs`。
+    ///
+    /// 实现选择（在 Rust 里比较而非纯 SQL `datetime` 比较）：
+    /// - `last_heartbeat_at` 由 [`DispatchContext`] 写入时统一为 RFC-3339（`Utc::now::to_rfc3339`），
+    ///   是字典序可比较的 ISO-8601；但 SQLite `datetime()` 只识别 `YYYY-MM-DDTHH:MM:SS`
+    ///   （无时区/小数秒），用 SQL 直接比较会丢精度。这里先 SELECT 出全部
+    ///   `dispatched` 上下文，再用 `chrono::DateTime` 精确比较——更鲁棒、无格式坑。
+    /// - threshold 取 `u64` 秒，避免上层魔法串。
+    pub fn get_stale_dispatches(&self, threshold_secs: u64) -> Result<Vec<DispatchContext>, String> {
+        let conn = lock_conn!(self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, task_id, assignee_handle, status, failure_count,
+                        last_heartbeat_at, last_failure, dispatched_at, completed_at, created_at
+                 FROM dispatch_contexts
+                 WHERE status = ?1",
+            )
+            .map_err(|e| format!("prepare get_stale_dispatches: {e}"))?;
+        let mut rows = stmt
+            .query(params![DispatchStatus::Dispatched.as_str()])
+            .map_err(|e| format!("query get_stale_dispatches: {e}"))?;
+        let mut out = Vec::new();
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(threshold_secs as i64);
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| format!("fetch get_stale_dispatches row: {e}"))?
+        {
+            let ctx = Self::row_to_dispatch(row)?;
+            // 缺心跳（NULL）一律视为 stale——派发后从未上报心跳本身就是异常。
+            let hb_str = match ctx.last_heartbeat_at.as_deref() {
+                Some(s) => s,
+                None => {
+                    out.push(ctx);
+                    continue;
+                }
+            };
+            let hb = match chrono::DateTime::parse_from_rfc3339(hb_str) {
+                Ok(t) => t.with_timezone(&chrono::Utc),
+                // 格式异常：保守起见也算 stale（让上层回收）。
+                Err(_) => {
+                    out.push(ctx);
+                    continue;
+                }
+            };
+            if hb < cutoff {
+                out.push(ctx);
+            }
+        }
+        Ok(out)
+    }
+
+    /// **测试专用**：把指定 dispatch 的 `last_heartbeat_at` 强制改成给定时间，
+    /// 用于构造 stale 派发场景（生产代码不应调用）。`#[cfg(test)]` 守卫避免泄漏。
+    #[cfg(test)]
+    pub fn set_dispatch_heartbeat_for_test(
+        &self,
+        dispatch_id: &str,
+        heartbeat: &str,
+    ) -> Result<(), String> {
+        let conn = lock_conn!(self.conn);
+        let updated = conn
+            .execute(
+                "UPDATE dispatch_contexts SET last_heartbeat_at = ?1 WHERE id = ?2",
+                params![heartbeat, dispatch_id],
+            )
+            .map_err(|e| format!("set_dispatch_heartbeat_for_test UPDATE: {e}"))?;
+        if updated == 0 {
+            return Err(format!("dispatch not found: {dispatch_id}"));
+        }
+        Ok(())
+    }
+
+    /// **测试专用**：按 task_id 找它当前 `dispatched` 状态的最新派发 id。
+    /// 用于 stale-reap 测试定位 Coordinator 自动生成的 dispatch（id 不可预测）。
+    #[cfg(test)]
+    pub fn find_active_dispatch_id_for_test(&self, task_id: &str) -> Result<String, String> {
+        let conn = lock_conn!(self.conn);
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM dispatch_contexts
+                 WHERE task_id = ?1 AND status = ?2
+                 ORDER BY rowid DESC LIMIT 1",
+                params![task_id, DispatchStatus::Dispatched.as_str()],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        id.ok_or_else(|| format!("no active dispatch for task {task_id}"))
+    }
+
     /// 取该 task 历史 dispatch 中的最大 `failure_count`。
     ///
     /// 用途：Coordinator 在重派（task 退回 Ready 后再次 dispatch_one）时，把上次的
