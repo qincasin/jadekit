@@ -192,12 +192,15 @@ impl GateStatus {
 /// - `Running`：调度循环中。
 /// - `Completed`：达成目标、正常结束。
 /// - `Failed`：异常终止。
+/// - `Cancelled`：被用户中途取消（Phase 3c 新增——mid-run cancel 信号置位后，
+///   `run()` 独立分支直接 `update_run(Cancelled)` + emit `Run{cancelled}`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RunStatus {
     Idle,
     Running,
     Completed,
     Failed,
+    Cancelled,
 }
 
 impl RunStatus {
@@ -207,6 +210,7 @@ impl RunStatus {
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 
@@ -216,6 +220,7 @@ impl RunStatus {
             "running" => Ok(Self::Running),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
             other => Err(format!("unknown RunStatus: {other}")),
         }
     }
@@ -445,6 +450,7 @@ mod tests {
             RunStatus::Running,
             RunStatus::Completed,
             RunStatus::Failed,
+            RunStatus::Cancelled,
         ] {
             let s = v.as_str();
             assert_eq!(RunStatus::from_str(s).unwrap(), v, "roundtrip {}", s);

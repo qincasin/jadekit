@@ -263,12 +263,16 @@ impl Store {
         .map_err(|e| format!("Failed to create decision_gates table: {e}"))?;
 
         // ── coordinator_runs ──
+        // Phase 3c：CHECK 新增 'cancelled'（RunStatus::Cancelled）。Hermes DB 是 Phase 2
+        // 新建、无历史数据，schema 直接改即可。若本地 dev 已有旧 schema 的 hermes.db，
+        // CREATE TABLE IF NOT EXISTS 不会重建——需删库后重启 dev 让新 CHECK 生效。
+        // （in-memory 测试 DB 每次重建，故测试不受影响。）
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS coordinator_runs (
                 id                  TEXT PRIMARY KEY,
                 spec                TEXT NOT NULL,
                 status              TEXT NOT NULL DEFAULT 'idle'
-                  CHECK(status IN ('idle', 'running', 'completed', 'failed')),
+                  CHECK(status IN ('idle', 'running', 'completed', 'failed', 'cancelled')),
                 coordinator_handle  TEXT NOT NULL,
                 poll_interval_ms    INTEGER NOT NULL DEFAULT 2000,
                 created_at          TEXT NOT NULL DEFAULT (datetime('now')),
@@ -1277,6 +1281,7 @@ impl Store {
         // 让所有 runtime 写入的时间戳格式统一（与 create_run / create_dispatch 等
         // 已用 chrono 的路径一致）。CASE 表达式保持原语义：终态时写 now，否则 NULL
         // → COALESCE 保留既有值。
+        // Phase 3c：'cancelled' 也是终态，需记 completed_at（cancel 时 run 结束）。
         let now = chrono::Utc::now().to_rfc3339();
         let conn = lock_conn!(self.conn);
         let updated = conn
@@ -1284,7 +1289,7 @@ impl Store {
                 "UPDATE coordinator_runs
                  SET status = ?1,
                      completed_at = COALESCE(
-                        CASE WHEN ?1 IN ('completed', 'failed') THEN ?3 ELSE NULL END,
+                        CASE WHEN ?1 IN ('completed', 'failed', 'cancelled') THEN ?3 ELSE NULL END,
                         completed_at
                      )
                  WHERE id = ?2",
@@ -2115,6 +2120,26 @@ mod tests {
         assert_eq!(
             db_run.created_at, run.created_at,
             "DB 行与返回 struct 的 created_at 必须一致（Task 4 D.5 修复）"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Task 10（3c）—— RunStatus::Cancelled 落库：CHECK 放行 + completed_at 终态
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Task 10（3c）：update_run(id, Cancelled) 必须被 schema CHECK 放行，
+    /// 且 cancelled 是终态 → completed_at 必须被写入。
+    /// （若 CHECK 未加 'cancelled'，update_run 会返回 SQLite CHECK constraint failed。）
+    #[test]
+    fn update_run_accepts_cancelled_status() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("cancel me", "coord", 5).unwrap();
+        store.update_run(&run.id, RunStatus::Cancelled).unwrap();
+        let got = store.get_run(&run.id).unwrap().expect("run present");
+        assert_eq!(got.status, RunStatus::Cancelled, "CHECK 必须放行 cancelled");
+        assert!(
+            got.completed_at.is_some(),
+            "cancelled 是终态，应记 completed_at"
         );
     }
 
