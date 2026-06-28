@@ -22,7 +22,8 @@
 //! `Mutex<Connection>` 串行化所有写者，"同一事务 = 同一 `tx`"。
 
 use crate::hermes::types::{
-    AgentAssignment, DispatchContext, DispatchStatus, Task, TaskStatus,
+    AgentAssignment, DecisionGate, DispatchContext, DispatchStatus, GateStatus, Message,
+    MessageType, RunStatus, CoordinatorRun, Task, TaskStatus,
 };
 use rusqlite::{params, Connection, Transaction};
 use std::path::Path;
@@ -349,21 +350,22 @@ impl Store {
 
     pub fn list_tasks(&self, filter: TaskListFilter) -> Result<Vec<Task>, String> {
         let conn = lock_conn!(self.conn);
+        // M2: 状态过滤改为参数化绑定（params![s.as_str()]），与 ready 分支保持一致；
+        // 同时杜绝把 enum token 字符串拼进 SQL 字面量的写法。
         let mut stmt = if filter.ready {
             conn.prepare(
                 "SELECT id, parent_id, spec, status, deps, result, assignment,
                         created_at, completed_at
-                 FROM tasks WHERE status = 'ready' ORDER BY created_at",
+                 FROM tasks WHERE status = ?1 ORDER BY created_at",
             )
             .map_err(|e| format!("Failed to prepare list_tasks (ready): {e}"))?
         } else if let Some(s) = filter.status {
-            let sql = format!(
+            conn.prepare(
                 "SELECT id, parent_id, spec, status, deps, result, assignment,
                         created_at, completed_at
-                 FROM tasks WHERE status = '{}' ORDER BY created_at",
-                s.as_str()
-            );
-            conn.prepare(&sql).map_err(|e| format!("Failed to prepare list_tasks (status): {e}"))?
+                 FROM tasks WHERE status = ?1 ORDER BY created_at",
+            )
+            .map_err(|e| format!("Failed to prepare list_tasks (status): {e}"))?
         } else {
             conn.prepare(
                 "SELECT id, parent_id, spec, status, deps, result, assignment,
@@ -372,15 +374,38 @@ impl Store {
             )
             .map_err(|e| format!("Failed to prepare list_tasks (all): {e}"))?
         };
-        let mut rows = stmt
-            .query([])
-            .map_err(|e| format!("Failed to query list_tasks: {e}"))?;
+
         let mut out = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|e| format!("Failed to fetch list_tasks row: {e}"))?
-        {
-            out.push(Self::row_to_task(row)?);
+        if filter.ready {
+            let mut rows = stmt
+                .query(params![TaskStatus::Ready.as_str()])
+                .map_err(|e| format!("Failed to query list_tasks (ready): {e}"))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|e| format!("Failed to fetch list_tasks row: {e}"))?
+            {
+                out.push(Self::row_to_task(row)?);
+            }
+        } else if let Some(s) = filter.status {
+            let mut rows = stmt
+                .query(params![s.as_str()])
+                .map_err(|e| format!("Failed to query list_tasks (status): {e}"))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|e| format!("Failed to fetch list_tasks row: {e}"))?
+            {
+                out.push(Self::row_to_task(row)?);
+            }
+        } else {
+            let mut rows = stmt
+                .query([])
+                .map_err(|e| format!("Failed to query list_tasks (all): {e}"))?;
+            while let Some(row) = rows
+                .next()
+                .map_err(|e| format!("Failed to fetch list_tasks row: {e}"))?
+            {
+                out.push(Self::row_to_task(row)?);
+            }
         }
         Ok(out)
     }
@@ -433,17 +458,22 @@ impl Store {
     /// 更新任务状态。如果新状态是 `Completed`，则在 **同一写事务** 内
     /// 调用 [`promote_ready_tasks_in_tx`]，把所有 deps 已全部 Completed 的
     /// 下游 Pending 任务原子提升为 Ready（并发不变量；见模块级文档）。
+    ///
+    /// `result`：可选结果字符串。`Some(s)` 写入；`None` 用 `COALESCE` 保留既有值
+    /// ——这样 Coordinator 可以在 worker_done 回填结果后，后续状态更新（如幂等重写）
+    /// 不会清空已落库的 result（M1 修复，对齐 orca `updateTaskStatus(id, status, result?)`）。
     pub fn update_task_status(
         &self,
         id: &str,
         new_status: TaskStatus,
+        result: Option<&str>,
     ) -> Result<(), String> {
         let mut conn = lock_conn!(self.conn);
         // 关键：status 写 + ready 提升放同一 tx，要么一起提交要么一起回滚。
         let tx = conn
             .transaction()
             .map_err(|e| format!("BEGIN update_task_status tx failed: {e}"))?;
-        Self::update_task_status_in_tx(&tx, id, new_status)?;
+        Self::update_task_status_in_tx(&tx, id, new_status, result)?;
         tx.commit()
             .map_err(|e| format!("COMMIT update_task_status tx failed: {e}"))?;
         Ok(())
@@ -453,6 +483,7 @@ impl Store {
         tx: &Transaction,
         id: &str,
         new_status: TaskStatus,
+        result: Option<&str>,
     ) -> Result<(), String> {
         // completed_at 仅在终态写入；其它状态置 NULL 不影响。
         let now = chrono::Utc::now().to_rfc3339();
@@ -464,8 +495,12 @@ impl Store {
             };
         let updated = tx
             .execute(
-                "UPDATE tasks SET status = ?1, completed_at = COALESCE(?2, completed_at) WHERE id = ?3",
-                params![new_status.as_str(), completed_at, id],
+                // M1: result 用 COALESCE(?, result) —— None 不覆盖既有值。
+                "UPDATE tasks SET status = ?1,
+                                      result = COALESCE(?2, result),
+                                      completed_at = COALESCE(?3, completed_at)
+                 WHERE id = ?4",
+                params![new_status.as_str(), result, completed_at, id],
             )
             .map_err(|e| format!("UPDATE tasks failed: {e}"))?;
         if updated == 0 {
@@ -710,6 +745,614 @@ impl Store {
             created_at: updated.9,
         }))
     }
+
+    // ── Message bus ──────────────────────────────────────────────────────
+
+    /// 写入一条消息。`sequence` 由 SQLite `rowid AUTOINCREMENT` 单调分配：
+    /// 选用 AUTOINCREMENT（而非 `MAX(sequence)+1`）是因为它在并发 / 回滚场景下
+    /// 由 SQLite 内部 `sqlite_sequence` 表维护，**绝不复用**已分配的 rowid——
+    /// 即使事务回滚也不会回退序列号。这样多个 worker_done / heartbeat 并发
+    /// 落库时，消息顺序严格反映"先到先服务"，便于 Coordinator 按 sequence 顺序
+    /// 消费 inbox（移植 orca `insertMessage` line 287）。
+    ///
+    /// 调用方提供的 `msg.sequence` 会被覆盖；返回的 Message 已带真实 sequence。
+    pub fn insert_message(&self, msg: Message) -> Result<Message, String> {
+        let conn = lock_conn!(self.conn);
+        conn.execute(
+            "INSERT INTO messages (
+                id, from_handle, to_handle, subject, body, type, priority,
+                thread_id, payload, read, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                msg.id,
+                msg.from,
+                msg.to,
+                msg.subject,
+                msg.body,
+                msg.kind.as_str(),
+                msg.priority,
+                msg.thread_id,
+                msg.payload,
+                msg.read as i64,
+                msg.created_at,
+            ],
+        )
+        .map_err(|e| format!("Failed to insert message: {e}"))?;
+
+        // 回读 sequence（由 AUTOINCREMENT 分配），便于调用方拿到权威值。
+        // query_row 的 closure 在锁内执行，可直接调用 row_to_message 构造 Message。
+        let stored = conn
+            .query_row(
+                "SELECT id, from_handle, to_handle, subject, body, type, priority,
+                        thread_id, payload, read, sequence, created_at
+                 FROM messages WHERE id = ?",
+                params![msg.id],
+                |row| {
+                    // 在闭包内只做无 fallible 转换的部分；枚举 from_str 在外层做。
+                    Ok(MessageRowLite {
+                        id: row.get(0)?,
+                        from: row.get(1)?,
+                        to: row.get(2)?,
+                        subject: row.get(3)?,
+                        body: row.get(4)?,
+                        type_str: row.get(5)?,
+                        priority: row.get(6)?,
+                        thread_id: row.get(7).ok(),
+                        payload: row.get(8).ok(),
+                        read_i: row.get(9)?,
+                        sequence: row.get::<_, i64>(10)? as u64,
+                        created_at: row.get(11)?,
+                    })
+                },
+            )
+            .map_err(|e| format!("Failed to re-read message: {e}"))?;
+        Ok(Message {
+            id: stored.id,
+            from: stored.from,
+            to: stored.to,
+            subject: stored.subject,
+            body: stored.body,
+            kind: MessageType::from_str(&stored.type_str)?,
+            priority: stored.priority,
+            thread_id: stored.thread_id,
+            payload: stored.payload,
+            read: stored.read_i != 0,
+            sequence: stored.sequence,
+            created_at: stored.created_at,
+        })
+    }
+
+    /// 按 `to_handle` 列出 inbox。`unread_only=true` 只返回未读；按 `sequence` 升序。
+    /// 对齐 orca `getUnreadMessages`（line 305）—— Coordinator 按 sequence 顺序消费，
+    /// 保证先到先处理。
+    pub fn list_inbox(&self, to_handle: &str, opts: InboxFilter) -> Result<Vec<Message>, String> {
+        let conn = lock_conn!(self.conn);
+        let mut stmt = if opts.unread_only {
+            conn.prepare(
+                "SELECT id, from_handle, to_handle, subject, body, type, priority,
+                        thread_id, payload, read, sequence, created_at
+                 FROM messages WHERE to_handle = ?1 AND read = 0
+                 ORDER BY sequence ASC",
+            )
+            .map_err(|e| format!("Failed to prepare list_inbox (unread): {e}"))?
+        } else {
+            conn.prepare(
+                "SELECT id, from_handle, to_handle, subject, body, type, priority,
+                        thread_id, payload, read, sequence, created_at
+                 FROM messages WHERE to_handle = ?1
+                 ORDER BY sequence ASC",
+            )
+            .map_err(|e| format!("Failed to prepare list_inbox (all): {e}"))?
+        };
+        let mut rows = stmt
+            .query(params![to_handle])
+            .map_err(|e| format!("Failed to query list_inbox: {e}"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| format!("Failed to fetch list_inbox row: {e}"))?
+        {
+            out.push(Self::row_to_message(row)?);
+        }
+        Ok(out)
+    }
+
+    /// 按消息 sequence（自增主键）批量标记已读。对齐 orca `markAsRead(ids)` line 367，
+    /// 区别在于 orca 用字符串 id，这里用 sequence（主键，更稳定且高效）。
+    pub fn mark_read_by_ids(&self, sequences: &[i64]) -> Result<(), String> {
+        if sequences.is_empty() {
+            return Ok(());
+        }
+        let conn = lock_conn!(self.conn);
+        let placeholders = std::iter::repeat("?")
+            .take(sequences.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("UPDATE messages SET read = 1 WHERE sequence IN ({placeholders})");
+        conn.execute(
+            &sql,
+            rusqlite::params_from_iter(sequences.iter().copied()),
+        )
+        .map_err(|e| format!("Failed to mark_read_by_ids: {e}"))?;
+        Ok(())
+    }
+
+    /// 按 `to_handle` 标记全部未读为已读（批量场景）。Coordinator 在消费完 inbox
+    /// 一轮后通常调用此方法清理收件箱。
+    pub fn mark_read_by_handle(&self, to_handle: &str) -> Result<(), String> {
+        let conn = lock_conn!(self.conn);
+        conn.execute(
+            "UPDATE messages SET read = 1 WHERE to_handle = ?1 AND read = 0",
+            params![to_handle],
+        )
+        .map_err(|e| format!("Failed to mark_read_by_handle: {e}"))?;
+        Ok(())
+    }
+
+    fn row_to_message(row: &rusqlite::Row) -> Result<Message, String> {
+        let id: String = row.get(0).map_err(|e| format!("message.id: {e}"))?;
+        let from: String = row.get(1).map_err(|e| format!("message.from: {e}"))?;
+        let to: String = row.get(2).map_err(|e| format!("message.to: {e}"))?;
+        let subject: String = row.get(3).map_err(|e| format!("message.subject: {e}"))?;
+        let body: String = row.get(4).map_err(|e| format!("message.body: {e}"))?;
+        let type_str: String = row.get(5).map_err(|e| format!("message.type: {e}"))?;
+        let priority: String = row.get(6).map_err(|e| format!("message.priority: {e}"))?;
+        let thread_id: Option<String> = row.get(7).ok();
+        let payload: Option<String> = row.get(8).ok();
+        let read_i: i64 = row.get(9).map_err(|e| format!("message.read: {e}"))?;
+        let sequence: u64 = row
+            .get::<_, i64>(10)
+            .map_err(|e| format!("message.sequence: {e}"))?
+            as u64;
+        let created_at: String = row.get(11).map_err(|e| format!("message.created_at: {e}"))?;
+
+        Ok(Message {
+            id,
+            from,
+            to,
+            subject,
+            body,
+            kind: MessageType::from_str(&type_str)?,
+            priority,
+            thread_id,
+            payload,
+            read: read_i != 0,
+            sequence,
+            created_at,
+        })
+    }
+
+    // ── Decision gates ──────────────────────────────────────────────────
+    //
+    // Gate 状态流：Pending → Resolved（外部回答）/ Timeout。
+    // - create_gate：插入 Pending gate，并把对应 task 置为 Blocked（等待人工决策）。
+    //   （对齐 orca `createGate` line 735。当前实现不级联 task 状态——YAGNI，
+    //   由调用方 Coordinator 决定是否 Block 任务。仅持久化 gate 记录。）
+    // - resolve_gate：写入 resolution + resolved_at，状态 → Resolved。
+    //   对齐 orca `resolveGate` line 748（不在此自动 unblock task，留给 Coordinator）。
+
+    pub fn create_gate(
+        &self,
+        task_id: &str,
+        question: &str,
+        options: Vec<String>,
+    ) -> Result<DecisionGate, String> {
+        let id = format!("gate_{}", uuid_v4_short());
+        let options_json = serde_json::to_string(&options)
+            .map_err(|e| format!("Failed to serialize gate options: {e}"))?;
+        let conn = lock_conn!(self.conn);
+        conn.execute(
+            "INSERT INTO decision_gates (id, task_id, question, options, status)
+             VALUES (?, ?, ?, ?, ?)",
+            params![id, task_id, question, options_json, GateStatus::Pending.as_str()],
+        )
+        .map_err(|e| format!("Failed to insert gate: {e}"))?;
+
+        Ok(DecisionGate {
+            id,
+            task_id: task_id.to_string(),
+            question: question.to_string(),
+            options,
+            resolution: None,
+            status: GateStatus::Pending,
+        })
+    }
+
+    pub fn resolve_gate(&self, gate_id: &str, resolution: String) -> Result<(), String> {
+        let conn = lock_conn!(self.conn);
+        let updated = conn
+            .execute(
+                "UPDATE decision_gates
+                 SET status = ?1, resolution = ?2, resolved_at = datetime('now')
+                 WHERE id = ?3",
+                params![GateStatus::Resolved.as_str(), resolution, gate_id],
+            )
+            .map_err(|e| format!("Failed to resolve gate: {e}"))?;
+        if updated == 0 {
+            return Err(format!("Gate not found: {gate_id}"));
+        }
+        Ok(())
+    }
+
+    pub fn list_gates(&self, filter: GateListFilter) -> Result<Vec<DecisionGate>, String> {
+        let conn = lock_conn!(self.conn);
+        let mut stmt = match (filter.task_id.as_deref(), filter.status) {
+            (Some(_), Some(_)) => conn
+                .prepare(
+                    "SELECT id, task_id, question, options, status, resolution
+                     FROM decision_gates WHERE task_id = ?1 AND status = ?2
+                     ORDER BY created_at",
+                )
+                .map_err(|e| format!("prepare list_gates(task+status): {e}"))?,
+            (Some(_), None) => conn
+                .prepare(
+                    "SELECT id, task_id, question, options, status, resolution
+                     FROM decision_gates WHERE task_id = ?1
+                     ORDER BY created_at",
+                )
+                .map_err(|e| format!("prepare list_gates(task): {e}"))?,
+            (None, Some(_)) => conn
+                .prepare(
+                    "SELECT id, task_id, question, options, status, resolution
+                     FROM decision_gates WHERE status = ?1
+                     ORDER BY created_at",
+                )
+                .map_err(|e| format!("prepare list_gates(status): {e}"))?,
+            (None, None) => conn
+                .prepare(
+                    "SELECT id, task_id, question, options, status, resolution
+                     FROM decision_gates ORDER BY created_at",
+                )
+                .map_err(|e| format!("prepare list_gates(all): {e}"))?,
+        };
+
+        let mut rows = match (filter.task_id.as_deref(), filter.status) {
+            (Some(t), Some(s)) => stmt.query(params![t, s.as_str()]),
+            (Some(t), None) => stmt.query(params![t]),
+            (None, Some(s)) => stmt.query(params![s.as_str()]),
+            (None, None) => stmt.query([]),
+        }
+        .map_err(|e| format!("Failed to query list_gates: {e}"))?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| format!("Failed to fetch list_gates row: {e}"))?
+        {
+            out.push(Self::row_to_gate(row)?);
+        }
+        Ok(out)
+    }
+
+    fn row_to_gate(row: &rusqlite::Row) -> Result<DecisionGate, String> {
+        let id: String = row.get(0).map_err(|e| format!("gate.id: {e}"))?;
+        let task_id: String = row.get(1).map_err(|e| format!("gate.task_id: {e}"))?;
+        let question: String = row.get(2).map_err(|e| format!("gate.question: {e}"))?;
+        let options_str: String = row.get(3).map_err(|e| format!("gate.options: {e}"))?;
+        let status_str: String = row.get(4).map_err(|e| format!("gate.status: {e}"))?;
+        let resolution: Option<String> = row.get(5).ok();
+
+        let options: Vec<String> = serde_json::from_str(&options_str)
+            .map_err(|e| format!("Failed to deserialize gate options '{options_str}': {e}"))?;
+
+        Ok(DecisionGate {
+            id,
+            task_id,
+            question,
+            options,
+            resolution,
+            status: GateStatus::from_str(&status_str)?,
+        })
+    }
+
+    // ── Coordinator runs ────────────────────────────────────────────────
+
+    /// 开启一次 Coordinator 编排运行。状态置为 `Running`（对齐 orca `createCoordinatorRun`）。
+    pub fn create_run(
+        &self,
+        goal: &str,
+        coordinator_handle: &str,
+        poll_interval_ms: u64,
+    ) -> Result<CoordinatorRun, String> {
+        let id = format!("run_{}", uuid_v4_short());
+        let conn = lock_conn!(self.conn);
+        conn.execute(
+            "INSERT INTO coordinator_runs
+                (id, spec, status, coordinator_handle, poll_interval_ms)
+             VALUES (?, ?, ?, ?, ?)",
+            params![
+                id,
+                goal,
+                RunStatus::Running.as_str(),
+                coordinator_handle,
+                poll_interval_ms as i64,
+            ],
+        )
+        .map_err(|e| format!("Failed to insert coordinator_run: {e}"))?;
+
+        Ok(CoordinatorRun {
+            id,
+            goal: goal.to_string(),
+            status: RunStatus::Running,
+            coordinator_handle: coordinator_handle.to_string(),
+            poll_interval_ms,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: None,
+        })
+    }
+
+    pub fn update_run(
+        &self,
+        run_id: &str,
+        status: RunStatus,
+    ) -> Result<(), String> {
+        let conn = lock_conn!(self.conn);
+        let updated = conn
+            .execute(
+                "UPDATE coordinator_runs
+                 SET status = ?1,
+                     completed_at = COALESCE(
+                        CASE WHEN ?1 IN ('completed', 'failed') THEN datetime('now') ELSE NULL END,
+                        completed_at
+                     )
+                 WHERE id = ?2",
+                params![status.as_str(), run_id],
+            )
+            .map_err(|e| format!("Failed to update coordinator_run: {e}"))?;
+        if updated == 0 {
+            return Err(format!("Run not found: {run_id}"));
+        }
+        Ok(())
+    }
+
+    pub fn get_active_run(&self) -> Result<Option<CoordinatorRun>, String> {
+        let conn = lock_conn!(self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, spec, status, coordinator_handle, poll_interval_ms,
+                        created_at, completed_at
+                 FROM coordinator_runs
+                 WHERE status = ?1
+                 ORDER BY created_at DESC LIMIT 1",
+            )
+            .map_err(|e| format!("prepare get_active_run: {e}"))?;
+        let mut rows = stmt
+            .query(params![RunStatus::Running.as_str()])
+            .map_err(|e| format!("query get_active_run: {e}"))?;
+        match rows
+            .next()
+            .map_err(|e| format!("fetch get_active_run: {e}"))?
+        {
+            Some(row) => Ok(Some(Self::row_to_run(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn row_to_run(row: &rusqlite::Row) -> Result<CoordinatorRun, String> {
+        let id: String = row.get(0).map_err(|e| format!("run.id: {e}"))?;
+        let goal: String = row.get(1).map_err(|e| format!("run.spec: {e}"))?;
+        let status_str: String = row.get(2).map_err(|e| format!("run.status: {e}"))?;
+        let coordinator_handle: String = row
+            .get(3)
+            .map_err(|e| format!("run.coordinator_handle: {e}"))?;
+        let poll_interval_ms: u64 = row
+            .get::<_, i64>(4)
+            .map_err(|e| format!("run.poll_interval_ms: {e}"))?
+            as u64;
+        let created_at: String = row.get(5).map_err(|e| format!("run.created_at: {e}"))?;
+        let completed_at: Option<String> = row.get(6).ok();
+
+        Ok(CoordinatorRun {
+            id,
+            goal,
+            status: RunStatus::from_str(&status_str)?,
+            coordinator_handle,
+            poll_interval_ms,
+            created_at,
+            completed_at,
+        })
+    }
+
+    // ── Crash-recovery reconciliation ───────────────────────────────────
+    //
+    // 进程崩溃后，可能在 `dispatched` 状态留下"孤儿"任务。重启时 reconcile
+    // 把这些任务收敛回正确状态（移植 orca `lifecycle-reconciliation`）：
+    //
+    // - 若已收到该 dispatch 对应的 worker_done（且 dispatch_id + task_id +
+    //   assignee 三元组匹配，避免重试产生的陈旧 worker_done 错配）→
+    //   把 task 标为 Completed 并持久化 worker_done payload 中的 result，
+    //   dispatch 标为 Completed。
+    // - 否则（dispatched 但无匹配 worker_done）→ agent 大概率崩溃/丢失，
+    //   把 task 重置为 Ready（不是 Pending——下游已提升过；Ready 让
+    //   Coordinator 下一轮重新派发），dispatch 标为 Failed。
+    //
+    // 整个扫描在同一事务内完成，保证一致性（中途崩溃不会留下半成品状态）。
+
+    pub fn reconcile_on_startup(&self) -> Result<ReconcileReport, String> {
+        let mut conn = lock_conn!(self.conn);
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("BEGIN reconcile tx: {e}"))?;
+        let report = Self::reconcile_in_tx(&tx)?;
+        tx.commit().map_err(|e| format!("COMMIT reconcile tx: {e}"))?;
+        Ok(report)
+    }
+
+    fn reconcile_in_tx(tx: &Transaction) -> Result<ReconcileReport, String> {
+        let mut completed_via_worker_done: u64 = 0;
+        let mut marked_for_redispatch: u64 = 0;
+
+        // 1) 收集所有"孤儿 dispatched"任务 + 它们当前活跃的 dispatch 上下文。
+        //    一条 task 理论上同时只有一个活跃 dispatch；取最新的那条（对齐 orca
+        //    `getDispatchContext` ORDER BY rowid DESC LIMIT 1）。
+        let mut stmt = tx
+            .prepare(
+                "SELECT t.id, t.status
+                 FROM tasks t
+                 WHERE t.status = ?1",
+            )
+            .map_err(|e| format!("prepare reconcile scan: {e}"))?;
+        let orphan_task_ids: Vec<String> = stmt
+            .query_map(params![TaskStatus::Dispatched.as_str()], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("query reconcile scan: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect reconcile scan: {e}"))?;
+        drop(stmt);
+
+        for task_id in orphan_task_ids {
+            // 取该 task 当前活跃的 dispatch（dispatched 状态，最新一条）
+            let active_dispatch: Option<(String, Option<String>)> = tx
+                .query_row(
+                    "SELECT id, assignee_handle FROM dispatch_contexts
+                     WHERE task_id = ?1 AND status = ?2
+                     ORDER BY rowid DESC LIMIT 1",
+                    params![task_id, DispatchStatus::Dispatched.as_str()],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .ok();
+
+            let Some((dispatch_id, dispatch_assignee)) = active_dispatch else {
+                // 没有 dispatched 状态的上下文：说明任务状态与 dispatch 表不一致。
+                // 视作无 worker_done 也能匹配的情况——直接把 task 推回 Ready
+                // 让 Coordinator 自检（保守做法，避免卡死）。
+                Self::reset_task_to_ready_in_tx(tx, &task_id)?;
+                marked_for_redispatch += 1;
+                continue;
+            };
+
+            // 2) 在 messages 表里查找匹配三元组的 worker_done（dispatch_id + task_id + from_handle=assignee）。
+            //    对齐 orca `reconcileWorkerDoneMessage`：忽略陈旧/错配的 worker_done。
+            let matched_msg: Option<(Option<String>,)> = tx
+                .query_row(
+                    "SELECT m.payload FROM messages m
+                     WHERE m.type = ?1
+                       AND m.from_handle = ?2
+                       AND m.payload IS NOT NULL
+                       AND json_extract(m.payload, '$.taskId') = ?3
+                       AND json_extract(m.payload, '$.dispatchId') = ?4
+                     ORDER BY m.sequence DESC LIMIT 1",
+                    params![
+                        MessageType::WorkerDone.as_str(),
+                        dispatch_assignee.as_deref().unwrap_or(""),
+                        task_id,
+                        dispatch_id,
+                    ],
+                    |r| Ok((r.get::<_, Option<String>>(0)?,)),
+                )
+                .ok();
+
+            if let Some((Some(payload),)) = matched_msg {
+                // 回填：task → Completed（带 result），dispatch → Completed
+                let result_text = extract_result_from_payload(&payload);
+                Self::update_task_status_in_tx(
+                    tx,
+                    &task_id,
+                    TaskStatus::Completed,
+                    result_text.as_deref(),
+                )?;
+                tx.execute(
+                    "UPDATE dispatch_contexts
+                     SET status = ?1, completed_at = datetime('now')
+                     WHERE id = ?2",
+                    params![DispatchStatus::Completed.as_str(), dispatch_id],
+                )
+                .map_err(|e| format!("reconcile complete dispatch: {e}"))?;
+                completed_via_worker_done += 1;
+            } else {
+                // 重派：task → Ready，dispatch → Failed
+                Self::reset_task_to_ready_in_tx(tx, &task_id)?;
+                tx.execute(
+                    "UPDATE dispatch_contexts
+                     SET status = ?1
+                     WHERE id = ?2",
+                    params![DispatchStatus::Failed.as_str(), dispatch_id],
+                )
+                .map_err(|e| format!("reconcile fail dispatch: {e}"))?;
+                marked_for_redispatch += 1;
+            }
+        }
+
+        Ok(ReconcileReport {
+            completed_via_worker_done,
+            marked_for_redispatch,
+        })
+    }
+
+    /// 把 task 重置回 Ready（而非 Pending）。
+    /// 关键：deps 早已提升完毕（task 才能走到 dispatched），所以重置为 Ready 让
+    /// Coordinator 下一轮重新派发即可；不需要重跑 promote（对齐 orca `failDispatch`
+    /// line 723-725 的注释："set back to 'ready' (not 'pending')"）。
+    /// 同时把 completed_at 清空，让 task 重新"活着"。
+    fn reset_task_to_ready_in_tx(tx: &Transaction, task_id: &str) -> Result<(), String> {
+        tx.execute(
+            "UPDATE tasks SET status = ?1, completed_at = NULL WHERE id = ?2",
+            params![TaskStatus::Ready.as_str(), task_id],
+        )
+        .map_err(|e| format!("reset_task_to_ready UPDATE: {e}"))?;
+        Ok(())
+    }
+}
+
+/// `insert_message` 回读时用的中间结构——rusqlite closure 不能返回 fallible
+/// `Message`（`MessageType::from_str` 会失败），先存原始字符串再外层转换。
+struct MessageRowLite {
+    id: String,
+    from: String,
+    to: String,
+    subject: String,
+    body: String,
+    type_str: String,
+    priority: String,
+    thread_id: Option<String>,
+    payload: Option<String>,
+    read_i: i64,
+    sequence: u64,
+    created_at: String,
+}
+
+/// `list_inbox` 的过滤参数（对齐 orca `getUnreadMessages(opts?)`）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InboxFilter {
+    /// true：仅返回 `read=0` 的消息。
+    pub unread_only: bool,
+}
+
+/// `list_gates` 的过滤参数（对齐 orca `listGates(filter)`）。
+#[derive(Debug, Clone, Default)]
+pub struct GateListFilter {
+    pub task_id: Option<String>,
+    pub status: Option<GateStatus>,
+}
+
+/// `reconcile_on_startup` 的返回报告。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReconcileReport {
+    /// 通过匹配 worker_done 消息回填为 Completed 的任务数。
+    pub completed_via_worker_done: u64,
+    /// 因无 worker_done 而被重置为 Ready、对应 dispatch 标 Failed 的任务数。
+    pub marked_for_redispatch: u64,
+}
+
+/// 从 worker_done 消息 payload 中提取 result 文本。
+/// payload 形如 `{"taskId": "...", "dispatchId": "...", "result": "..."}`。
+/// 若 payload 缺 result 字段，返回 None（task 仍标 Completed，只是不带 result）。
+fn extract_result_from_payload(payload: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    match v.get("result")? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
+/// 生成一个简短的伪 UUID（用于 gate / run id 前缀）。
+/// 不依赖 `uuid` crate（YAGNI——非安全敏感场景，timestamp + 计数即可）。
+fn uuid_v4_short() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:x}")
 }
 
 // 局部复用 database 模块的锁辅助宏，避免在文件顶部 `use` 一遍再破坏隔离。
@@ -729,7 +1372,9 @@ use lock_conn;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hermes::types::RuntimeKind;
+    use crate::hermes::types::{
+        DecisionGate, GateStatus, Message, MessageType, RunStatus, RuntimeKind,
+    };
 
     fn sample_task(id: &str, deps: Vec<&str>) -> Task {
         Task {
@@ -808,7 +1453,7 @@ mod tests {
 
         // 完成 root
         store
-            .update_task_status("root", TaskStatus::Completed)
+            .update_task_status("root", TaskStatus::Completed, None)
             .unwrap();
 
         // 立即读 child —— 必须 Ready（同事务提交）
@@ -828,7 +1473,7 @@ mod tests {
         assert_eq!(multi.status, TaskStatus::Pending, "multi has root2 outstanding");
 
         store
-            .update_task_status("root2", TaskStatus::Completed)
+            .update_task_status("root2", TaskStatus::Completed, None)
             .unwrap();
         let multi = store.get_task("multi").unwrap().unwrap();
         assert_eq!(
@@ -906,5 +1551,224 @@ mod tests {
         );
         assert_eq!(got.created_at, "2026-06-28T00:00:00Z");
         assert_eq!(got.completed_at, None);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Task 7 —— Message bus / Gates / Runs / Reconcile（先 RED，后 GREEN）
+    // ──────────────────────────────────────────────────────────────────
+
+    fn sample_message(seq_id: &str, to: &str, kind: MessageType) -> Message {
+        Message {
+            id: seq_id.to_string(),
+            from: "coord".to_string(),
+            to: to.to_string(),
+            subject: format!("subj {seq_id}"),
+            body: String::new(),
+            kind,
+            priority: "normal".to_string(),
+            thread_id: None,
+            payload: None,
+            read: false,
+            // 由 insert_message 覆盖；测试构造时随意给个占位
+            sequence: 0,
+            created_at: "2026-06-28T00:00:00Z".to_string(),
+        }
+    }
+
+    /// T1: 同一 to_handle 的 3 条消息按 sequence 升序返回。
+    #[test]
+    fn inbox_returns_messages_in_ascending_sequence() {
+        let store = Store::open_in_memory().unwrap();
+        let to = "agent_1";
+        store.insert_message(sample_message("m1", to, MessageType::Status)).unwrap();
+        store.insert_message(sample_message("m2", to, MessageType::Status)).unwrap();
+        store.insert_message(sample_message("m3", to, MessageType::Status)).unwrap();
+
+        let inbox = store
+            .list_inbox(to, InboxFilter { unread_only: false })
+            .unwrap();
+        assert_eq!(inbox.len(), 3, "3 messages to same handle");
+        // sequence 严格单调递增
+        assert!(inbox[0].sequence < inbox[1].sequence);
+        assert!(inbox[1].sequence < inbox[2].sequence);
+        // 按插入顺序 m1 < m2 < m3
+        assert_eq!(inbox[0].id, "m1");
+        assert_eq!(inbox[1].id, "m2");
+        assert_eq!(inbox[2].id, "m3");
+    }
+
+    /// T2: unread_only 只返回未读；mark_read 把它们翻成已读。
+    #[test]
+    fn inbox_unread_filter_and_mark_read() {
+        let store = Store::open_in_memory().unwrap();
+        let to = "agent_1";
+        store.insert_message(sample_message("m1", to, MessageType::Status)).unwrap();
+        store.insert_message(sample_message("m2", to, MessageType::Status)).unwrap();
+
+        // 初始两条都未读
+        let unread = store
+            .list_inbox(to, InboxFilter { unread_only: true })
+            .unwrap();
+        assert_eq!(unread.len(), 2, "both unread initially");
+
+        // mark_read by to_handle：翻成已读
+        store.mark_read_by_handle(to).unwrap();
+        let unread_after = store
+            .list_inbox(to, InboxFilter { unread_only: true })
+            .unwrap();
+        assert_eq!(unread_after.len(), 0, "no unread after mark_read");
+
+        // unread_only=false 仍能看到全部（已读 + 未读）
+        let all = store
+            .list_inbox(to, InboxFilter { unread_only: false })
+            .unwrap();
+        assert_eq!(all.len(), 2);
+
+        // mark_read by ids 也工作：新插一条，按 id 翻
+        store.insert_message(sample_message("m3", to, MessageType::Status)).unwrap();
+        let m3 = store
+            .list_inbox(to, InboxFilter { unread_only: true })
+            .unwrap();
+        assert_eq!(m3.len(), 1);
+        store.mark_read_by_ids(&[m3[0].sequence as i64]).unwrap();
+        let final_unread = store
+            .list_inbox(to, InboxFilter { unread_only: true })
+            .unwrap();
+        assert_eq!(final_unread.len(), 0);
+    }
+
+    /// T3: Gate 生命周期——create → list(Pending) 命中 → resolve → list(Resolved) 命中。
+    #[test]
+    fn gate_lifecycle_create_resolve_list() {
+        let store = Store::open_in_memory().unwrap();
+        store.create_task(sample_task("gt", vec![])).unwrap();
+
+        let gate = store
+            .create_gate("gt", "继续吗？", vec!["yes".to_string(), "no".to_string()])
+            .unwrap();
+        assert_eq!(gate.status, GateStatus::Pending);
+        assert_eq!(gate.options, vec!["yes".to_string(), "no".to_string()]);
+
+        // Pending 列表命中
+        let pending = store
+            .list_gates(GateListFilter {
+                task_id: None,
+                status: Some(GateStatus::Pending),
+            })
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, gate.id);
+
+        // resolve
+        store.resolve_gate(&gate.id, "yes".to_string()).unwrap();
+
+        // Pending 列表空，Resolved 命中
+        let pending_after = store
+            .list_gates(GateListFilter {
+                task_id: None,
+                status: Some(GateStatus::Pending),
+            })
+            .unwrap();
+        assert_eq!(pending_after.len(), 0, "no pending after resolve");
+
+        let resolved = store
+            .list_gates(GateListFilter {
+                task_id: None,
+                status: Some(GateStatus::Resolved),
+            })
+            .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, gate.id);
+        assert_eq!(resolved[0].resolution.as_deref(), Some("yes"));
+    }
+
+    /// T4: Reconcile —— dispatched 任务有 worker_done → 完成。
+    #[test]
+    fn reconcile_worker_done_completes_task() {
+        let store = Store::open_in_memory().unwrap();
+        store.create_task(sample_task("rt", vec![])).unwrap();
+        // 模拟 Coordinator 派发：建 dispatched 上下文 + 把任务推到 Dispatched
+        let mut ctx = sample_dispatch("ctx_1", "rt");
+        ctx.status = DispatchStatus::Dispatched;
+        ctx.assignee = Some("worker_a".to_string());
+        store.create_dispatch(ctx.clone()).unwrap();
+        store
+            .update_task_status("rt", TaskStatus::Dispatched, None)
+            .unwrap();
+
+        // worker_a 发回 worker_done 消息（payload 含 taskId/dispatchId/assignee）
+        let mut msg = sample_message("wd", "coordinator", MessageType::WorkerDone);
+        msg.from = "worker_a".to_string();
+        msg.payload = Some(
+            serde_json::json!({
+                "taskId": "rt",
+                "dispatchId": "ctx_1",
+                "result": "all good",
+            })
+            .to_string(),
+        );
+        store.insert_message(msg).unwrap();
+
+        let report = store.reconcile_on_startup().unwrap();
+        assert_eq!(report.completed_via_worker_done, 1, "1 task completed via worker_done");
+        assert_eq!(report.marked_for_redispatch, 0);
+
+        // task 现在是 Completed，且 result 被回填
+        let t = store.get_task("rt").unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Completed);
+        assert!(t.result.is_some(), "result populated from worker_done payload");
+
+        // dispatch 也变 Completed
+        let d = store.get_dispatch("ctx_1").unwrap().unwrap();
+        assert_eq!(d.status, DispatchStatus::Completed);
+    }
+
+    /// T5: Reconcile —— dispatched 任务无 worker_done → 标记重派（task → Ready, dispatch → Failed）。
+    #[test]
+    fn reconcile_missing_worker_done_redispatches() {
+        let store = Store::open_in_memory().unwrap();
+        store.create_task(sample_task("rt2", vec![])).unwrap();
+        let mut ctx = sample_dispatch("ctx_2", "rt2");
+        ctx.status = DispatchStatus::Dispatched;
+        ctx.assignee = Some("worker_b".to_string());
+        store.create_dispatch(ctx.clone()).unwrap();
+        store
+            .update_task_status("rt2", TaskStatus::Dispatched, None)
+            .unwrap();
+        // 不插 worker_done 消息——模拟 worker 崩溃
+
+        let report = store.reconcile_on_startup().unwrap();
+        assert_eq!(report.completed_via_worker_done, 0);
+        assert_eq!(report.marked_for_redispatch, 1, "1 task marked for redispatch");
+
+        let t = store.get_task("rt2").unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Ready, "task reset to Ready for re-dispatch");
+
+        let d = store.get_dispatch("ctx_2").unwrap().unwrap();
+        assert_eq!(d.status, DispatchStatus::Failed, "stale dispatch marked Failed");
+    }
+
+    /// T6 (M1 回归): update_task_status 携带 result 时被持久化。
+    #[test]
+    fn update_task_status_persists_result() {
+        let store = Store::open_in_memory().unwrap();
+        store.create_task(sample_task("rr", vec![])).unwrap();
+        store
+            .update_task_status("rr", TaskStatus::Completed, Some("result-text"))
+            .unwrap();
+        let got = store.get_task("rr").unwrap().unwrap();
+        assert_eq!(got.status, TaskStatus::Completed);
+        assert_eq!(got.result.as_deref(), Some("result-text"), "result persisted");
+
+        // 不传 result 不覆盖既有 result（COALESCE 语义）
+        store
+            .update_task_status("rr", TaskStatus::Completed, None)
+            .unwrap();
+        let got2 = store.get_task("rr").unwrap().unwrap();
+        assert_eq!(
+            got2.result.as_deref(),
+            Some("result-text"),
+            "None must not clobber existing result"
+        );
     }
 }

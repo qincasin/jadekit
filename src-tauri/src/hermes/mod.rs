@@ -13,7 +13,7 @@ pub use runtime::{
     RuntimeStartSpec,
 };
 pub use sdk_runtime::{parse_stream_line, SdkRuntime};
-pub use store::{Store, TaskListFilter};
+pub use store::{GateListFilter, InboxFilter, ReconcileReport, Store, TaskListFilter};
 pub use types::{
     AgentAssignment, CoordinatorRun, DecisionGate, DispatchContext, DispatchStatus, GateStatus,
     Message, MessageType, RunStatus, RuntimeKind, Task, TaskStatus,
