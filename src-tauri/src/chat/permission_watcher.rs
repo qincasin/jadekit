@@ -23,6 +23,26 @@ pub struct PermissionWatcher<R: Runtime> {
     stop: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+pub(crate) struct PermissionWatcherHandle {
+    stop: Arc<AtomicBool>,
+}
+
+impl PermissionWatcherHandle {
+    fn new(stop: Arc<AtomicBool>) -> Self {
+        Self { stop }
+    }
+
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self::new(Arc::new(AtomicBool::new(false)))
+    }
+}
+
 // ─── Request Types ──────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -174,10 +194,14 @@ impl<R: Runtime> PermissionWatcher<R> {
         });
     }
 
+    pub(crate) fn handle(&self) -> PermissionWatcherHandle {
+        PermissionWatcherHandle::new(self.stop.clone())
+    }
+
     /// Stop the polling thread. Reserved for future watcher lifecycle control.
     #[allow(dead_code)]
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.handle().stop();
     }
 
     /// Single poll cycle: scan for request files, parse, emit event, delete request.

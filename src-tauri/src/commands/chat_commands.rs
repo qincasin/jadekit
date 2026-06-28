@@ -547,6 +547,31 @@ pub fn helm_worktree_diff(worktree_path: String) -> Result<DiffSummaryDto, Strin
     WorktreeManager::diff_summary(&worktree_path).map(diff_summary_dto)
 }
 
+/// 关闭 Helm agent，并可选删除其 worktree（删除前由 WorktreeManager 做脏检查）。
+#[tauri::command]
+pub async fn helm_close_agent(
+    agent_id: String,
+    remove_worktree: bool,
+    repo_root: Option<String>,
+    worktree_path: Option<String>,
+    force: bool,
+    state: State<'_, ChatState>,
+) -> Result<(), String> {
+    let agent = resolve_agent_id(Some(agent_id));
+    state.manager.close_agent(agent).await;
+
+    if !remove_worktree {
+        return Ok(());
+    }
+
+    let repo_root = repo_root.ok_or_else(|| "删除 worktree 需要 Git 仓库路径".to_string())?;
+    let worktree_path = worktree_path.ok_or_else(|| "删除 worktree 需要 worktree 路径".to_string())?;
+    let cwd = resolve_existing_chat_directory(repo_root, "Git 仓库")?;
+    let (repo_root, _) = resolve_git_repository(&cwd)?;
+    let worktree_path = resolve_existing_chat_directory(worktree_path, "worktree 路径")?;
+    WorktreeManager::remove(&repo_root, &worktree_path, force)
+}
+
 /// 列出所有 SDK 的安装状态（Claude / Codex）。
 #[tauri::command]
 pub async fn chat_sdk_status(

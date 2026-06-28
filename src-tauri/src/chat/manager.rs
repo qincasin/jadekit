@@ -27,7 +27,7 @@ use crate::models::chat::ChatMessageEvent;
 
 use super::agent_id::{AgentId, DEFAULT_AGENT_ID};
 use super::daemon_client::{DaemonClient, EventSink};
-use super::permission_watcher::PermissionWatcher;
+use super::permission_watcher::{PermissionWatcher, PermissionWatcherHandle};
 use super::pool::AgentPool;
 use super::protocol::StreamLine;
 use super::resources;
@@ -112,7 +112,7 @@ pub struct ChatManager {
     /// 按 agent_id 索引的 daemon 池；每个 agent 一个独立 daemon 进程（独立 cwd/session）。
     pool: AgentPool,
     /// 按 agent_id 索引的 permission watcher；每个 agent 监听自己的 permission 子目录。
-    permission_watchers: Mutex<HashMap<AgentId, PermissionWatcher<tauri::Wry>>>,
+    permission_watchers: Mutex<HashMap<AgentId, PermissionWatcherHandle>>,
 }
 
 impl ChatManager {
@@ -196,8 +196,9 @@ impl ChatManager {
         let sub = perm_root.join(agent_id);
         let _ = std::fs::create_dir_all(&sub);
         let watcher = PermissionWatcher::new(sub, agent_id.clone(), self.app.clone());
+        let handle = watcher.handle();
         watcher.start();
-        watchers.insert(agent_id.clone(), watcher);
+        watchers.insert(agent_id.clone(), handle);
     }
 
     /// 取某 agent 的 daemon client，并在缓存进程已退出时重启它。
@@ -391,6 +392,24 @@ impl ChatManager {
         } else {
             Ok(())
         }
+    }
+
+    async fn close_agent_entries(
+        pool: &AgentPool,
+        permission_watchers: &Mutex<HashMap<AgentId, PermissionWatcherHandle>>,
+        agent_id: AgentId,
+    ) {
+        if let Some(c) = pool.remove(&agent_id).await {
+            c.stop().await;
+        }
+        if let Some(watcher) = permission_watchers.lock().await.remove(&agent_id) {
+            watcher.stop();
+        }
+    }
+
+    /// 关闭某 agent：停 daemon、移出池、停并移除其 permission watcher。幂等。
+    pub async fn close_agent(&self, agent_id: AgentId) {
+        Self::close_agent_entries(&self.pool, &self.permission_watchers, agent_id).await;
     }
 
     /// 显式启动指定 agent 的 daemon（否则在首次 send 时懒启动）。
@@ -884,5 +903,28 @@ mod tests {
             0,
             "abort(a) 不得影响 agent b"
         );
+    }
+
+    #[tokio::test]
+    async fn close_agent_removes_pool_entry_and_watcher_registration() {
+        let fake = Arc::new(FakeDaemonClient::new(true));
+        let client: Arc<dyn ManagerDaemonClient> = fake.clone();
+        let pool = AgentPool::new();
+        let watchers = Mutex::new(HashMap::new());
+        let agent_id = "agent-close".to_string();
+
+        pool.get_or_init(&agent_id, || async move { Ok(client) })
+            .await
+            .unwrap();
+        watchers
+            .lock()
+            .await
+            .insert(agent_id.clone(), PermissionWatcherHandle::new_for_test());
+
+        ChatManager::close_agent_entries(&pool, &watchers, agent_id.clone()).await;
+
+        assert!(pool.get(&agent_id).await.is_none());
+        assert_eq!(fake.stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(watchers.lock().await.len(), 0);
     }
 }
