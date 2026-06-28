@@ -632,7 +632,15 @@
       "enable": "扇出",
       "roster": "扇出阵容",
       "launch": "下达",
-      "launching": "下达中"
+      "launching": "下达中",
+      "compare": "扇出对比",
+      "agentCount": "{{count}} 个 Agent",
+      "waiting": "等待输出…",
+      "discard": "丢弃",
+      "merge": "合并",
+      "confirmDiscard": "丢弃这个扇出 Agent 并移除其 worktree？",
+      "confirmMerge": "将这个扇出分支合并到当前仓库？",
+      "mergeConflict": "检测到合并冲突，已自动回滚。"
     },
     "clear": "清空",
     "empty": "开始与 AI 对话",

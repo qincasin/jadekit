@@ -1157,7 +1157,15 @@
       "enable": "Fan-out",
       "roster": "Fan-out roster",
       "launch": "Launch",
-      "launching": "Launching"
+      "launching": "Launching",
+      "compare": "Fan-out compare",
+      "agentCount": "{{count}} agents",
+      "waiting": "Waiting for output...",
+      "discard": "Discard",
+      "merge": "Merge",
+      "confirmDiscard": "Discard this fan-out agent and remove its worktree?",
+      "confirmMerge": "Merge this fan-out branch into the current repository?",
+      "mergeConflict": "Merge conflict detected. The merge was aborted."
     },
     "clear": "Clear",
     "empty": "Start a conversation with AI",
