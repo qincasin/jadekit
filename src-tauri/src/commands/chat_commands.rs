@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::{AppHandle, State};
 
-use crate::chat::ChatManager;
+use crate::chat::{ChatManager, DiffSummary, WorktreeInfo, WorktreeManager};
+
+const HELM_WORKTREES_DIR_NAME: &str = "helm-worktrees";
 
 /// 当前聊天工作目录的只读工作区状态。
 #[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
@@ -24,6 +26,23 @@ pub struct ChatWorkspaceStatus {
 pub struct ChatGitBranch {
     pub name: String,
     pub current: bool,
+}
+
+/// 一个 Helm worktree（给前端展示与绑定 cwd）。
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeInfoDto {
+    pub path: String,
+    pub branch: String,
+}
+
+/// worktree 相对 HEAD 的 diff 摘要。
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffSummaryDto {
+    pub files_changed: u32,
+    pub insertions: u32,
+    pub deletions: u32,
 }
 
 /// 一个工作目录文件项（供 `@` 文件引用补全使用）。
@@ -208,6 +227,32 @@ fn resolve_existing_chat_directory(path: String, label: &str) -> Result<PathBuf,
         return Err(format!("{label}不是目录: {}", path.to_string_lossy()));
     }
     Ok(path)
+}
+
+fn repo_worktrees_dir(repo_root: &Path) -> Result<PathBuf, String> {
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("repo");
+    crate::services::app_paths::data_subdir(HELM_WORKTREES_DIR_NAME)
+        .map(|root| root.join(repo_name))
+        .map_err(|e| format!("定位 Helm worktrees 目录失败: {e}"))
+}
+
+fn worktree_info_dto(info: WorktreeInfo) -> WorktreeInfoDto {
+    WorktreeInfoDto {
+        path: info.path.to_string_lossy().to_string(),
+        branch: info.branch,
+    }
+}
+
+fn diff_summary_dto(summary: DiffSummary) -> DiffSummaryDto {
+    DiffSummaryDto {
+        files_changed: summary.files_changed,
+        insertions: summary.insertions,
+        deletions: summary.deletions,
+    }
 }
 
 fn normalize_chat_git_branch_name(branch_name: &str) -> Result<String, String> {
@@ -462,6 +507,44 @@ pub fn chat_git_create_and_checkout_branch(
     }
 
     resolve_chat_workspace_status(Some(repo_root.to_string_lossy().to_string()))
+}
+
+/// 为 Helm agent 创建独立 worktree，并返回其路径与分支名。
+#[tauri::command]
+pub fn helm_worktree_create(repo_root: String, name: String) -> Result<WorktreeInfoDto, String> {
+    let cwd = resolve_existing_chat_directory(repo_root, "Git 仓库")?;
+    let (repo_root, _) = resolve_git_repository(&cwd)?;
+    let worktrees_dir = repo_worktrees_dir(&repo_root)?;
+    WorktreeManager::create(&repo_root, &worktrees_dir, name.trim()).map(worktree_info_dto)
+}
+
+/// 删除 Helm worktree。非 force 时底层会先做脏检查，拒绝删除有改动的工作树。
+#[tauri::command]
+pub fn helm_worktree_remove(
+    repo_root: String,
+    worktree_path: String,
+    force: bool,
+) -> Result<(), String> {
+    let cwd = resolve_existing_chat_directory(repo_root, "Git 仓库")?;
+    let (repo_root, _) = resolve_git_repository(&cwd)?;
+    let worktree_path = resolve_existing_chat_directory(worktree_path, "worktree 路径")?;
+    WorktreeManager::remove(&repo_root, &worktree_path, force)
+}
+
+/// 列出指定 Git 仓库下的所有 worktree。
+#[tauri::command]
+pub fn helm_worktree_list(repo_root: String) -> Result<Vec<WorktreeInfoDto>, String> {
+    let cwd = resolve_existing_chat_directory(repo_root, "Git 仓库")?;
+    let (repo_root, _) = resolve_git_repository(&cwd)?;
+    WorktreeManager::list(&repo_root)
+        .map(|items| items.into_iter().map(worktree_info_dto).collect())
+}
+
+/// 返回 worktree 相对 HEAD 的 diff 摘要。
+#[tauri::command]
+pub fn helm_worktree_diff(worktree_path: String) -> Result<DiffSummaryDto, String> {
+    let worktree_path = resolve_existing_chat_directory(worktree_path, "worktree 路径")?;
+    WorktreeManager::diff_summary(&worktree_path).map(diff_summary_dto)
 }
 
 /// 列出所有 SDK 的安装状态（Claude / Codex）。
