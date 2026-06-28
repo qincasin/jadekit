@@ -3,6 +3,7 @@
 //! 建立在 Helm（Phase 0/1/1b）之上，定义引擎与可插拔 agent 介质之间的契约。
 //! 本模块为纯增量，不影响现有 `chat` 代码。
 
+pub mod cli_runtime;
 pub mod coordinator;
 pub mod planner;
 pub mod runtime;
@@ -17,6 +18,7 @@ pub use runtime::{
 };
 pub use supervisor::{DEFAULT_MAX_TURN_MS, WorkerStatus, WorkerSupervisor};
 pub use sdk_runtime::{parse_stream_line, SdkRuntime};
+pub use cli_runtime::CliRuntime;
 pub use store::{GateListFilter, InboxFilter, ReconcileReport, Store, TaskListFilter};
 pub use types::{
     AgentAssignment, CoordinatorRun, DecisionGate, DispatchContext, DispatchStatus, GateStatus,
