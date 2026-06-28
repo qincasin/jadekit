@@ -145,7 +145,7 @@ pub struct Coordinator {
     // 非回归关键：Coordinator 的所有现有测试都用 `Coordinator::new` 构造
     // （supervisor=None），行为与 Task 9–14 完全一致。只有显式注入 supervisor 时
     // 才会触发：
-    //   * dispatch_one：register(agent_id, runtime.capabilities().structured_events)。
+    //   * dispatch_one：register(agent_id, runtime.capabilities().structured_events, kind)。
     //   * watcher：每个 AgentEvent 喂给 supervisor.on_event。
     //   * tick：supervisor.reap → 对每个 Suspect agent abort + fail_dispatch
     //     （接入已建好的熔断 / replan 路径）。
@@ -213,7 +213,7 @@ impl Coordinator {
     /// 注入 WorkerSupervisor（Task 18：把判活状态机接进 tick 循环）。
     ///
     /// 注入后 Coordinator 会在每轮 tick 里：
-    ///   * dispatch_one：`supervisor.register(agent_id, runtime.capabilities().structured_events)`。
+    ///   * dispatch_one：`supervisor.register(agent_id, runtime.capabilities().structured_events, kind)`。
     ///   * watcher：把每个 AgentEvent 喂给 `supervisor.on_event`（刷新活动时间 /
     ///     更新 open_tool_uses / 标记 WaitingInput 等）。
     ///   * tick 阶段 ①：`supervisor.reap(now, activity_timeout, max_turn_ms)`
@@ -223,8 +223,9 @@ impl Coordinator {
     /// 不注入（默认 `None`）时 Coordinator 仍是 Task 9–14 的原循环——所有现有
     /// 测试不动它就保持原行为（关键非回归保证）。
     ///
-    /// **约束**：supervisor 必须用与 Coordinator 相同的 `Arc<dyn AgentRuntime>`
-    /// 构造（reap 内部要调 `runtime.liveness`）。调用方负责保证二者一致。
+    /// **约束**：supervisor 的 [`RuntimeRegistry`] 必须与 Coordinator 的 registry 解析到
+    /// 同一介质实例（reap 内部要调 `runtime.liveness`）。Phase 2 兼容做法：两者都用
+    /// [`RuntimeRegistry::single`] 包装同一 `Arc<dyn AgentRuntime>`。调用方负责保证二者一致。
     #[allow(dead_code)]
     pub fn with_supervisor(mut self, supervisor: Arc<WorkerSupervisor>) -> Self {
         self.supervisor = Some(supervisor);
@@ -622,6 +623,7 @@ impl Coordinator {
             supervisor.register(
                 &handle.agent_id,
                 runtime.capabilities().structured_events,
+                kind,
             );
         }
 
@@ -2397,9 +2399,12 @@ mod tests {
         //    静默超时 + Alive → degraded 档判 Suspect（即使无 open tool_use 也会触发）。
         //    register(sdk_agent, structured=true) 后同理也会判 Suspect（结构化档同等条件）。
         //    更直接：文档化断言「register 接受 structured 参数并存储」——通过行为验证。
-        let sup = WorkerSupervisor::new(sdk_rt.clone());
-        sup.register("cli-agent", false); // degraded tier
-        sup.register("sdk-agent", true); // structured tier
+        // Task 8：supervisor 用 single(sdk_rt) 构造（两种 kind 都解析到 sdk_rt，
+        // liveness 行为由 agent_id 决定）。register 传语义正确的 kind 以验证参数传递：
+        // cli-agent→Cli、sdk-agent→Sdk（single 下两者探针都走 sdk_rt，行为不变）。
+        let sup = WorkerSupervisor::new(RuntimeRegistry::single(sdk_rt.clone()));
+        sup.register("cli-agent", false, RuntimeKind::Cli); // degraded tier
+        sup.register("sdk-agent", true, RuntimeKind::Sdk); // structured tier
 
         // 用 chrono Duration；两个 agent 都静默超时 + Alive（MockRuntime 默认 Alive）。
         let now = chrono::Utc::now() + chrono::Duration::seconds(60);
@@ -2511,7 +2516,10 @@ mod tests {
             let runtime_clone_for_planner: Arc<dyn AgentRuntime> = self.runtime.clone();
             let planner = Arc::new(Planner::new(runtime_clone_for_planner));
             let runtime_clone_for_supervisor: Arc<dyn AgentRuntime> = self.runtime.clone();
-            let supervisor = Arc::new(WorkerSupervisor::new(runtime_clone_for_supervisor));
+            // Task 8：supervisor 用 single(rt) 构造，与 Coordinator 的 registry 解析到同一介质。
+            let supervisor = Arc::new(WorkerSupervisor::new(RuntimeRegistry::single(
+                runtime_clone_for_supervisor,
+            )));
             let runtime_for_coord: Arc<dyn AgentRuntime> = self.runtime.clone();
             Coordinator::new(
                 self.store.clone_handle(),
@@ -2527,7 +2535,8 @@ mod tests {
         /// 仅注入 Supervisor（无 Planner），用于聚焦 reap 行为的测试。
         fn coordinator_with_supervisor(&self) -> Coordinator {
             let runtime_clone: Arc<dyn AgentRuntime> = self.runtime.clone();
-            let supervisor = Arc::new(WorkerSupervisor::new(runtime_clone));
+            // Task 8：supervisor 用 single(rt) 构造，与 Coordinator 的 registry 解析到同一介质。
+            let supervisor = Arc::new(WorkerSupervisor::new(RuntimeRegistry::single(runtime_clone)));
             let runtime_for_coord: Arc<dyn AgentRuntime> = self.runtime.clone();
             Coordinator::new(
                 self.store.clone_handle(),
