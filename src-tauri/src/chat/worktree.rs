@@ -102,8 +102,12 @@ impl WorktreeManager {
 
     /// 相对 HEAD 的改动摘要（含已跟踪文件改动；解析 `git diff --shortstat`）。
     pub fn diff_summary(worktree_path: &Path) -> Result<DiffSummary, String> {
-        // 包含已暂存与未暂存改动相对 HEAD。
-        let out = Self::run(worktree_path, &["diff", "--shortstat", "HEAD"])?;
+        // 把未跟踪文件登记为 intent-to-add，使其纳入 `git diff` 统计；读完即还原。
+        let _ = Self::run(worktree_path, &["add", "--intent-to-add", "--", "."]);
+        let out = Self::run(worktree_path, &["diff", "--shortstat", "HEAD"]);
+        // 无论统计成功与否都还原 intent-to-add，避免污染暂存区。
+        let _ = Self::run(worktree_path, &["reset", "--quiet"]);
+        let out = out?;
         let mut summary = DiffSummary::default();
         for part in out.split(',') {
             let item = part.trim();
@@ -208,5 +212,20 @@ mod tests {
         let s = WorktreeManager::diff_summary(&info.path).unwrap();
         assert!(s.files_changed >= 1);
         assert!(s.insertions >= 1);
+    }
+
+    #[test]
+    fn diff_summary_includes_untracked_new_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let wts = tmp.path().join("worktrees");
+        let info = WorktreeManager::create(&repo, &wts, "task-u").unwrap();
+
+        std::fs::write(info.path.join("brand_new.txt"), "a\nb\n").unwrap();
+        let s = WorktreeManager::diff_summary(&info.path).unwrap();
+        assert!(s.files_changed >= 1, "未跟踪新文件应计入 files_changed");
+        assert!(s.insertions >= 2, "未跟踪新文件行数应计入 insertions");
     }
 }
