@@ -628,6 +628,12 @@
     "worktree": {
       "createForAgent": "为此 Agent 建独立 worktree"
     },
+    "fanout": {
+      "enable": "扇出",
+      "roster": "扇出阵容",
+      "launch": "下达",
+      "launching": "下达中"
+    },
     "clear": "清空",
     "empty": "开始与 AI 对话",
     "message": {

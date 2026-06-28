@@ -1153,6 +1153,12 @@
     "worktree": {
       "createForAgent": "Create isolated worktree for this agent"
     },
+    "fanout": {
+      "enable": "Fan-out",
+      "roster": "Fan-out roster",
+      "launch": "Launch",
+      "launching": "Launching"
+    },
     "clear": "Clear",
     "empty": "Start a conversation with AI",
     "message": {
