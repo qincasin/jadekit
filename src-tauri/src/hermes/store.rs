@@ -694,6 +694,40 @@ impl Store {
         Ok(out)
     }
 
+    /// 列出所有当前状态为 `Dispatched` 的派发上下文（Task 18：supervisor-in-loop）。
+    ///
+    /// 用途：Coordinator 的 `tick` 在 supervisor 标记 Suspect agent 后，需要找到
+    /// 这些 agent 对应的 active dispatch 行（拿到 dispatch_id / task_id）才能
+    /// `fail_dispatch` + abort runtime。Supervisor 只返回 agent_id 列表，这层
+    /// "agent_id → active dispatch" 的映射由本方法提供。
+    ///
+    /// 实现：`status = 'dispatched'` 过滤即可——dispatch 表的唯一活跃态就是
+    /// Dispatched（Failed / CircuitBroken 是终态/熔断态，不会被 Suspect 命中）。
+    /// 返回顺序按 `created_at`（与 list_tasks 一致，便于确定性测试）。
+    pub fn list_active_dispatches(&self) -> Result<Vec<DispatchContext>, String> {
+        let conn = lock_conn!(self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, task_id, assignee_handle, status, failure_count,
+                        last_heartbeat_at, last_failure, dispatched_at, completed_at, created_at
+                 FROM dispatch_contexts
+                 WHERE status = ?1
+                 ORDER BY created_at",
+            )
+            .map_err(|e| format!("prepare list_active_dispatches: {e}"))?;
+        let mut rows = stmt
+            .query(params![DispatchStatus::Dispatched.as_str()])
+            .map_err(|e| format!("query list_active_dispatches: {e}"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| format!("fetch list_active_dispatches row: {e}"))?
+        {
+            out.push(Self::row_to_dispatch(row)?);
+        }
+        Ok(out)
+    }
+
     /// **测试专用**：把指定 dispatch 的 `last_heartbeat_at` 强制改成给定时间，
     /// 用于构造 stale 派发场景（生产代码不应调用）。`#[cfg(test)]` 守卫避免泄漏。
     #[cfg(test)]

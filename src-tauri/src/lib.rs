@@ -19,6 +19,7 @@ use commands::backup_commands;
 use commands::chat_commands;
 use commands::deeplink_commands;
 use commands::editor_commands;
+use commands::hermes_commands;
 use commands::mcp_commands;
 use commands::prompt_commands;
 use commands::provider_commands;
@@ -1053,6 +1054,12 @@ pub fn run() {
             antigravity_commands::ag_get_operation_logs,
             antigravity_commands::ag_get_all_operation_logs,
             antigravity_commands::ag_get_token_status,
+            // Hermes 编排引擎命令（Phase 2g / Task 17）
+            hermes_commands::hermes_run,
+            hermes_commands::hermes_task_list,
+            hermes_commands::hermes_dispatch_show,
+            hermes_commands::hermes_gate_resolve,
+            hermes_commands::hermes_run_stop,
         ])
         .setup(|app| {
             // 初始化数据库
@@ -1085,6 +1092,49 @@ pub fn run() {
                 app.manage(chat_commands::ChatState {
                     manager: chat_manager,
                 });
+            }
+
+            // Hermes 编排引擎（Phase 2g / Task 17）：
+            //   - Store 落在 ~/.jadekit/hermes.db（WAL，崩溃可前滚）；
+            //   - runtime = SdkRuntime（注入一份独立 ChatManager——Hermes 自己的 daemon
+            //     生命周期与交互式 Chat 解耦，互不影响）；
+            //   - repo_root 缺省取 cwd（前端可在 hermes_run 的 opts 里覆盖）；
+            //   - worktrees_dir 复用 chat 侧的 helm-worktrees 子目录约定。
+            {
+                let store_path =
+                    crate::services::app_paths::data_file("hermes.db").map_err(|e| {
+                        format!("Failed to resolve hermes.db path: {e}")
+                    })?;
+                // 确保父目录存在（首次启动时 .jadekit 可能尚未创建）。
+                if let Some(parent) = store_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let store = hermes::Store::open(&store_path).map_err(|e| {
+                    format!("Failed to open hermes store: {e}")
+                })?;
+                // 崩溃恢复：把上次中断留下的孤儿 dispatched 任务收敛回 Ready/Completed。
+                if let Err(e) = store.reconcile_on_startup() {
+                    eprintln!("Hermes reconcile_on_startup warning: {e}");
+                }
+
+                let hermes_chat_manager =
+                    std::sync::Arc::new(chat::ChatManager::new(app.handle().clone()));
+                let runtime: std::sync::Arc<dyn hermes::AgentRuntime> =
+                    std::sync::Arc::new(hermes::SdkRuntime::new(hermes_chat_manager));
+
+                let repo_root = std::env::current_dir().unwrap_or_else(|_| {
+                    dirs::home_dir().unwrap_or_default()
+                });
+                let worktrees_dir = crate::services::app_paths::data_subdir("helm-worktrees")
+                    .unwrap_or_else(|_| std::env::temp_dir().join("helm-worktrees"));
+
+                let engine = hermes_commands::HermesEngine::new(
+                    store,
+                    runtime,
+                    repo_root,
+                    worktrees_dir,
+                );
+                app.manage(engine);
             }
 
             // 自动备份：启动时检查 + 后台定时任务
