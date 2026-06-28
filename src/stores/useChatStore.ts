@@ -41,11 +41,13 @@ import {
     createWorktree,
     type HelmDiffSummary,
     mergeWorktree,
+    removeWorktree,
     worktreeDiff,
 } from '../services/worktreeService';
 import {resolveSendCwd} from './chatSendCwd';
 import {resolveTabForEvent} from './chatEventRouting';
 import type {FanoutPlan} from './fanoutPlan';
+import {worktreesToRollback} from './fanoutRollback';
 
 const DRAFT_KEY_PREFIX = 'ccg-chat-draft:';
 const REASONING_KEY = 'ccg-chat-reasoning';
@@ -1942,10 +1944,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
             tab: ChatSessionTab;
             assistantMessageId: string;
         }> = [];
+        // 本轮已成功创建的 worktree，用于部分失败时回滚，避免泄漏。
+        const created: {path: string; branch: string}[] = [];
 
         for (const agent of plan.agents) {
             try {
                 const info = await createWorktree(normalizedRepo, agent.worktreeName);
+                created.push(info);
                 const diff = await worktreeDiff(info.path).catch(() => null);
                 const timestamp = nowMs();
                 const userMsg: ChatMessage = {
@@ -1980,6 +1985,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
                     },
                 });
             } catch (e) {
+                // 部分失败：best-effort 回滚本轮已成功创建的 worktree，避免泄漏。
+                // 单个 removeWorktree 失败不应掩盖原始错误，故吞掉异常。
+                for (const path of worktreesToRollback(created)) {
+                    await removeWorktree(normalizedRepo, path, true).catch(() => {});
+                }
                 set({error: String(e)});
                 return;
             }
