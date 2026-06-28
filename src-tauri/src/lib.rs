@@ -1123,6 +1123,11 @@ pub fn run() {
                     std::sync::Arc::new(chat::ChatManager::new(app.handle().clone()));
                 let runtime: std::sync::Arc<dyn hermes::AgentRuntime> =
                     std::sync::Arc::new(hermes::SdkRuntime::new(hermes_chat_manager));
+                // Task 7：构造介质注册表——先登记 Sdk（Task 9 会再接 CliRuntime）。
+                // production 用显式 .with（不用 single）；assignment.runtime 缺省为 Sdk，
+                // 当前所有真实 task 都走 Sdk 介质。
+                let registry =
+                    hermes::RuntimeRegistry::new().with(hermes::RuntimeKind::Sdk, runtime);
 
                 let repo_root = std::env::current_dir().unwrap_or_else(|_| {
                     dirs::home_dir().unwrap_or_default()
@@ -1132,7 +1137,7 @@ pub fn run() {
 
                 let engine = hermes_commands::HermesEngine::new(
                     store,
-                    runtime,
+                    registry,
                     repo_root,
                     worktrees_dir,
                 );

@@ -24,11 +24,12 @@ use crate::chat::WorktreeManager;
 use crate::hermes::events::{NullEventSink, OrchestrationEvent, OrchestrationEventSink};
 use crate::hermes::planner::{Planner, ReplanAction, ReplanDecision, Roster};
 use crate::hermes::runtime::{AgentEvent, AgentHandle, AgentRuntime, RuntimeStartSpec};
+use crate::hermes::runtime_registry::RuntimeRegistry;
 use crate::hermes::store::{InboxFilter, Store, TaskListFilter};
 use crate::hermes::supervisor::{WorkerSupervisor, DEFAULT_MAX_TURN_MS};
 use crate::hermes::types::{
     AgentAssignment, CoordinatorRun, DispatchContext, DispatchStatus, Message, MessageType,
-    RunStatus, Task, TaskStatus,
+    RunStatus, RuntimeKind, Task, TaskStatus,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -111,7 +112,14 @@ pub struct TickOutcome {
 /// - `tick` 是幂等的：重复调用得到等价结果（除非外部并发改了 Store）。
 pub struct Coordinator {
     store: Store,
-    runtime: Arc<dyn AgentRuntime>,
+    /// 介质注册表（Phase 3b）：`dispatch_one` 按 `task.assignment.runtime`（缺省
+    /// [`RuntimeKind::Sdk`]）从 registry 取介质做 start/send；`reap_silent_workers`
+    /// 按 agent 所属 task 的 assignment.runtime 取介质做 abort。
+    ///
+    /// 兼容 Phase 2：所有 Phase 2 测试用 [`RuntimeRegistry::single`] 把同一 `rt`
+    /// 登记到所有 kind——无论 `assignment.runtime` 是什么，registry 都返回它，
+    /// 行为与 Phase 2 的单 `Arc<dyn AgentRuntime>` 字段逐字一致（关键非回归保证）。
+    registry: RuntimeRegistry,
     repo_root: PathBuf,
     /// 每个 worker agent 一个独立 git worktree 的根目录（如 `repo_root/.helm/worktrees`）。
     worktrees_dir: PathBuf,
@@ -156,13 +164,13 @@ pub struct Coordinator {
 impl Coordinator {
     pub fn new(
         store: Store,
-        runtime: Arc<dyn AgentRuntime>,
+        registry: RuntimeRegistry,
         repo_root: PathBuf,
         worktrees_dir: PathBuf,
     ) -> Self {
         Self {
             store,
-            runtime,
+            registry,
             repo_root,
             worktrees_dir,
             max_concurrent: MAX_CONCURRENT_DEFAULT,
@@ -377,10 +385,21 @@ impl Coordinator {
             let task_id = ctx.task_id.clone();
 
             // —— 中文：强杀 runtime 进程（best-effort，失败不影响后续 fail_dispatch） ——
+            // Task 7：按该 agent 所属 task 的 assignment.runtime 选介质做 abort。
+            // ctx.task_id / handle 都已在循环作用域内；`if let Ok` 容错——
+            // registry 缺该 kind 时跳过 abort（仍走下面的 fail_dispatch 级联，
+            // 与原 `let _ =` 的容忍语义一致）。Task 8 让 supervisor 自己 track kind。
             let handle = AgentHandle {
                 agent_id: agent_id.clone(),
             };
-            let _ = self.runtime.abort(&handle).await;
+            let task = self.store.get_task(&ctx.task_id)?;
+            let kind = task
+                .as_ref()
+                .and_then(|t| t.assignment.as_ref().map(|a| a.runtime))
+                .unwrap_or(RuntimeKind::Sdk);
+            if let Ok(rt) = self.registry.get(kind) {
+                let _ = rt.abort(&handle).await;
+            }
 
             // —— 中文：fail_dispatch + 熔断级联（接入已建好的路径） ——
             let error = format!(
@@ -519,6 +538,18 @@ impl Coordinator {
     ///    消息（下轮 tick drain_inbox 时完成 task）；Failed{error} → fail_dispatch
     ///    + 熔断级联（task → Failed）。
     async fn dispatch_one(&self, task: &Task) -> Result<(), String> {
+        // Task 7：按 task.assignment.runtime 选介质（缺省 Sdk）。registry 缺该 kind → 报错回退。
+        // assignment=None（无 planner 场景）走默认 Sdk，与 Phase 2 行为一致。
+        let kind = task
+            .assignment
+            .as_ref()
+            .map(|a| a.runtime)
+            .unwrap_or(RuntimeKind::Sdk);
+        let runtime = self
+            .registry
+            .get(kind)
+            .map_err(|e| format!("dispatch_one({}): {e}", task.id))?;
+
         // —— 1. 状态前置：task → Dispatched ——
         self.store
             .update_task_status(&task.id, TaskStatus::Dispatched, None)?;
@@ -549,8 +580,7 @@ impl Coordinator {
             model,
             provider: DEFAULT_PROVIDER.to_string(),
         };
-        let handle = self
-            .runtime
+        let handle = runtime
             .start(start_spec)
             .await
             .map_err(|e| format!("runtime.start({}) failed: {:?}", task.id, e))?;
@@ -578,7 +608,7 @@ impl Coordinator {
 
         // —— 5. runtime.send（task.spec + preamble）——
         let prompt = build_prompt(task, &dispatch_id);
-        let mut rx = self.runtime.send(&handle, prompt).await.map_err(|e| {
+        let mut rx = runtime.send(&handle, prompt).await.map_err(|e| {
             format!("runtime.send({}) failed: {:?}", task.id, e)
         })?;
 
@@ -591,7 +621,7 @@ impl Coordinator {
         if let Some(supervisor) = self.supervisor.as_ref() {
             supervisor.register(
                 &handle.agent_id,
-                self.runtime.capabilities().structured_events,
+                runtime.capabilities().structured_events,
             );
         }
 
@@ -1244,6 +1274,7 @@ mod tests {
     use crate::hermes::runtime::{
         AgentHandle, Liveness, RuntimeCapabilities, RuntimeError,
     };
+    use crate::hermes::runtime_registry::RuntimeRegistry;
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::process::Command;
@@ -1391,7 +1422,9 @@ mod tests {
             let runtime_clone: Arc<dyn AgentRuntime> = self.runtime.clone();
             Coordinator::new(
                 self.store.clone_handle(),
-                runtime_clone,
+                // Task 7：Phase 2 兼容——single(rt) 把同一 rt 登记到所有 kind，
+                // 无论 assignment.runtime 是什么，registry 都返回它 → 行为与 Phase 2 一致。
+                RuntimeRegistry::single(runtime_clone),
                 self.repo_root.clone(),
                 self.worktrees_dir.clone(),
             )
@@ -1892,7 +1925,8 @@ mod tests {
             let runtime_for_coord: Arc<dyn AgentRuntime> = self.runtime.clone();
             Coordinator::new(
                 self.store.clone_handle(),
-                runtime_for_coord,
+                // Task 7：Phase 2 兼容——single(rt) 包装。
+                RuntimeRegistry::single(runtime_for_coord),
                 self.repo_root.clone(),
                 self.worktrees_dir.clone(),
             )
@@ -2216,7 +2250,8 @@ mod tests {
             let runtime: Arc<dyn AgentRuntime> = Arc::new(CliRuntime::new(command));
             Coordinator::new(
                 self.store.clone_handle(),
-                runtime,
+                // Task 7：Phase 2 兼容——single(rt) 包装（Cli 测试也走同一介质）。
+                RuntimeRegistry::single(runtime),
                 self.repo_root.clone(),
                 self.worktrees_dir.clone(),
             )
@@ -2480,7 +2515,8 @@ mod tests {
             let runtime_for_coord: Arc<dyn AgentRuntime> = self.runtime.clone();
             Coordinator::new(
                 self.store.clone_handle(),
-                runtime_for_coord,
+                // Task 7：Phase 2 兼容——single(rt) 包装。
+                RuntimeRegistry::single(runtime_for_coord),
                 self.repo_root.clone(),
                 self.worktrees_dir.clone(),
             )
@@ -2495,7 +2531,8 @@ mod tests {
             let runtime_for_coord: Arc<dyn AgentRuntime> = self.runtime.clone();
             Coordinator::new(
                 self.store.clone_handle(),
-                runtime_for_coord,
+                // Task 7：Phase 2 兼容——single(rt) 包装。
+                RuntimeRegistry::single(runtime_for_coord),
                 self.repo_root.clone(),
                 self.worktrees_dir.clone(),
             )
@@ -3097,6 +3134,148 @@ mod tests {
         assert!(
             sink.0.lock().unwrap().is_empty(),
             "ToolResult 不应发 Agent 事件"
+        );
+    }
+
+    // =========================================================================
+    // Task 7：异构路由——按 task.assignment.runtime 把派发路由到对的介质
+    // =========================================================================
+    //
+    // Phase 3b 目标：一次 run 内 SDK × CLI 混跑（每个 task 自带 assignment.runtime，
+    // dispatch_one 读它选介质）。这里用两个 RECORDING mock（各记录 start 收到的
+    // agent_id），分别登记到 RuntimeRegistry 的 Sdk / Cli，建 2 task（t_sdk / t_cli），
+    // 跑一轮 tick 后断言：sdk_mock 只收到 t_sdk、cli_mock 只收到 t_cli。
+
+    /// 记录介质：把每次 start 的 agent_id 存下来，供断言路由命中。
+    struct RecordingRuntime {
+        started: std::sync::Mutex<Vec<String>>,
+    }
+    impl RecordingRuntime {
+        fn new() -> Self {
+            Self {
+                started: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+    #[async_trait]
+    impl AgentRuntime for RecordingRuntime {
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities {
+                structured_events: true,
+                supports_resume: false,
+                supports_permission_prompt: false,
+            }
+        }
+        async fn start(&self, spec: RuntimeStartSpec) -> Result<AgentHandle, RuntimeError> {
+            self.started.lock().unwrap().push(spec.agent_id.clone());
+            Ok(AgentHandle {
+                agent_id: spec.agent_id,
+            })
+        }
+        async fn send(
+            &self,
+            _handle: &AgentHandle,
+            _prompt: String,
+        ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, RuntimeError> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            // 让 task 立刻可完成：watcher 收到 Done{success:true} 即写 worker_done。
+            let _ = tx.send(AgentEvent::Done {
+                success: true,
+                files_modified: vec![],
+            });
+            drop(tx);
+            Ok(rx)
+        }
+        async fn abort(&self, _handle: &AgentHandle) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+        async fn liveness(&self, _handle: &AgentHandle) -> Liveness {
+            Liveness::Alive
+        }
+        async fn stop(&self, _handle: &AgentHandle) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_by_assignment_runtime_kind() {
+        let fx = Fixture::new();
+
+        // 建 2 个 ready task：t_sdk.assignment.runtime=Sdk，t_cli.assignment.runtime=Cli。
+        let t_sdk = Task {
+            id: "t_sdk".to_string(),
+            parent_id: None,
+            spec: "task via Sdk".to_string(),
+            status: TaskStatus::Pending,
+            deps: vec![],
+            result: None,
+            assignment: Some(AgentAssignment {
+                runtime: RuntimeKind::Sdk,
+                tool: "claude-sdk".to_string(),
+                model: "sonnet".to_string(),
+            }),
+            created_at: "2026-06-28T00:00:01Z".to_string(),
+            completed_at: None,
+        };
+        let t_cli = Task {
+            id: "t_cli".to_string(),
+            parent_id: None,
+            spec: "task via Cli".to_string(),
+            status: TaskStatus::Pending,
+            deps: vec![],
+            result: None,
+            assignment: Some(AgentAssignment {
+                runtime: RuntimeKind::Cli,
+                tool: "claude-cli".to_string(),
+                model: "sonnet".to_string(),
+            }),
+            created_at: "2026-06-28T00:00:02Z".to_string(),
+            completed_at: None,
+        };
+        fx.store.create_task(t_sdk).unwrap();
+        fx.store.create_task(t_cli).unwrap();
+
+        // 用两个独立 RecordingRuntime，分别登记到 Sdk / Cli。
+        let sdk_mock = std::sync::Arc::new(RecordingRuntime::new());
+        let cli_mock = std::sync::Arc::new(RecordingRuntime::new());
+        let registry = RuntimeRegistry::new()
+            .with(
+                RuntimeKind::Sdk,
+                sdk_mock.clone() as Arc<dyn AgentRuntime>,
+            )
+            .with(
+                RuntimeKind::Cli,
+                cli_mock.clone() as Arc<dyn AgentRuntime>,
+            );
+        let coord = Coordinator::new(
+            fx.store.clone_handle(),
+            registry,
+            fx.repo_root.clone(),
+            fx.worktrees_dir.clone(),
+        )
+        .with_max_concurrent(4);
+
+        coord.tick().await.unwrap();
+        fx.yield_for_watchers().await;
+
+        // 断言：sdk_mock 收到 t_sdk；cli_mock 收到 t_cli；不交叉。
+        let sdk_started = sdk_mock.started.lock().unwrap().clone();
+        let cli_started = cli_mock.started.lock().unwrap().clone();
+        assert!(
+            sdk_started.iter().any(|a| a == "t_sdk"),
+            "Sdk task 应走 Sdk 介质; got {sdk_started:?}"
+        );
+        assert!(
+            cli_started.iter().any(|a| a == "t_cli"),
+            "Cli task 应走 Cli 介质; got {cli_started:?}"
+        );
+        assert!(
+            !sdk_started.iter().any(|a| a == "t_cli"),
+            "Cli task 不应走 Sdk 介质"
+        );
+        assert!(
+            !cli_started.iter().any(|a| a == "t_sdk"),
+            "Sdk task 不应走 Cli 介质"
         );
     }
 }
