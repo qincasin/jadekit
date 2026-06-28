@@ -8,6 +8,7 @@ pub mod coordinator;
 pub mod events;
 pub mod planner;
 pub mod runtime;
+pub mod runtime_registry;
 pub mod sdk_runtime;
 pub mod store;
 pub mod supervisor;
@@ -17,6 +18,7 @@ pub use runtime::{
     AgentEvent, AgentHandle, AgentRuntime, Liveness, RuntimeCapabilities, RuntimeError,
     RuntimeStartSpec,
 };
+pub use runtime_registry::RuntimeRegistry;
 pub use coordinator::{Coordinator, TickOutcome};
 pub use events::{NullEventSink, OrchestrationEvent, OrchestrationEventSink};
 pub use supervisor::{DEFAULT_MAX_TURN_MS, WorkerStatus, WorkerSupervisor};

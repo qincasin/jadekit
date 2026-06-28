@@ -33,11 +33,13 @@
 //! 不会在运行中途切换。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use chrono::{DateTime, Duration, Utc};
 
-use super::runtime::{AgentEvent, AgentHandle, AgentRuntime, Liveness};
+use super::runtime::{AgentEvent, AgentHandle, Liveness};
+use crate::hermes::runtime_registry::RuntimeRegistry;
+use crate::hermes::types::RuntimeKind;
 
 /// 降级判活的硬兜底超时（设计 §6.3）。
 ///
@@ -103,18 +105,23 @@ struct WorkerState {
     /// [`super::RuntimeCapabilities::structured_events`] 决定，整个生命周期不变）。
     /// true=结构化档；false=降级档。两档不混用。
     structured: bool,
+    /// 该 agent 注册时的介质种类（Task 8）：reap 的 liveness 探针据此从
+    /// [`WorkerSupervisor::registry`] 取对应介质。一次 run 内 SDK × CLI 异构混跑时，
+    /// 每个 agent 用自己注册时的介质判活，而非单一全局介质。
+    kind: RuntimeKind,
     /// agent 本次运行起点（`register` 时戳）。仅降级档用：`now - started_at > max_turn_ms`
     /// 触发硬兜底 Suspect。
     started_at: DateTime<Utc>,
 }
 
 impl WorkerState {
-    fn new_running(now: DateTime<Utc>, structured: bool) -> Self {
+    fn new_running(now: DateTime<Utc>, structured: bool, kind: RuntimeKind) -> Self {
         Self {
             last_activity_at: now,
             open_tool_uses: HashSet::new(),
             status: WorkerStatus::Running,
             structured,
+            kind,
             started_at: now,
         }
     }
@@ -124,15 +131,20 @@ impl WorkerState {
 
 /// 每 agent 判活状态机。线程安全（`Mutex<HashMap<agent_id, WorkerState>>`），
 /// 事件来自 Coordinator 的 watcher 任务。
+///
+/// Phase 3b（Task 8）：持 [`RuntimeRegistry`] 而非单一 `Arc<dyn AgentRuntime>`——
+/// 一次 run 内 SDK × CLI 异构混跑时，reap 的 liveness 探针按每个 agent 注册时记下的
+/// [`RuntimeKind`] 从 registry 取对应介质判活。兼容 Phase 2：用
+/// [`RuntimeRegistry::single`] 构造时所有 kind 都解析到同一介质，行为与单介质逐字一致。
 pub struct WorkerSupervisor {
-    runtime: Arc<dyn AgentRuntime>,
+    registry: RuntimeRegistry,
     workers: Mutex<HashMap<String, WorkerState>>,
 }
 
 impl WorkerSupervisor {
-    pub fn new(runtime: Arc<dyn AgentRuntime>) -> Self {
+    pub fn new(registry: RuntimeRegistry) -> Self {
         Self {
-            runtime,
+            registry,
             workers: Mutex::new(HashMap::new()),
         }
     }
@@ -146,12 +158,16 @@ impl WorkerSupervisor {
     ///   `max_turn_ms` 硬兜底）。
     /// 档次在 `register` 时钉死，整个生命周期不变（**两档不混用**）。
     /// Coordinator（后续任务）传 `runtime.capabilities().structured_events`。
-    pub fn register(&self, agent_id: &str, structured: bool) {
+    ///
+    /// `kind`（Task 8）：该 agent 注册时的介质种类——reap 据此从 registry 取介质做
+    /// liveness 探针。Phase 2 兼容：用 [`RuntimeRegistry::single`] 构造 supervisor 时，
+    /// 无论传哪种 kind，registry 都返回同一介质 → 行为与 Phase 2 逐字一致。
+    pub fn register(&self, agent_id: &str, structured: bool, kind: RuntimeKind) {
         let now = Utc::now();
         let mut workers = self.workers.lock().unwrap();
         workers.insert(
             agent_id.to_string(),
-            WorkerState::new_running(now, structured),
+            WorkerState::new_running(now, structured, kind),
         );
     }
 
@@ -164,9 +180,10 @@ impl WorkerSupervisor {
         let mut workers = self.workers.lock().unwrap();
         // 自动注册默认走结构化档（Coordinator 正常流程会先 register 显式标档次；
         // 走到这里说明事件早于 register，按更保守的结构化档处理）。
+        // Task 8：自动注册的介质种类默认 Sdk（结构化档对应 SDK 介质，与上面 true 一致）。
         let state = workers
             .entry(agent_id.to_string())
-            .or_insert_with(|| WorkerState::new_running(now, true));
+            .or_insert_with(|| WorkerState::new_running(now, true, RuntimeKind::Sdk));
         // 任意事件都刷新活动时间（"timeout 内有任意 event → Running"）。
         state.last_activity_at = now;
 
@@ -226,7 +243,8 @@ impl WorkerSupervisor {
     ) -> Vec<String> {
         // 先挑出本轮候选（持锁时间短）：按 per-agent 档次分流，应用对应档的判活规则。
         // 进程存活探针放到锁外做（避免 await 持锁），后面再做 TOCTOU 双检。
-        let candidate_ids: Vec<String> = {
+        // Task 8：候选携带 agent 注册时的 RuntimeKind，供锁外按 kind 从 registry 取介质探针。
+        let candidate_ids: Vec<(String, RuntimeKind)> = {
             let workers = self.workers.lock().unwrap();
             workers
                 .iter()
@@ -242,19 +260,22 @@ impl WorkerSupervisor {
                             || (now - state.started_at) > max_turn_ms
                     }
                 })
-                .map(|(id, _)| id.clone())
+                .map(|(id, state)| (id.clone(), state.kind))
                 .collect()
         };
 
         let mut suspects = Vec::new();
-        for agent_id in candidate_ids {
-            // 进程存活探针：Dead + 静默不算 Suspect（Dead 由别处作为 Failed 处理）。
-            let liveness = self
-                .runtime
-                .liveness(&AgentHandle {
-                    agent_id: agent_id.clone(),
-                })
-                .await;
+        for (agent_id, kind) in candidate_ids {
+            // Task 8：按该 agent 注册时的 RuntimeKind 从 registry 取介质做 liveness 探针。
+            // 缺 kind（不应发生——single() 全登记）→ 视为非 Alive，跳过（与 Dead 同处理）。
+            let liveness = match self.registry.get(kind) {
+                Ok(rt) => rt
+                    .liveness(&AgentHandle {
+                        agent_id: agent_id.clone(),
+                    })
+                    .await,
+                Err(_) => Liveness::Unknown,
+            };
             if liveness == Liveness::Alive {
                 let mut workers = self.workers.lock().unwrap();
                 if let Some(state) = workers.get_mut(&agent_id) {
@@ -299,9 +320,11 @@ impl WorkerSupervisor {
 mod tests {
     use super::*;
     use crate::hermes::{
-        RuntimeCapabilities, RuntimeError, RuntimeStartSpec,
+        AgentRuntime, RuntimeCapabilities, RuntimeError, RuntimeKind, RuntimeRegistry,
+        RuntimeStartSpec,
     };
     use async_trait::async_trait;
+    use std::sync::Arc;
     use tokio::sync::mpsc;
 
     // ── 测试专用 MockRuntime：liveness 可按 agent_id 编程 ────────────────────
@@ -365,14 +388,16 @@ mod tests {
     fn supervisor(default_liveness: Liveness) -> (WorkerSupervisor, Arc<MockRuntime>) {
         let rt = Arc::new(MockRuntime::new(default_liveness));
         let rt_dyn: Arc<dyn AgentRuntime> = rt.clone();
-        (WorkerSupervisor::new(rt_dyn), rt)
+        // Task 8：Phase 2 兼容——single(rt) 把同一 rt 登记到所有 kind，
+        // 无论 agent 注册时带哪种 kind，liveness 探针都解析到它 → 行为与 Phase 2 逐字一致。
+        (WorkerSupervisor::new(RuntimeRegistry::single(rt_dyn)), rt)
     }
 
     // 用例 1：ToolUse 未闭合 → 即使静默超时 + 进程存活，也**不**判 Suspect。
     #[tokio::test]
     async fn open_tool_use_shields_from_suspect() {
         let (sup, _rt) = supervisor(Liveness::Alive);
-        sup.register("a1", true);
+        sup.register("a1", true, RuntimeKind::Sdk);
         // 发一个 ToolUse 但没对应的 ToolResult。
         sup.on_event(
             "a1",
@@ -395,7 +420,7 @@ mod tests {
     #[tokio::test]
     async fn tool_result_closes_then_can_be_suspect() {
         let (sup, _rt) = supervisor(Liveness::Alive);
-        sup.register("a1", true);
+        sup.register("a1", true, RuntimeKind::Sdk);
         sup.on_event(
             "a1",
             &AgentEvent::ToolUse {
@@ -427,7 +452,7 @@ mod tests {
     #[tokio::test]
     async fn waiting_input_is_never_reaped() {
         let (sup, _rt) = supervisor(Liveness::Alive);
-        sup.register("a1", true);
+        sup.register("a1", true, RuntimeKind::Sdk);
         sup.on_event("a1", &AgentEvent::NeedsInput).await;
         assert_eq!(sup.status_of("a1"), Some(WorkerStatus::WaitingInput));
 
@@ -443,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn silent_alive_no_open_tool_use_is_suspect() {
         let (sup, _rt) = supervisor(Liveness::Alive);
-        sup.register("a1", true);
+        sup.register("a1", true, RuntimeKind::Sdk);
         // 无任何事件 → 无 open tool_use。
 
         let now = Utc::now() + Duration::seconds(60);
@@ -458,7 +483,7 @@ mod tests {
     #[tokio::test]
     async fn dead_silent_is_not_suspect() {
         let (sup, _rt) = supervisor(Liveness::Dead);
-        sup.register("a1", true);
+        sup.register("a1", true, RuntimeKind::Sdk);
 
         let now = Utc::now() + Duration::seconds(60);
         let reaped = sup
@@ -477,7 +502,7 @@ mod tests {
     async fn done_and_failed_are_not_reaped() {
         let (sup, _rt) = supervisor(Liveness::Alive);
 
-        sup.register("done", true);
+        sup.register("done", true, RuntimeKind::Sdk);
         sup.on_event(
             "done",
             &AgentEvent::Done {
@@ -488,7 +513,7 @@ mod tests {
         .await;
         assert_eq!(sup.status_of("done"), Some(WorkerStatus::Done));
 
-        sup.register("failed", true);
+        sup.register("failed", true, RuntimeKind::Sdk);
         sup.on_event(
             "failed",
             &AgentEvent::Failed {
@@ -511,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn any_event_refreshes_activity() {
         let (sup, _rt) = supervisor(Liveness::Alive);
-        sup.register("a1", true);
+        sup.register("a1", true, RuntimeKind::Sdk);
 
         // 在 "now" 之前注册（老活动时间），然后 reap 用一个较近的 now，
         // 但 reap 前再发一个事件刷新 last_activity_at。
@@ -557,9 +582,9 @@ mod tests {
     #[tokio::test]
     async fn reap_returns_sorted_multiple_suspects() {
         let (sup, _rt) = supervisor(Liveness::Alive);
-        sup.register("b", true);
-        sup.register("a", true);
-        sup.register("c", true);
+        sup.register("b", true, RuntimeKind::Sdk);
+        sup.register("a", true, RuntimeKind::Sdk);
+        sup.register("c", true, RuntimeKind::Sdk);
         // 把 c 改成 Done，不应被收。
         sup.on_event(
             "c",
@@ -592,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn degraded_recent_output_alive_not_suspect() {
         let (sup, _rt) = supervisor(Liveness::Alive);
-        sup.register("cli1", false);
+        sup.register("cli1", false, RuntimeKind::Sdk);
         // 降级 agent 发一个 TextDelta（"有输出=活"）。
         sup.on_event("cli1", &AgentEvent::TextDelta("hello".to_string()))
             .await;
@@ -610,7 +635,7 @@ mod tests {
     #[tokio::test]
     async fn degraded_silent_alive_is_suspect() {
         let (sup, _rt) = supervisor(Liveness::Alive);
-        sup.register("cli1", false);
+        sup.register("cli1", false, RuntimeKind::Sdk);
 
         let now = Utc::now() + Duration::seconds(60);
         let reaped = sup
@@ -625,7 +650,7 @@ mod tests {
     #[tokio::test]
     async fn degraded_hard_backstop_fires_even_with_fresh_activity() {
         let (sup, _rt) = supervisor(Liveness::Alive);
-        sup.register("cli1", false);
+        sup.register("cli1", false, RuntimeKind::Sdk);
         // 关键：模拟「一直在吐文本」——把 last_activity_at 拉到很新，
         // 但把 started_at 拉到很久以前，使 (now - started_at) > max_turn_ms。
         let now = Utc::now();
@@ -653,7 +678,7 @@ mod tests {
     #[tokio::test]
     async fn degraded_dead_not_suspect_even_past_max_turn() {
         let (sup, _rt) = supervisor(Liveness::Dead);
-        sup.register("cli1", false);
+        sup.register("cli1", false, RuntimeKind::Sdk);
 
         let now = Utc::now() + Duration::minutes(30);
         let reaped = sup
@@ -673,7 +698,7 @@ mod tests {
     #[tokio::test]
     async fn structured_ignores_max_turn_ms_when_open_tool_use_shields() {
         let (sup, _rt) = supervisor(Liveness::Alive);
-        sup.register("sdk1", true);
+        sup.register("sdk1", true, RuntimeKind::Sdk);
         sup.on_event(
             "sdk1",
             &AgentEvent::ToolUse {
@@ -709,7 +734,7 @@ mod tests {
     #[tokio::test]
     async fn structured_reaped_by_activity_timeout_not_max_turn() {
         let (sup, _rt) = supervisor(Liveness::Alive);
-        sup.register("sdk1", true);
+        sup.register("sdk1", true, RuntimeKind::Sdk);
 
         let now = Utc::now() + Duration::minutes(30);
         let reaped = sup
@@ -717,5 +742,34 @@ mod tests {
             .await;
         assert_eq!(reaped, vec!["sdk1".to_string()]);
         assert_eq!(sup.status_of("sdk1"), Some(WorkerStatus::Suspect));
+    }
+
+    // Task 8：reap 按 per-agent RuntimeKind 从 registry 取介质做 liveness 探针。
+    //
+    // 两个 MockRuntime（sdk 默认 Alive、cli 默认 Dead），分别登记到 Sdk / Cli；
+    // a1 注册为 Sdk、a2 注册为 Cli。reap 后：
+    //   * a1(Sdk→Alive)+静默 → Suspect；
+    //   * a2(Cli→Dead)+静默 → 非 Suspect（Dead + 静默不算 Suspect）。
+    // 这证明 liveness 探针走的是 agent 注册时记下的 kind 对应的介质，而非单一全局介质。
+    #[tokio::test]
+    async fn reap_probes_liveness_via_per_agent_runtime_kind() {
+        let sdk_rt = Arc::new(MockRuntime::new(Liveness::Alive));
+        let cli_rt = Arc::new(MockRuntime::new(Liveness::Dead));
+        let registry = RuntimeRegistry::new()
+            .with(RuntimeKind::Sdk, sdk_rt.clone() as Arc<dyn AgentRuntime>)
+            .with(RuntimeKind::Cli, cli_rt.clone() as Arc<dyn AgentRuntime>);
+        let sup = WorkerSupervisor::new(registry);
+        sup.register("a1", true, RuntimeKind::Sdk); // structured + Sdk → 探针走 sdk_rt(Alive)
+        sup.register("a2", true, RuntimeKind::Cli); // structured + Cli → 探针走 cli_rt(Dead)
+        let now = Utc::now() + Duration::seconds(60);
+        let reaped = sup.reap(now, Duration::seconds(5), DEFAULT_MAX_TURN_MS).await;
+        assert!(
+            reaped.contains(&"a1".to_string()),
+            "a1(Sdk→Alive)+静默 → Suspect"
+        );
+        assert!(
+            !reaped.contains(&"a2".to_string()),
+            "a2(Cli→Dead)+静默 → 非 Suspect（Dead 不收）"
+        );
     }
 }

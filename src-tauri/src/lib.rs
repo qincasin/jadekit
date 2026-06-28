@@ -1121,8 +1121,21 @@ pub fn run() {
 
                 let hermes_chat_manager =
                     std::sync::Arc::new(chat::ChatManager::new(app.handle().clone()));
-                let runtime: std::sync::Arc<dyn hermes::AgentRuntime> =
+                let sdk_runtime: std::sync::Arc<dyn hermes::AgentRuntime> =
                     std::sync::Arc::new(hermes::SdkRuntime::new(hermes_chat_manager));
+                // 生产侧 Cli 介质命令：默认走 PATH 上的 `claude` CLI（与 cli_runtime.rs
+                // 文档注释约定一致——生产用 ["claude"]，测试用 ["bash","-c",...]）。
+                // 本运行时不内置 provider 名，命令由调用方注入；Task 17 的手动真实 LLM
+                // e2e 会验证/调整此命令，Task 9 的 DoD 是 mock e2e，不依赖此命令真能跑。
+                let cli_runtime: std::sync::Arc<dyn hermes::AgentRuntime> =
+                    std::sync::Arc::new(hermes::CliRuntime::new(vec!["claude".to_string()]));
+                // Task 9：构造介质注册表——Sdk + Cli 双介质并登（Phase 3b 异构 in-run
+                // 调度）。assignment.runtime=Sdk 的 task 走 SdkRuntime（ai-bridge daemon
+                // 结构化流）；assignment.runtime=Cli 的 task 走 CliRuntime（裸 PTY 进程，
+                // 降级 liveness 档）。production 用显式 .with（不用 single）。
+                let registry = hermes::RuntimeRegistry::new()
+                    .with(hermes::RuntimeKind::Sdk, sdk_runtime)
+                    .with(hermes::RuntimeKind::Cli, cli_runtime);
 
                 let repo_root = std::env::current_dir().unwrap_or_else(|_| {
                     dirs::home_dir().unwrap_or_default()
@@ -1132,7 +1145,7 @@ pub fn run() {
 
                 let engine = hermes_commands::HermesEngine::new(
                     store,
-                    runtime,
+                    registry,
                     repo_root,
                     worktrees_dir,
                 );

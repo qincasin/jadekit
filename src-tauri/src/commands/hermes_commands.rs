@@ -20,8 +20,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::hermes::{
-    self, Coordinator, DispatchContext, OrchestrationEventSink, RunStatus, Store, Task,
-    TaskListFilter, TaskStatus,
+    self, Coordinator, DispatchContext, OrchestrationEventSink, RuntimeRegistry, RunStatus, Store,
+    Task, TaskListFilter, TaskStatus,
 };
 
 // =============================================================================
@@ -307,30 +307,31 @@ pub struct RunHandle {
 ///
 /// 持有：
 /// - [`Store`]（Arc<Mutex<Connection>> 在内部，跨 spawned 任务共享）；
-/// - 注入的 `runtime`（生产 SdkRuntime，测试 mock）；
+/// - 注入的 `registry`（生产用 `SdkRuntime`，测试 mock）——Task 7 起按
+///   `task.assignment.runtime` 把派发路由到对应介质（一次 run 内 SDK × CLI 混跑）；
 /// - `repo_root`（缺省 cwd，opts 可覆盖）；
 /// - `worktrees_dir`（每个 worker agent 一个独立 git worktree 的根目录）；
 /// - `runs`：run_id → RunHandle，供 `hermes_run_stop` 发出取消信号。
 pub struct HermesEngine {
     store: Store,
-    runtime: Arc<dyn hermes::AgentRuntime>,
+    registry: RuntimeRegistry,
     repo_root: PathBuf,
     worktrees_dir: PathBuf,
     runs: StdMutex<HashMap<String, RunHandle>>,
 }
 
 impl HermesEngine {
-    /// 构造引擎。生产由 `lib.rs::setup` 调用（注入 `SdkRuntime`），
-    /// 测试可注入任意 `Arc<dyn AgentRuntime>` mock。
+    /// 构造引擎。生产由 `lib.rs::setup` 调用（注入含 SdkRuntime 的 registry），
+    /// 测试可注入任意 registry（如 `RuntimeRegistry::single(mock)`）。
     pub fn new(
         store: Store,
-        runtime: Arc<dyn hermes::AgentRuntime>,
+        registry: RuntimeRegistry,
         repo_root: PathBuf,
         worktrees_dir: PathBuf,
     ) -> Self {
         Self {
             store,
-            runtime,
+            registry,
             repo_root,
             worktrees_dir,
             runs: StdMutex::new(HashMap::new()),
@@ -380,7 +381,8 @@ impl HermesEngine {
 
         // spawn 后台 Coordinator 循环。
         let store = self.store.clone_handle();
-        let runtime = Arc::clone(&self.runtime);
+        // Task 7：registry 是 Clone（内部全 Arc），廉价 clone 一份进 spawned 任务。
+        let registry = self.registry.clone();
         let worktrees_dir = self.worktrees_dir.clone();
         let run_id = run.id.clone();
         let run_goal = run.goal.clone();
@@ -389,10 +391,13 @@ impl HermesEngine {
         let sink_for_task = sink.clone();
 
         tauri::async_runtime::spawn(async move {
-            let coordinator = Coordinator::new(store.clone_handle(), runtime, repo_root, worktrees_dir)
-                .with_max_concurrent(opts.max_concurrent)
-                // Task 4：注入 TauriEventSink——引擎内部 task/agent 级事件经此通道落地。
-                .with_event_sink(sink_for_task.clone() as Arc<dyn crate::hermes::OrchestrationEventSink>);
+            let coordinator =
+                Coordinator::new(store.clone_handle(), registry, repo_root, worktrees_dir)
+                    .with_max_concurrent(opts.max_concurrent)
+                    // Task 4：注入 TauriEventSink——引擎内部 task/agent 级事件经此通道落地。
+                    .with_event_sink(
+                        sink_for_task.clone() as Arc<dyn crate::hermes::OrchestrationEventSink>,
+                    );
 
             let final_status = if cancel_for_task.load(Ordering::SeqCst) {
                 // 在进入循环前就被 cancel——直接置 Failed（保持原语义；Cancelled 是 Task 11 的范围）。
@@ -756,9 +761,11 @@ mod tests {
     fn build_test_engine() -> HermesEngine {
         let store = Store::open_in_memory().unwrap();
         let runtime: Arc<dyn AgentRuntime> = Arc::new(NoopRuntime);
+        // Task 7：Phase 2 兼容——single(rt) 把同一 rt 登记到所有 kind。
+        let registry = crate::hermes::RuntimeRegistry::single(runtime);
         HermesEngine::new(
             store,
-            runtime,
+            registry,
             PathBuf::from("/tmp/repo"),
             PathBuf::from("/tmp/worktrees"),
         )
