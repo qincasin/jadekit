@@ -39,4 +39,4 @@ pub use permission_watcher::{
 pub use resources::permission_dir;
 pub use sdk_installer::SdkStatus;
 pub use slash_commands::list_slash_commands;
-pub use worktree::{DiffSummary, MergeOutcome, WorktreeInfo, WorktreeManager};
+pub use worktree::{DiffSummary, HELM_BRANCH_PREFIX, MergeOutcome, WorktreeInfo, WorktreeManager};
