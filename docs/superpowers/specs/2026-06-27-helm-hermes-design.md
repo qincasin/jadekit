@@ -292,6 +292,30 @@ SQLite 表：`tasks` / `dispatch_contexts` / `messages` / `decision_gates` / `co
 - 看板状态 = 编排状态的可视镜像，拖拽即干预。
 - 每个 Agent 卡显示 `CLI 图标 + 模型徽章`，让异构舰队「谁用什么模型干什么」一目了然。
 
+### Phase 4 质量基线（强约束，不可降级）
+
+> Phase 4（驾驶舱 UI）是 Helm 的门面，**质量门槛拉到最高**：要做到「比 orca 更真实、更好用、非常 hermess 化（编排/舰队感强）」。这不是收尾凑数，是重头戏。下列为**验收硬标准**，任一不达标即视为 Phase 4 未完成。
+
+**必须做到（功能完整度）**
+- **三栏 cockpit**：左=舰队看板、中=选中 Agent 会话 / 异构扇出并排、右=worktree diff + 合并/丢弃 + 评判结果；面板可开合（对齐 orca `PanelLeft/PanelRight`），**非路由分页**。
+- **Kanban 状态看板**：泳道（待派/执行中/待评审/完成），**跨泳道拖拽 = 人工干预**，看板状态与编排 Task 状态**双向同步**。
+- **AgentStateDot 状态词汇**：`working`(转圈)/`idle`(灰)/`active`(翠绿)/`done`(独立色)/`needs-attention`(琥珀，合并 blocked+waiting+permission)/`interrupted`(红)；**严格区分「等待输入」与「卡死」**。
+- **⌘K Jump Palette**：在所有活跃 Agent 间秒切；**点 Agent 卡 → 跳转到该 Agent（及其 worktree）会话**。
+- **子代理可达**：会话内 Task 块**内联展开 sidechain 子代理**（复用现有 `SubagentHistoryPanel`/`subagentRuns`）；编排 run 视图点任意 worker → 进其会话。
+- **Roster 面板**：可部署 CLI×模型清单（取自现有 provider 管理），Hermes 选兵/手动选兵共用。
+- **编排 run 视图**：task DAG 可视化、worker 卡片（CLI 图标 + 模型徽章 + 状态点 + 分支 + diff）、gate/decision 浮现可应答。
+
+**必须做到（质感/可用性，"比 orca 更好用"）**
+- **键盘优先**：核心动作（切 Agent、扇出、合并、丢弃、应答 gate）皆有快捷键，不靠纯鼠标。
+- **实时性**：流式输出、状态点、diff 概要近实时刷新，无明显卡顿；长列表虚拟化。
+- **零模板感**：视觉要有意图、不是 DaisyUI 默认堆砌——建 Phase 4 时**必须加载 `frontend-design` 技能**定基调（排版/层次/色彩/留白）。
+- **破坏性操作安全**：删 worktree / 丢弃 / 合并冲突均预检 + 二次确认 + 清晰回滚提示。
+
+**过程要求（如何保证达标）**
+- 动工前用 codegraph 读 **orca 真实组件**对标：`Sidebar`/`WorkspaceKanban*`/`AgentStateDot`/`WorktreeCard*`/`WorktreeJumpPalette`/`NewWorkspaceComposerModal`，学其交互细节而非照抄像素。
+- **加载 `frontend-design` 技能**做视觉方向；关键界面出**可视稿/截图**自审，达不到"orca 级真实好用"就返工。
+- 复用已有能力（会话侧栏/tabs/扇出对比/子代理面板），**重组进 cockpit**，不另起炉灶、不重复造。
+
 ---
 
 ## 11. 错误处理 / 熔断 / 崩溃恢复
@@ -315,12 +339,16 @@ SQLite 表：`tasks` / `dispatch_contexts` / `messages` / `decision_gates` / `co
 
 ## 13. 分阶段路线（全量目标，标注 MVP 与灰度）
 
-- **Phase 0 — RuntimePool/DaemonPool（地基，必做，小）**：单例 daemon → 按 agentId 多 daemon，per-agent cwd/abort。✅ 完成后多 tab 已真并行、互不踩 cwd。
-- **Phase 1 — Worktree 隔离 + 异构扇出（中）**：worktree per Agent；一 prompt 扇出 N Agent（含跨 CLI×模型）并排对比，选赢家合并。
-- **Phase 2 — 编排 MVP（大）← MVP 终点**：`AgentRuntime` 契约 + `CliRuntime` + Task/Dispatch/Coordinator + Planner（拆解 + 选兵，**扁平任务深度 ≤ 2**）+ maxConcurrent + 熔断 + Supervisor 判活。**建议产品层 opt-in / 灰度**（对齐 orca 把编排做成实验开关）。
-- **Phase 3 — 全量（大）**：完整 DAG（deps）+ DecisionGate + Message 总线 + escalation/replan + LLM-judge 评判。
+> 实际推进中 Phase 1 的扇出拆成了 Phase 1b；编号按落地现实校正如下。
 
-每阶段独立可交付。writing-plans 阶段先针对 **Phase 0 + Phase 1** 出实现计划，Phase 2/3 后续单独立计划。
+- **Phase 0 — DaemonPool（地基，小）✅ 已完成**：单例 daemon → 按 agentId 多 daemon，per-agent cwd/abort。多 tab 真并行、互不踩 cwd。
+- **Phase 1 — Worktree 隔离（中）✅ 已完成**：worktree per Agent + 分支/diff 徽章 + close_agent 清理。
+- **Phase 1b — 异构扇出（中）✅ 已完成**：一 prompt 扇出 N Agent（跨 CLI×模型）各自 worktree 并排对比，选赢家合并 / 丢弃（merge 冲突安全回滚）。
+- **Phase 2 — Hermes 引擎（大）🔄 进行中**：`AgentRuntime` 契约 + `SdkRuntime`/`CliRuntime` + SQLite Store + 确定性 Coordinator + WorkerSupervisor 判活 + Planner（拆解/选兵/replan）。**建议产品层 opt-in / 灰度**。后端为主，UI 基本不动。
+- **Phase 3 — 编排完整化（大）⬜**：完整 DAG（deps）+ DecisionGate + Message 总线 + escalation/replan + LLM-judge。**硬依赖 Phase 2 引擎**。
+- **Phase 4 — 驾驶舱 UI（大，质量门槛最高）⬜**：三栏 cockpit + Kanban 看板 + AgentStateDot + Roster + ⌘K Jump + 编排 worker 可视化。**验收按上文「§10 Phase 4 质量基线（强约束）」逐条核对**——要做到「比 orca 更真实、更好用、非常 hermess 化」。其"驾驶舱外壳"部分不依赖 Phase 2，仅"编排 worker 可视化"需 Phase 2 落地后接入。
+
+每阶段独立可交付，**一个一个来**（一次只让一个 agent 动工作树，逐阶段验收）。分支约定：每阶段从主功能分支 `feat/helm` 拉子分支，验收通过 `--no-ff` 合回 `feat/helm`，暂不入 main/develop。
 
 ---
 
