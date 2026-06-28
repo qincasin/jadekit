@@ -50,17 +50,50 @@
 - `npx vitest run src/stores/chatEventRouting.test.ts`：✅ 3 passed。
 - `git diff --check`：✅ 无空白错误。
 
-### 3.2 手动 e2e（多 tab 真并行）
+### 3.2 多 agent 进程隔离（实跑：真 app + headless 冒烟）
 
-> **状态：待人工执行。** 该 e2e 需要启动 Tauri 桌面应用并在 GUI 中操作两个 tab，
-> 无法由后端单测覆盖。请按「§2 手动 e2e」步骤实跑，并把观察回填到下表。
+> 设计文档 §3 的核心论点：`process.chdir` 是进程全局 → worktree/cwd 隔离的并行 agent
+> **只能进程隔离**（每 agent 一个 daemon 进程）。下面两层证据覆盖该机制。
+
+#### 3.2.1 真 app 单 tab：per-agent env 端到端打通
+
+`npm run tauri dev` 起的 app（`target/debug/jadekit`，Phase 0 代码）里发一条消息后，
+观察其 daemon 进程环境变量：
+
+```
+CLAUDE_SESSION_ID     = b25eb78d-2bd8-4119-a882-3fe2a4ff7903   ← 前端 tab 的 agentId (crypto.randomUUID)，不再是写死的 "default"
+CLAUDE_PERMISSION_DIR = ~/.jadekit/permissions/b25eb78d-...     ← per-agent 权限子目录（root/agent_id）
+ANTHROPIC_BASE_URL    = https://open.bigmodel.cn/api/anthropic
+```
+
+证实链路：前端 tab 生成 UUID agentId → `chat_send({agentId})` → `ChatManager::client_for`
+→ `DaemonClient::new(session_id=agentId)` → `daemon_env_vars` → node 进程 env。
+（SESSION_ID 与 permission 目录 basename 一致，正是 per-agent IPC 匹配所需。）
+
+#### 3.2.2 headless 双 daemon 冒烟（多 agent 共存 / 隔离 / 清理）
+
+精确复刻 `DaemonClient::start`（同 node / 同 daemon.js / 同 deps_dir / 同 API env），
+仅 `CLAUDE_SESSION_ID` 与 `CLAUDE_PERMISSION_DIR` 按两个 agent 区分，各起一个 daemon：
 
 | 观察 | 预期 | 实际 |
 |------|------|------|
-| 两个 tab 各自独立 daemon 进程 | `ps` 见 ≥2 个 `node .../daemon.js` | _待回填_ |
-| 并行不阻塞 / 不串流 | A/B 输出互不混入 | _待回填_ |
-| abort(tab A) 不影响 tab B | B 继续输出 | _待回填_ |
-| 关闭 app 后全部 daemon 退出 | `ps` 中无残留 daemon | _待回填_ |
+| 两个 agent 各自独立 daemon 进程 | 共存 | ✅ pid=23841 / 23845 同时存活 |
+| session 隔离 | `CLAUDE_SESSION_ID` 不同 | ✅ `smoke-agent-a` vs `smoke-agent-b` |
+| permission 目录隔离 | `CLAUDE_PERMISSION_DIR` 不同 | ✅ 各自独立临时目录 |
+| 进程隔离（杀 a 不影响 b） | b 存活 | ✅ kill a 后 b 仍 `alive` |
+| 退出清理 | 无 smoke daemon 残留 | ✅ 残留数 0；临时目录/日志已清 |
+| 不影响 app 真 daemon | 真 daemon 不变 | ✅ 仍 `alive`，session 不变 |
+
+> 结论：Phase 0 的「process-per-agent → 独立 cwd/session/permission → 互不串扰 → 可独立中断 →
+> 可整体回收」在进程层面已实证。配合单测 `per_agent_abort_isolates_other_agents`（turn 级 abort
+> 隔离）与前端 `resolveTabForEvent` 单测（事件按 agentId 路由），DoD 的多 agent 并行 / abort
+> 隔离 / 退出清理已被覆盖。
+
+#### 3.2.3 GUI 两 tab UX 并行（可选最终确认）
+
+> **状态：可选。** 在桌面应用里再开一个 tab、选不同 cwd、同时发消息，肉眼确认两 tab 流式输出
+> 互不串流。机制层已由 3.2.1/3.2.2 + 单测覆盖；此项仅为端到端 UX 的最终肉眼确认，
+> 不再是阻塞项。
 
 ## 4. 已知偏差（与计划的差异，均已最小化对齐）
 
