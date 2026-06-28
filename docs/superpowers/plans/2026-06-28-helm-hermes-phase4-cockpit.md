@@ -234,18 +234,31 @@ git checkout feat/helm && git merge --no-ff feat/helm-phase4b-fleet -m "merge: P
 - [ ] **Step 4: 确认通过** → vitest PASS
 - [ ] **Step 5: 提交** `feat(helm): cmd-k jump palette for active agents`
 
-## Task 9: 中栏 agent 会话 + 子代理内联展开（复用）
+## Task 9: 中栏 agent 真实会话（复用现有 chat 全套渲染，不做瘦摘要）
+
+> **强约束（§10 复用优先 + 设计评审反馈）**：中栏默认渲染该 agent 的**真实会话 transcript**，**不是状态摘要**。必须复用现有 chat 的整套渲染能力，禁止另写一个功能更少的会话视图。digest/事件流概览只作**次级可折叠层**。
 
 **Files:**
-- Create: `src/components/helm/SessionPanel.tsx`（选中 agent → 渲染其会话，复用现有 `MessageList`/`SubagentHistoryPanel`/`subagentRuns`）
-- Test: `src/components/helm/sessionSelect.test.ts`（选中态纯逻辑）
+- Create: `src/components/helm/SessionPanel.tsx`、`src/components/helm/sessionHeaderActions.ts`（单-agent 动作纯逻辑）
+- Test: `src/components/helm/sessionSelect.test.ts`、`src/components/helm/sessionHeaderActions.test.ts`
 
-**Interfaces:** Consumes：现有会话渲染 + `subagentRuns`（按 parentToolUseId）。Produces：`SessionPanel`（点 WorkerCard → store 设 `selectedAgentId` → 渲染该 agent 会话；Task 块内联展开 sidechain）。
-- [ ] **Step 1: 写失败测试** —— `selectAgent(id)` 设选中；切换清理上一个的临时态。
+**Interfaces:**
+- **必须复用（codegraph 定位后接入，禁止重写）**：
+  - 真实 transcript：`MessageList` / `ContentBlockRenderer` / `MessageItem` —— **默认就是它**。
+  - **工具链路调用查看**：`src/components/toolBlocks/` 整套（`BashToolBlock`/`BashToolGroupBlock` · `EditToolBlock`+`EditDiffPreview` · `ReadToolBlock`/`ReadToolGroupBlock` · `SearchToolGroupBlock` · `GenericToolBlock` · `AgentGroupBlock` · `TaskExecutionBlock`），逐个可展开看命令·参数·结果·diff。
+  - 子代理：`SubagentHistoryPanel` + `subagentRuns`（按 parentToolUseId 内联展开 sidechain）。
+  - thinking：`ThinkingBlock`；逐条元信息：`MessageMeta`（token/成本/耗时）。
+  - 滚动/流式：`ScrollControl` + `StreamingPlaceholder`/`WaitingIndicator`/`BouncingDots`。
+  - 会话内搜索：`ConversationSearch`。
+- Produces：
+  - `SessionPanel`（点 WorkerCard → store 设 `selectedAgentId` → 渲染该 agent **真实会话**；toolBlocks/thinking/子代理皆可展开；digest 为次级）。
+  - **会话头单-agent 动作**：`sessionHeaderActions(agent)` → 停止该 agent（`hermes_run_cancel` 暂为 run 级，单-agent abort 见交付报告待办）/ 跳到其 worktree / 重试（failed 时）；不只 working/tool_use 徽章。
+  - **内联干预槽**：该 agent `needs-attention` 时，权限/ask-user/decision-gate 回答 UI 在本会话内联浮现（实现归 4f，本 task 预留挂载点）。
+- [ ] **Step 1: 写失败测试** —— `selectAgent(id)` 设选中 + 切换清理上一个临时态；`sessionHeaderActions(failedAgent)` 含「重试」、`runningAgent` 含「停止」「跳 worktree」。
 - [ ] **Step 2: 确认失败** → FAIL
-- [ ] **Step 3: 实现**（复用，不重写会话渲染；空态「选择左侧一个 agent 查看其会话」）
+- [ ] **Step 3: 实现**（复用上列全部，不重写任何渲染；空态「选择左侧一个 agent 查看其会话」；digest 次级可折叠）
 - [ ] **Step 4: 确认通过 + build** → 全绿
-- [ ] **Step 5: 提交** `feat(helm): center session panel with inline sub-agent expansion`
+- [ ] **Step 5: 提交** `feat(helm): center session reuses full chat transcript, tool blocks, and sub-agents`
 
 ### ✅ GATE 4c
 ```bash
@@ -317,12 +330,19 @@ git checkout feat/helm && git merge --no-ff feat/helm-phase4d-inspector -m "merg
 ## Task 13: Composer（下达目标起 run + 选兵 + 扇出）
 
 **Files:**
-- Create: `src/components/helm/HelmComposer.tsx`（复用 `FanoutComposer` + `useComposerState` 思路）、`src/components/helm/launchPlan.ts`（goal+roster → 启动参数纯逻辑）
+- Create: `src/components/helm/HelmComposer.tsx`、`src/components/helm/launchPlan.ts`（goal+roster → 启动参数纯逻辑）
 - Test: `src/components/helm/launchPlan.test.ts`
 
-**Interfaces:** Produces：`buildLaunch(goal, opts, roster): { goal, opts }`（校验 goal 非空、maxConcurrent>0）；提交 → `hermesService.run`；异构扇出复用 Phase 1b `FanoutComposer`。键盘优先（⌘Enter 提交）。
+**Interfaces:**
+- **必须复用（不要只做 3 个 roster chip + 派发；codegraph `src/components/chat/composer/` 后接入）**：
+  - 模型/provider 选择：`SelectorDropdown`（model/mode/reasoning）+ `ModelIcon` —— 摆在「Roster 选兵 / 手动扇出」语境，而非单聊式「每条选模型」。
+  - 补全：`CompletionMenu` + `useCompletions`（`/` 斜杠命令 + `@` 文件）。
+  - 辅助：`ContextBar`（cwd/上下文）、`TokenIndicator`（token 计数）、`PromptEnhancerDialog`（提示词增强）、`FileTag`（文件附件）。
+  - 安全：SDK 缺失拦截（缺 SDK 拦发送 + 提示安装，复用现有 `ChatComposer` 的守卫逻辑）。
+  - 异构扇出复用 Phase 1b `FanoutComposer` + `roster.ts`。
+- Produces：`buildLaunch(goal, opts, roster): { goal, opts }`（校验 goal 非空、maxConcurrent>0）；提交 → `hermesService.run`。键盘优先（⌘Enter 提交）。
 - [ ] **Step 1: 写失败测试** —— 空 goal 拒绝；opts 归一化；扇出计划构造。
-- [ ] **Step 2: FAIL** → **Step 3: 实现**（空/错态文案）→ **Step 4: vitest+build+lint** → **Step 5: 提交** `feat(helm): composer to launch orchestration runs`
+- [ ] **Step 2: FAIL** → **Step 3: 实现**（复用上列选择/补全/增强/守卫，不做瘦版；空/错态文案）→ **Step 4: vitest+build+lint** → **Step 5: 提交** `feat(helm): composer reuses model selector, completions, and launch controls`
 
 ### ✅ GATE 4e
 ```bash
