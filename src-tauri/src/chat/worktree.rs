@@ -13,6 +13,13 @@ pub struct WorktreeInfo {
     pub branch: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DiffSummary {
+    pub files_changed: u32,
+    pub insertions: u32,
+    pub deletions: u32,
+}
+
 pub struct WorktreeManager;
 
 impl WorktreeManager {
@@ -92,6 +99,29 @@ impl WorktreeManager {
         let out = Self::run(worktree_path, &["status", "--porcelain"])?;
         Ok(!out.trim().is_empty())
     }
+
+    /// 相对 HEAD 的改动摘要（含已跟踪文件改动；解析 `git diff --shortstat`）。
+    pub fn diff_summary(worktree_path: &Path) -> Result<DiffSummary, String> {
+        // 包含已暂存与未暂存改动相对 HEAD。
+        let out = Self::run(worktree_path, &["diff", "--shortstat", "HEAD"])?;
+        let mut summary = DiffSummary::default();
+        for part in out.split(',') {
+            let item = part.trim();
+            let count: u32 = item
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            if item.contains("file") {
+                summary.files_changed = count;
+            } else if item.contains("insertion") {
+                summary.insertions = count;
+            } else if item.contains("deletion") {
+                summary.deletions = count;
+            }
+        }
+        Ok(summary)
+    }
 }
 
 #[cfg(test)]
@@ -163,5 +193,20 @@ mod tests {
             WorktreeManager::remove(&repo, &info.path, true).is_ok(),
             "force 可删"
         );
+    }
+
+    #[test]
+    fn diff_summary_counts_changes_vs_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let wts = tmp.path().join("worktrees");
+        let info = WorktreeManager::create(&repo, &wts, "task-c").unwrap();
+
+        std::fs::write(info.path.join("README.md"), "hi\nmore\n").unwrap();
+        let s = WorktreeManager::diff_summary(&info.path).unwrap();
+        assert!(s.files_changed >= 1);
+        assert!(s.insertions >= 1);
     }
 }
