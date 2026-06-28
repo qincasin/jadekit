@@ -14,7 +14,7 @@ pub use runtime::{
     AgentEvent, AgentHandle, AgentRuntime, Liveness, RuntimeCapabilities, RuntimeError,
     RuntimeStartSpec,
 };
-pub use supervisor::{WorkerStatus, WorkerSupervisor};
+pub use supervisor::{DEFAULT_MAX_TURN_MS, WorkerStatus, WorkerSupervisor};
 pub use sdk_runtime::{parse_stream_line, SdkRuntime};
 pub use store::{GateListFilter, InboxFilter, ReconcileReport, Store, TaskListFilter};
 pub use types::{
