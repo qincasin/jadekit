@@ -27,7 +27,7 @@ use crate::hermes::types::{
 };
 use rusqlite::{params, Connection, Transaction};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // =============================================================================
 // 常量：表 / 列 / 索引 / PRAGMA（不写魔法串；所有标识符集中定义）
@@ -78,10 +78,21 @@ const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 /// Hermes 编排状态机的 SQLite 句柄。所有写操作通过 `Mutex` 串行化；
 /// 关键不变量（status 写 + ready 提升）在同一 `Transaction` 内提交。
 pub struct Store {
-    /// 内部 `Mutex<Connection>`，与 jadekit `database::Database` 同一风格。
+    /// `Arc<Mutex<Connection>>`——`Arc` 让 Coordinator 把句柄 clone 进 watcher
+    /// spawned future（'static）共享同一连接；`Mutex` 串行化所有写者。
     /// `Transaction` 由 `Connection::transaction` 创建后会借用 `&mut Connection`，
     /// 故仍需独占锁。
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl Store {
+    /// 克隆内部 Arc 句柄——两个 clone 共享同一 SQLite 连接。
+    /// Coordinator 用它把 Store 传给 spawned watcher（'static future）。
+    pub fn clone_handle(&self) -> Self {
+        Self {
+            conn: Arc::clone(&self.conn),
+        }
+    }
 }
 
 /// `list_tasks` 的过滤条件，对齐 orca `listTasks(filter)`。
@@ -107,7 +118,7 @@ impl Store {
             Connection::open(path).map_err(|e| format!("Failed to open hermes store: {e}"))?;
         Self::init_connection(&conn)?;
         let store = Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         };
         store.create_tables()?;
         Ok(store)
@@ -121,7 +132,7 @@ impl Store {
             .map_err(|e| format!("Failed to open in-memory hermes store: {e}"))?;
         Self::init_connection(&conn)?;
         let store = Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         };
         store.create_tables()?;
         Ok(store)
@@ -601,6 +612,24 @@ impl Store {
         )
         .map_err(|e| format!("Failed to insert dispatch_context: {e}"))?;
         Ok(())
+    }
+
+    /// 取该 task 历史 dispatch 中的最大 `failure_count`。
+    ///
+    /// 用途：Coordinator 在重派（task 退回 Ready 后再次 dispatch_one）时，把上次的
+    /// 失败计数 carry-forward 到新 dispatch（对齐 orca `createDispatchContext` 的
+    /// `MAX(failure_count)` 语义）。这样跨多次 dispatch 的失败仍能累计到熔断阈值。
+    /// 若该 task 无历史 dispatch，返回 0。
+    pub fn latest_failure_count_for_task(&self, task_id: &str) -> Result<u32, String> {
+        let conn = lock_conn!(self.conn);
+        let max_count: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(failure_count) FROM dispatch_contexts WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(max_count.unwrap_or(0) as u32)
     }
 
     pub fn get_dispatch(&self, id: &str) -> Result<Option<DispatchContext>, String> {
