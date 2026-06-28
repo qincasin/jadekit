@@ -183,6 +183,10 @@ pub struct Coordinator {
     /// Task 14（3d）：收敛后是否自动清扫 worktree。默认 [`SWEEP_ON_CONVERGE_DEFAULT`]（true，生产开启）；
     /// 测试用 [`Self::with_sweep_on_converge`](false) 关闭以避免 worktree 副作用。
     sweep_on_converge: bool,
+    /// Task 15（3e）：per-run 单飞守卫——同一 run 同时只允许一个 replan 在飞，
+    /// 避免并发熔断各自独立 replan / 重复 Converge 写入。用 tokio::sync::Mutex<HashSet<run_id>>。
+    /// 不注入 Planner 时 maybe_replan_on_failure 提前返回，此守卫不被触碰（非回归）。
+    replan_inflight: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Coordinator {
@@ -208,6 +212,9 @@ impl Coordinator {
             cancel: None,
             base_branch: HELM_BASE_BRANCH.to_string(),
             sweep_on_converge: SWEEP_ON_CONVERGE_DEFAULT,
+            replan_inflight: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         }
     }
 
@@ -700,6 +707,8 @@ impl Coordinator {
         let repo_root_w = self.repo_root.clone();
         // Task 18：把可选的 WorkerSupervisor 也 clone 进 watcher。
         let supervisor_w = self.supervisor.clone();
+        // Task 15（3e）：把 per-run 单飞守卫也 clone 进 watcher（maybe_replan_on_failure 用）。
+        let replan_inflight_w = Arc::clone(&self.replan_inflight);
         // Task 2：把事件 sink + run_id 也 clone 进 watcher，用于在 Done/Failed 分支
         // 发射 Task{completed} / Task{failed}。run_id 在 run() 入口已 set，此处读回。
         let sink_w = Arc::clone(&self.event_sink);
@@ -758,6 +767,7 @@ impl Coordinator {
                                     &repo_root_w,
                                     &task_id,
                                     "agent reported Done{success:false}",
+                                    &replan_inflight_w,
                                 )
                                 .await;
                             }
@@ -781,6 +791,7 @@ impl Coordinator {
                                 &repo_root_w,
                                 &task_id,
                                 &error,
+                                &replan_inflight_w,
                             )
                             .await;
                         }
@@ -1243,11 +1254,15 @@ fn emit_agent_event(
 /// 注：replan 失败（planner 自身 Err）保守地不动 task 状态（保留 Failed），
 ///     让 Coordinator 在下一轮自然收敛判定为 Failed run。
 ///
-/// 并发说明（Task 14 Finding 3）：并发熔断会触发多次并发 replan——
+/// 并发说明（Task 15 / 3e）：并发熔断会触发多次并发 replan——
 /// N 个 watcher 在同一波 circuit-break 中各自独立调 `planner.replan`，每个都可能
-/// 把 Converge→Completed。Phase 2 是**尽力而为**：熔断本身罕见，且 replan 都走
-/// 同一 SQLite 串行写锁，状态最终一致；但**不做 single-flight 串行化**，
-/// 多次 Converge 会被重复写入（`update_run` 幂等）。Phase 3 再加 single-flight。
+/// 把 Converge→Completed。Phase 2 是**尽力而为**；Task 15 加 per-run 单飞守卫：
+/// `inflight` 是 `tokio::sync::Mutex<HashSet<run_id>>`，进入时 `insert(run_id)`，
+/// 若已存在则跳过（返回 Ok，不重复 replan），结束时 `remove(run_id)`。
+/// 关键：短临界区——持锁只做 insert/remove，**不**跨 `planner.replan().await` 持锁
+/// （planner.replan 做 LLM round-trip，跨它持锁会串行化所有 run 的 replan）。
+///
+/// 非回归：无 Planner 注入时本函数在最早处返回，**不触碰** `inflight` 守卫。
 async fn maybe_replan_on_failure(
     store: &Store,
     planner: Option<&Arc<Planner>>,
@@ -1255,9 +1270,10 @@ async fn maybe_replan_on_failure(
     repo_root: &Path,
     failed_task_id: &str,
     failure_reason: &str,
+    inflight: &Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 ) -> Result<(), String> {
     let (Some(planner), Some(roster)) = (planner, roster) else {
-        // 无 Planner 注入 → 不介入（保持确定性原行为）。
+        // 无 Planner 注入 → 不介入（保持确定性原行为）；不触碰单飞守卫（非回归）。
         return Ok(());
     };
 
@@ -1270,11 +1286,25 @@ async fn maybe_replan_on_failure(
         return Ok(()); // task 已被清掉 → 无可 replan 对象。
     };
 
-    let decision = match planner
+    // Task 15（3e）：per-run 单飞——若该 run 已有一个 replan 在飞 → 跳过。
+    // 关键：不在持锁期间 await planner.replan——短临界区 insert，释放锁后再 await
+    // （planner.replan 做 LLM round-trip，跨它持锁会串行化所有 run 的 replan）。
+    {
+        let mut set = inflight.lock().await;
+        if !set.insert(run.id.clone()) {
+            // 已有在飞 replan → 跳过（单飞）。
+            return Ok(());
+        }
+    }
+
+    // 执行 replan（持锁外）。把 Ok/Err 两臂结果先绑到 result，最后统一 remove slot。
+    // 注意：原 Err 臂是 `return Ok(())`（早返回）；这里改成 `Ok(())` 绑给 result，
+    // 让 remove 必然执行——语义不变（replan Err → 写 escalation + 返回 Ok）。
+    let result = match planner
         .replan(&run, &task, failure_reason, roster, repo_root)
         .await
     {
-        Ok(d) => d,
+        Ok(d) => apply_replan_decision(store, &run.id, failed_task_id, d),
         Err(e) => {
             // replan 自身失败：写一条 escalation 让人工介入，但不动 task 状态。
             let _ = write_escalation(
@@ -1283,11 +1313,17 @@ async fn maybe_replan_on_failure(
                 failed_task_id,
                 &format!("planner replan failed: {e}"),
             );
-            return Ok(());
+            Ok(())
         }
     };
 
-    apply_replan_decision(store, &run.id, failed_task_id, decision)
+    // 单飞释放：移除 run_id，让后续 circuit-break 可再次 replan（remove 语义不可漏）。
+    {
+        let mut set = inflight.lock().await;
+        set.remove(&run.id);
+    }
+
+    result
 }
 
 /// 应用 replan 决策：根据 [`ReplanAction`] 修改 task / run / 写消息。
@@ -2408,6 +2444,232 @@ mod tests {
             updated.model, "glm-5.2",
             "Reassign 必须真正更新 task.assignment 的 model"
         );
+    }
+
+    // =========================================================================
+    // Task 15（3e）—— per-run 单飞：并发熔断同一 run 只触发一次 replan
+    // =========================================================================
+    //
+    // 问题（Task 14 Finding 3）：同一波 circuit-break 中 N 个 watcher 各自独立调
+    // maybe_replan_on_failure → N 次 planner.replan → 重复 Converge 写入。
+    // Task 15 加 per-run 单飞守卫（tokio::sync::Mutex<HashSet<run_id>>）：
+    //   * 进入时 insert(run_id)；已存在 → 跳过（return Ok，不重复 replan）。
+    //   * 结束时 remove(run_id)（释放 slot，让后续 circuit-break 可再次 replan）。
+    //   * 短临界区：持锁只做 insert/remove，不跨 planner.replan().await 持锁。
+    //
+    // 测试难点：要触发「真正并发」的两个 maybe_replan_on_failure。MockRuntime 的
+    // start/send 都同步返回（无 Pending 点），tokio::join! 下第一个调用可能在第二个
+    // 被调度前就跑完整个 replan → slot 已释放 → 第二个 insert 成功 → 两次都 replan，
+    // 测不到单飞。解决：用 YieldingMockRuntime——start/send 各 yield_now 一次，
+    // 迫使第一个调用在 planner.replan 内部 park（此时它已 insert run_id 持 slot），
+    // 给第二个调用机会检查守卫 → 命中「已存在」→ 短路返回。
+
+    /// 在 start / send 各 yield 一次的 mock runtime——专为单飞并发测试设计，
+    /// 保证并发的两个 maybe_replan_on_failure 真正交错（否则 fast mock 会让
+    /// 第一个调用在第二个被调度前跑完，测不到单飞）。事件分发语义同 MockRuntime。
+    struct YieldingMockRuntime {
+        events: std::sync::Mutex<ProgrammedEvents>,
+    }
+
+    impl YieldingMockRuntime {
+        fn new() -> Self {
+            Self {
+                events: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+
+        /// 给通配 `*` 编程（任意 agent_id 的 send 都匹配）。
+        fn program_wildcard(&self, events: Vec<AgentEvent>) {
+            self.events
+                .lock()
+                .unwrap()
+                .insert("*".to_string(), events);
+        }
+    }
+
+    #[async_trait]
+    impl AgentRuntime for YieldingMockRuntime {
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities {
+                structured_events: true,
+                supports_resume: false,
+                supports_permission_prompt: false,
+            }
+        }
+
+        async fn start(&self, spec: RuntimeStartSpec) -> Result<AgentHandle, RuntimeError> {
+            // 关键：yield 一次，让并发的另一个 maybe_replan_on_failure 在本调用
+            // 已 insert(run_id) 持 slot 后、仍 park 在 planner.replan 内时被调度。
+            tokio::task::yield_now().await;
+            Ok(AgentHandle {
+                agent_id: spec.agent_id,
+            })
+        }
+
+        async fn send(
+            &self,
+            handle: &AgentHandle,
+            _prompt: String,
+        ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, RuntimeError> {
+            // 再 yield 一次——planner.replan 在 start→send 之间有解析逻辑，
+            // 多一个 yield 点让交错更稳。
+            tokio::task::yield_now().await;
+            let (tx, rx) = mpsc::unbounded_channel();
+            let mut map = self.events.lock().unwrap();
+            let key = if map.contains_key(&handle.agent_id) {
+                handle.agent_id.clone()
+            } else {
+                "*".to_string()
+            };
+            if let Some(ev_list) = map.remove(&key) {
+                for ev in ev_list {
+                    let _ = tx.send(ev);
+                }
+            }
+            drop(tx);
+            Ok(rx)
+        }
+
+        async fn abort(&self, _handle: &AgentHandle) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn liveness(&self, _handle: &AgentHandle) -> Liveness {
+            Liveness::Alive
+        }
+
+        async fn stop(&self, _handle: &AgentHandle) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+    }
+
+    /// Task 15 RED：对同一 run 并发两次 maybe_replan_on_failure，断言
+    ///   * task 被重置回 Ready（其中一个 replan 成功应用 retry）。
+    ///   * 无 "planner replan failed" escalation——单飞让第二个调用短路，
+    ///     不触发 planner.replan 的空 receiver 错误。
+    ///
+    /// 无单飞时：两次都进 planner.replan，第一次 drain 通配（Ok），第二次拿到空
+    /// receiver → Err → 写 "planner replan failed" escalation → 断言 2 失败（RED）。
+    /// 有单飞时：第一次 insert(run_id) 后 park 在 planner.replan 内（YieldingMockRuntime
+    /// 的 yield）；第二次命中「已存在」→ 直接返回 Ok，不碰 planner → 无 escalation（GREEN）。
+    #[tokio::test]
+    async fn concurrent_replans_for_same_run_are_single_flight() {
+        let fx = Fixture::new();
+        fx.create_task("R", "risky work", vec![]);
+        // 必须 create_run：replan 需要 store.get_active_run() 返回 Some。
+        let _run = fx
+            .store
+            .create_run("risky goal", COORDINATOR_HANDLE, 5)
+            .unwrap();
+
+        // 用 YieldingMockRuntime 构造 Planner（不经过 Coordinator，直接调自由函数）。
+        // 保留具体类型 Arc<YieldingMockRuntime> 以便调 program_wildcard；
+        // Planner::new 需要 Arc<dyn AgentRuntime>，单独 clone 一份。
+        let yielding_mock = Arc::new(YieldingMockRuntime::new());
+        // 通配只编程一次 replan 响应（retry 决策）。若第二次 replan 被调 → 拿到空
+        // receiver → planner.replan Err → 写 "planner replan failed" escalation。
+        yielding_mock.program_wildcard(text_deltas_then_done_replan(
+            r#"{"decision":"retry","reason":"瞬时错误"}"#,
+        ));
+        let yielding_rt: Arc<dyn AgentRuntime> = yielding_mock.clone();
+        let planner = Arc::new(Planner::new(yielding_rt));
+        let roster = coord_test_roster();
+        let inflight = Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
+
+        // 两次并发调 maybe_replan_on_failure（同 active run → 同 run_id 单飞 key）。
+        let (r1, r2) = tokio::join!(
+            maybe_replan_on_failure(
+                &fx.store,
+                Some(&planner),
+                Some(&roster),
+                &fx.repo_root,
+                "R",
+                "boom",
+                &inflight,
+            ),
+            maybe_replan_on_failure(
+                &fx.store,
+                Some(&planner),
+                Some(&roster),
+                &fx.repo_root,
+                "R",
+                "boom",
+                &inflight,
+            ),
+        );
+        r1.expect("第一个 replan 应成功");
+        r2.expect("第二个 replan 应 Ok（单飞短路也返回 Ok）");
+
+        // 断言 1：task 被重置回 Ready（成功的那次 replan 应用了 retry 决策）。
+        let r_final = fx.store.get_task("R").unwrap().unwrap();
+        assert_eq!(
+            r_final.status,
+            TaskStatus::Ready,
+            "单飞下应有一次 replan 成功 → task 从 Failed 重置回 Ready"
+        );
+
+        // 断言 2（核心）：无 "planner replan failed" escalation。
+        // 无单飞时第二个 replan 拿到空 receiver → Err → 写此 escalation（RED 在此失败）。
+        // 有单飞时第二个调用短路，不触发 planner.replan → 无此 escalation（GREEN）。
+        let inbox = fx
+            .store
+            .list_inbox(COORDINATOR_HANDLE, InboxFilter { unread_only: false })
+            .unwrap();
+        let has_replan_fail = inbox.iter().any(|m| {
+            m.kind == MessageType::Escalation && m.body.contains("planner replan failed")
+        });
+        assert!(
+            !has_replan_fail,
+            "单飞应阻止第二个 replan 触发空 receiver 错误；inbox={inbox:?}"
+        );
+
+        // 断言 3：单飞 slot 已释放（remove 在 replan 结束后被调）。
+        // 后续 circuit-break 可再次 replan——验证 remove 语义未被遗漏。
+        {
+            let set = inflight.lock().await;
+            assert!(
+                set.is_empty(),
+                "replan 结束后单飞 slot 应已 remove（set 为空）；got {set:?}"
+            );
+        }
+    }
+
+    /// Task 15 守卫单元测试：直接验证 HashSet 单飞语义（insert/remove 机制），
+    /// 与并发集成测试互补——前者证明机制正确，后者证明接线正确。
+    #[tokio::test]
+    async fn single_flight_guard_insert_twice_second_returns_false() {
+        let inflight = Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ));
+        let key = "run_abc".to_string();
+
+        // 首次 insert → 成功。
+        {
+            let mut set = inflight.lock().await;
+            assert!(
+                set.insert(key.clone()),
+                "首次 insert 同一 run_id 应返回 true"
+            );
+        }
+        // 第二次 insert 同 key → false（单飞：已有在飞 replan）。
+        {
+            let mut set = inflight.lock().await;
+            assert!(
+                !set.insert(key.clone()),
+                "第二次 insert 同一 run_id 应返回 false（单飞）"
+            );
+        }
+        // remove 后再次 insert → 成功（slot 已释放，后续 circuit-break 可再 replan）。
+        {
+            let mut set = inflight.lock().await;
+            set.remove(&key);
+            assert!(
+                set.insert(key.clone()),
+                "remove 后再次 insert 应返回 true（slot 已释放）"
+            );
+        }
     }
 
     // ===== Case 6: 非回归——planner=None 走原路径（直接断言构造可能） =====
