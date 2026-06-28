@@ -87,8 +87,22 @@ const KEY_MODEL: &str = "model";
 
 /// replan 响应的 `decision` 键。
 const KEY_DECISION: &str = "decision";
-/// replan 响应的 `reason` 键。
+/// replan 响应的 `reason` 键（judge 也复用此键）。
 const KEY_REASON: &str = "reason";
+
+// —— judge（Task 16 / 3f）JSON 键 —— camelCase 边界（对齐 brief 契约）——
+/// judge 响应的 `winnerIndex` 键（`winner_index` → `winnerIndex`）。
+const KEY_WINNER_INDEX: &str = "winnerIndex";
+/// judge 响应的 `scores` 键。
+const KEY_SCORES: &str = "scores";
+/// judge 提示里候选列表的 `candidates` 键。
+const KEY_CANDIDATES: &str = "candidates";
+/// judge 候选对象的 `summary` 键。
+const KEY_SUMMARY: &str = "summary";
+/// judge 候选对象的 `index` 键。
+const KEY_INDEX: &str = "index";
+/// judge 候选对象的 `label` 键。
+const KEY_LABEL: &str = "label";
 
 /// RuntimeKind::Sdk 对应的默认 tool 标识（Planner 按 runtime 自动选 tool，不让模型指定）。
 const DEFAULT_SDK_TOOL: &str = "claude-sdk";
@@ -178,6 +192,45 @@ pub struct ReplanDecision {
     pub reason: String,
     /// 仅 `decision = Reassign` 时必需；其它动作可缺省。
     pub assignment: Option<AgentAssignment>,
+}
+
+// =============================================================================
+// Judge 类型（Task 16 / 3f）—— 多候选产物打分选优
+// =============================================================================
+
+/// Task 16（3f）：LLM-judge 对多候选产物打分选优的判定结果。
+///
+/// `winner_index` 指向 [`JudgeCandidate::index`]；`scores` 长度等于候选数量，
+/// 每个分数由模型给出（约定 [0,1] 区间，解析层不做区间强校验）；`reason` 是模型的简短解释。
+///
+/// JSON 边界使用 camelCase（`winner_index` → `winnerIndex`），对齐 brief 契约。
+///
+/// 注：`scores` 用 `f64`（serde 反序列化 JSON 数字的天然类型），而非 brief 提示的 `f32`——
+/// 避免 f64→f32 截断的二次转换，分数比较与序列化都更稳。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JudgeVerdict {
+    /// 选中的候选序号（0-based，与 [`JudgeCandidate::index`] 对齐）。
+    pub winner_index: usize,
+    /// 每个候选的分数（长度 == 候选数量）。
+    pub scores: Vec<f64>,
+    /// 模型给出的简短解释。
+    pub reason: String,
+}
+
+/// Judge 候选（fan-out 产物）。由 Coordinator（未来任务）从多个 worker 产出里汇总而来。
+///
+/// 故意保持最小：`index` + `label` + `summary`。judge 提示把这三项逐条列给模型，
+/// 模型据此对每个候选打分并选出 winner。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JudgeCandidate {
+    /// 候选序号（0-based），与 [`JudgeVerdict::winner_index`] 对齐。
+    pub index: usize,
+    /// 人类可读标签（如 "候选 A"）。
+    pub label: String,
+    /// 候选产物摘要（给 LLM 判分的依据）。
+    pub summary: String,
 }
 
 // =============================================================================
@@ -290,6 +343,76 @@ pub fn build_replan_prompt(run: &CoordinatorRun, failed_task: &Task, result: &st
         assignment = KEY_ASSIGNMENT,
         runtime = KEY_RUNTIME,
         model = KEY_MODEL,
+    )
+}
+
+/// 构造 judge 提示：给定多个候选产物，请 LLM 对每个打分（[0,1]）并选出 winner。
+///
+/// 提示内容：
+///   1. 陈述任务（打分选优）。
+///   2. 逐条列出候选（index + label + summary）。
+///   3. 列出 roster 作为介质上下文（候选由何种 runtime×model 产出，仅供参考）。
+///   4. 用 JSON schema + 示例约束模型只回 `{"winnerIndex":..,"scores":[..],"reason":..}`。
+///
+/// 同样的 `(candidates, roster)` 输入 → 字节级一致输出（无随机性），镜像 [`build_plan_prompt`]。
+pub fn build_judge_prompt(candidates: &[JudgeCandidate], roster: &Roster) -> String {
+    // 候选逐行渲染，每行都对齐 schema 字段名。
+    let mut cand_lines = String::new();
+    for c in candidates {
+        cand_lines.push_str(&format!(
+            "  - {idx_key}={i} | {label_key}={l} | {summary_key}={s}\n",
+            idx_key = KEY_INDEX,
+            i = c.index,
+            label_key = KEY_LABEL,
+            l = c.label,
+            summary_key = KEY_SUMMARY,
+            s = c.summary,
+        ));
+    }
+
+    // roster 介质上下文（与 build_plan_prompt 同构渲染，仅作参考）。
+    let mut roster_lines = String::new();
+    if roster.0.is_empty() {
+        roster_lines.push_str("  (roster 为空)\n");
+    }
+    for entry in &roster.0 {
+        let cost = entry.cost_hint.as_deref().unwrap_or("n/a");
+        roster_lines.push_str(&format!(
+            "  - label={label} | runtime={rt} | model={model} | cost_hint={cost}\n",
+            label = entry.label,
+            rt = entry.runtime.as_str(),
+            model = entry.model,
+            cost = cost,
+        ));
+    }
+
+    format!(
+        r#"你是 Hermes 编排引擎的 Judge。给定多个候选产物，请对每个候选打分（0-1）并选出最优。
+
+# 候选产物
+依次列出每个候选（{index} + {label} + {summary}）：
+{cand_lines}
+# 介质上下文（Roster）
+候选由以下 runtime×model 介质产出，仅供参考（不强制 winner 与介质绑定）：
+{roster_lines}
+# 输出契约（严格）
+- 只输出一个 JSON 对象，不要任何解释文字、不要 markdown 围栏。
+- 顶层结构：
+    {{ "{winner_index}": <int>, "{scores}": [<float>, ...], "{reason}": "<简短解释>" }}
+- {scores} 长度必须等于候选数量；每个分数在 [0, 1] 区间。
+- {winner_index} 必须是 {scores} 中最高分对应的候选 {index}。
+
+# 示例
+{{ "{winner_index}": 1, "{scores}": [0.6, 0.9], "{reason}": "候选 2 覆盖更全" }}
+"#,
+        index = KEY_INDEX,
+        label = KEY_LABEL,
+        summary = KEY_SUMMARY,
+        cand_lines = cand_lines.trim_end(),
+        roster_lines = roster_lines.trim_end(),
+        winner_index = KEY_WINNER_INDEX,
+        scores = KEY_SCORES,
+        reason = KEY_REASON,
     )
 }
 
@@ -584,6 +707,77 @@ pub fn parse_replan_response(text: &str, roster: &Roster) -> Result<ReplanDecisi
 }
 
 // =============================================================================
+// 解析：judge（Task 16 / 3f）
+// =============================================================================
+
+/// judge 响应的 JSON 反序列化中间结构（字段全可选，便于宽容解析）。
+///
+/// `rename_all = "camelCase"`：`winner_index` ← `winnerIndex`（brief 契约）。
+/// `scores` 用 `f64`（serde 天然浮点）；解析成功后原样塞进 [`JudgeVerdict`]。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JudgeResponseDto {
+    winner_index: Option<usize>,
+    scores: Option<Vec<f64>>,
+    reason: Option<String>,
+}
+
+/// 构造确定性 fallback 判定：取第一个候选（winner_index=0），scores 留空，
+/// reason 标明 fallback 原因。agent 失败 / 解析失败 / 校验不过 时统一走这里。
+fn fallback_verdict(reason: impl AsRef<str>) -> JudgeVerdict {
+    JudgeVerdict {
+        winner_index: 0,
+        scores: vec![],
+        reason: format!("fallback: {}", reason.as_ref()),
+    }
+}
+
+/// 解析 judge 响应文本 → [`JudgeVerdict`]。容错解析（复用 [`extract_json_object`]）。
+///
+/// 校验规则（任一不过 → fallback）：
+///   1. 能抠出合法 JSON 对象并反序列化为 [`JudgeResponseDto`]。
+///   2. `winnerIndex < candidates_len`（越界 → fallback）。
+///   3. `scores.len() == candidates_len`（长度不符 → fallback）。
+///
+/// fallback 统一为 `winner_index=0`（取第一个候选）、scores 空、reason="fallback: <原因>"。
+pub fn parse_judge_response(text: &str, candidates_len: usize) -> JudgeVerdict {
+    let json_str = match extract_json_object(text) {
+        Some(s) => s,
+        None => return fallback_verdict("parse failed: 找不到 JSON 对象"),
+    };
+
+    let dto: JudgeResponseDto = match serde_json::from_str(json_str) {
+        Ok(d) => d,
+        Err(e) => return fallback_verdict(&format!("parse failed: {e}")),
+    };
+
+    let winner_index = match dto.winner_index {
+        Some(w) if w < candidates_len => w,
+        _ => {
+            return fallback_verdict(&format!(
+                "parse failed: winnerIndex 越界 (candidates_len={candidates_len})"
+            ))
+        }
+    };
+
+    let scores = match dto.scores {
+        Some(s) if s.len() == candidates_len => s,
+        _ => {
+            return fallback_verdict(&format!(
+                "parse failed: scores 长度不符 (期望 {candidates_len})"
+            ))
+        }
+    };
+
+    let reason = dto.reason.unwrap_or_default();
+    JudgeVerdict {
+        winner_index,
+        scores,
+        reason,
+    }
+}
+
+// =============================================================================
 // 小工具
 // =============================================================================
 
@@ -702,6 +896,59 @@ impl Planner {
         let buffer = collect_text(&mut rx).await?;
 
         parse_replan_response(&buffer, roster)
+    }
+
+    /// Task 16（3f）：对多候选产物打分选优。起 planner agent → 发 `build_judge_prompt`
+    /// → 收敛 TextDelta → 解析。
+    ///
+    /// 与 `plan`/`replan` 同构；区别在于**永远返回 [`JudgeVerdict`]（非 `Result`）**：
+    /// agent 失败 / 解析失败 / 校验不过 时回落到确定性 fallback（winner_index=0），
+    /// 不向上游抛错——fan-out/convergence 调用方据此决定是否接受默认候选。
+    ///
+    /// 空候选列表短路：不起 agent，直接返回 `reason` 标明 "no candidates" 的判定。
+    pub async fn judge(
+        &self,
+        candidates: &[JudgeCandidate],
+        roster: &Roster,
+        repo_root: &Path,
+    ) -> JudgeVerdict {
+        if candidates.is_empty() {
+            return JudgeVerdict {
+                winner_index: 0,
+                scores: vec![],
+                reason: "fallback: no candidates".to_string(),
+            };
+        }
+
+        let prompt = build_judge_prompt(candidates, roster);
+        let agent_id = format!("planner-judge-{}", short_id());
+
+        // 起临时 planner agent：无 worktree，cwd = repo_root（planner 不改代码）。
+        let handle = match self
+            .runtime
+            .start(RuntimeStartSpec {
+                agent_id: agent_id.clone(),
+                cwd: repo_root.to_path_buf(),
+                model: DEFAULT_MODEL.to_string(),
+                provider: DEFAULT_PROVIDER.to_string(),
+            })
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => return fallback_verdict(&format!("agent start failed: {:?}", e)),
+        };
+
+        // 发提示 → 收敛到一段文本；任一环节失败 → fallback。
+        let mut rx = match self.runtime.send(&handle, prompt).await {
+            Ok(r) => r,
+            Err(e) => return fallback_verdict(&format!("agent send failed: {:?}", e)),
+        };
+        let buffer = match collect_text(&mut rx).await {
+            Ok(t) => t,
+            Err(e) => return fallback_verdict(&format!("agent stream: {e}")),
+        };
+
+        parse_judge_response(&buffer, candidates.len())
     }
 }
 
@@ -1274,5 +1521,156 @@ mod tests {
         let text = r#"前缀文本 {"tasks":[{"id":"t1","spec":"x","deps":[],"assignment":{"runtime":"sdk","model":"sonnet"}}]} 后缀"#;
         let tasks = parse_plan_response(text, &roster).expect("无围栏裸 JSON 走括号扫描");
         assert_eq!(tasks.len(), 1);
+    }
+
+    // =========================================================================
+    // Task 16（3f）测试：LLM-judge prompt 构造 + 容错解析 + Planner::judge 驱动
+    // =========================================================================
+
+    /// 测试用候选产物（fan-out 产生的两个候选）。
+    fn sample_candidates() -> Vec<JudgeCandidate> {
+        vec![
+            JudgeCandidate {
+                index: 0,
+                label: "候选 A".to_string(),
+                summary: "覆盖核心逻辑但缺边界测试".to_string(),
+            },
+            JudgeCandidate {
+                index: 1,
+                label: "候选 B".to_string(),
+                summary: "覆盖核心逻辑 + 边界测试 + 文档".to_string(),
+            },
+        ]
+    }
+
+    // ===== Judge Case 1: build_judge_prompt 含每个候选 + JSON schema =====
+    #[test]
+    fn build_judge_prompt_contains_candidates_and_schema() {
+        let roster = sample_roster();
+        let candidates = sample_candidates();
+        let prompt = build_judge_prompt(&candidates, &roster);
+
+        for c in &candidates {
+            assert!(
+                prompt.contains(&c.label),
+                "prompt 必须包含候选 label: {}",
+                c.label
+            );
+            assert!(
+                prompt.contains(&c.summary),
+                "prompt 必须包含候选 summary: {}",
+                c.summary
+            );
+        }
+        // JSON schema 关键键（camelCase 边界）。
+        assert!(prompt.contains("winnerIndex"), "prompt 必须声明 winnerIndex 键");
+        assert!(prompt.contains("scores"), "prompt 必须声明 scores 键");
+        assert!(prompt.contains("reason"), "prompt 必须声明 reason 键");
+    }
+
+    // ===== Judge Case 2: 干净 JSON → 正确 JudgeVerdict =====
+    #[test]
+    fn parse_judge_response_clean_json() {
+        let text = r#"{"winnerIndex":1,"scores":[0.6,0.9],"reason":"cand 2 better"}"#;
+        let v = parse_judge_response(text, 2);
+        assert_eq!(v.winner_index, 1);
+        assert_eq!(v.scores, vec![0.6, 0.9]);
+        assert_eq!(v.reason, "cand 2 better");
+    }
+
+    // ===== Judge Case 3: 畸形文本 → 回落确定性（winner=0, scores 空, reason 含 fallback） =====
+    #[test]
+    fn parse_judge_response_malformed_falls_back() {
+        let v = parse_judge_response("这里是自然语言，没有完整 JSON 对象", 2);
+        assert_eq!(v.winner_index, 0, "fallback 取第一个候选");
+        assert!(v.scores.is_empty(), "fallback scores 为空");
+        assert!(
+            v.reason.contains("fallback"),
+            "reason 应标明 fallback, got: {}",
+            v.reason
+        );
+    }
+
+    // ===== Judge Case 4: winnerIndex 越界 → fallback =====
+    #[test]
+    fn parse_judge_response_winner_out_of_range_falls_back() {
+        // candidates_len=2，winnerIndex=5 越界。
+        let text = r#"{"winnerIndex":5,"scores":[0.6,0.9]}"#;
+        let v = parse_judge_response(text, 2);
+        assert_eq!(v.winner_index, 0);
+        assert!(v.scores.is_empty());
+        assert!(v.reason.contains("fallback"), "got: {}", v.reason);
+    }
+
+    // ===== Judge Case 5: scores 长度与候选数不符 → fallback =====
+    #[test]
+    fn parse_judge_response_scores_length_mismatch_falls_back() {
+        // candidates_len=2，scores 只有 1 个。
+        let text = r#"{"winnerIndex":0,"scores":[0.6]}"#;
+        let v = parse_judge_response(text, 2);
+        assert_eq!(v.winner_index, 0);
+        assert!(v.scores.is_empty());
+        assert!(v.reason.contains("fallback"), "got: {}", v.reason);
+    }
+
+    // ===== Judge Case 6: judge JSON 被 ```json 围栏 + prose 包裹 → 仍能解析（复用 extract_json_object） =====
+    #[test]
+    fn parse_judge_response_tolerates_fences() {
+        let text = "Sure, judging...\n```json\n{\"winnerIndex\":0,\"scores\":[0.8,0.5],\"reason\":\"cand 1 稳\"}\n```\nLet me know!";
+        let v = parse_judge_response(text, 2);
+        assert_eq!(v.winner_index, 0);
+        assert_eq!(v.scores, vec![0.8, 0.5]);
+        assert_eq!(v.reason, "cand 1 稳");
+    }
+
+    // ===== Judge Case 7: Planner::judge with mock → 期望的 JudgeVerdict =====
+    #[tokio::test]
+    async fn planner_judge_with_mock_returns_verdict() {
+        let (planner, runtime, repo_root) = planner_with_mock();
+        let roster = sample_roster();
+        let candidates = sample_candidates();
+        let judge_json =
+            r#"{"winnerIndex":1,"scores":[0.6,0.9],"reason":"候选 2 覆盖更全"}"#;
+        runtime.program("*", text_deltas_then_done(judge_json));
+
+        let verdict = planner.judge(&candidates, &roster, &repo_root).await;
+        assert_eq!(verdict.winner_index, 1);
+        assert_eq!(verdict.scores, vec![0.6, 0.9]);
+        assert_eq!(verdict.reason, "候选 2 覆盖更全");
+    }
+
+    // ===== Judge Case 8: Planner::judge 当 mock emit Failed → 回落确定性 JudgeVerdict =====
+    #[tokio::test]
+    async fn planner_judge_agent_failure_falls_back() {
+        let (planner, runtime, repo_root) = planner_with_mock();
+        let roster = sample_roster();
+        let candidates = sample_candidates();
+        runtime.program(
+            "*",
+            vec![AgentEvent::Failed {
+                error: "model overloaded".to_string(),
+            }],
+        );
+
+        let verdict = planner.judge(&candidates, &roster, &repo_root).await;
+        assert_eq!(verdict.winner_index, 0, "agent 失败 → fallback 取第一个候选");
+        assert!(verdict.scores.is_empty(), "fallback scores 为空");
+        assert!(
+            verdict.reason.contains("fallback"),
+            "reason 应标明 fallback, got: {}",
+            verdict.reason
+        );
+    }
+
+    // ===== Judge Case 9: 空候选列表 → 直接返回确定性结果（无需起 agent） =====
+    #[tokio::test]
+    async fn planner_judge_empty_candidates_short_circuits() {
+        let (planner, _runtime, repo_root) = planner_with_mock();
+        let roster = sample_roster();
+        // 不 program 任何事件——空候选应短路，不触发 agent。
+        let verdict = planner.judge(&[], &roster, &repo_root).await;
+        assert_eq!(verdict.winner_index, 0);
+        assert!(verdict.scores.is_empty());
+        assert!(verdict.reason.contains("no candidates"), "got: {}", verdict.reason);
     }
 }
