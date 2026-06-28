@@ -608,12 +608,9 @@ fn now_iso() -> String {
 //   * [`Planner::replan`]：失败后决策。
 // 其余 Coordinator 循环（派发 / 收敛 / 熔断 / 心跳）全部确定性——Planner 不碰。
 
-/// 默认 planner provider（对齐 Coordinator 的 [`DEFAULT_PROVIDER`](crate::hermes::coordinator::DEFAULT_PROVIDER)）。
-/// 注：Phase 2 只有 Claude SDK 一种介质；Phase 3 才有 Codex/Gemini 等多 provider。
-const DEFAULT_PROVIDER: &str = "claude";
-
-/// 默认 planner 模型（对齐 Coordinator 的 DEFAULT_MODEL）。
-const DEFAULT_MODEL: &str = "sonnet";
+/// 默认 planner provider / model：复用 Coordinator 的常量，避免两份漂移。
+/// （Phase 2 只有 Claude SDK 一种介质；Phase 3 才有 Codex/Gemini 等多 provider。）
+use crate::hermes::coordinator::{DEFAULT_MODEL, DEFAULT_PROVIDER};
 
 /// Planner 驱动器：经 [`AgentRuntime`] 起临时 planner agent，发提示并解析响应。
 ///

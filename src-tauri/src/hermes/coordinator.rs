@@ -25,8 +25,8 @@ use crate::hermes::planner::{Planner, ReplanAction, ReplanDecision, Roster};
 use crate::hermes::runtime::{AgentEvent, AgentRuntime, RuntimeStartSpec};
 use crate::hermes::store::{InboxFilter, Store, TaskListFilter};
 use crate::hermes::types::{
-    CoordinatorRun, DispatchContext, DispatchStatus, Message, MessageType, RunStatus, Task,
-    TaskStatus,
+    AgentAssignment, CoordinatorRun, DispatchContext, DispatchStatus, Message, MessageType,
+    RunStatus, Task, TaskStatus,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -55,8 +55,11 @@ const MAX_CONCURRENT_DEFAULT: usize = 4;
 const DEFAULT_POLL_MS: u64 = 2000;
 
 /// 默认模型 / provider（task.assignment 缺省时使用）。
-const DEFAULT_MODEL: &str = "sonnet";
-const DEFAULT_PROVIDER: &str = "claude";
+///
+/// `pub(crate)` 是为了让 [`Planner`](crate::hermes::planner::Planner) 复用同一份默认值，
+/// 避免 planner 模块各自再复制一份导致漂移（Phase 2 单介质只有 Claude SDK 一项）。
+pub(crate) const DEFAULT_MODEL: &str = "sonnet";
+pub(crate) const DEFAULT_PROVIDER: &str = "claude";
 
 // =============================================================================
 // TickOutcome
@@ -815,6 +818,12 @@ fn fail_dispatch_with_cascade(
 ///
 /// 注：replan 失败（planner 自身 Err）保守地不动 task 状态（保留 Failed），
 ///     让 Coordinator 在下一轮自然收敛判定为 Failed run。
+///
+/// 并发说明（Task 14 Finding 3）：并发熔断会触发多次并发 replan——
+/// N 个 watcher 在同一波 circuit-break 中各自独立调 `planner.replan`，每个都可能
+/// 把 Converge→Completed。Phase 2 是**尽力而为**：熔断本身罕见，且 replan 都走
+/// 同一 SQLite 串行写锁，状态最终一致；但**不做 single-flight 串行化**，
+/// 多次 Converge 会被重复写入（`update_run` 幂等）。Phase 3 再加 single-flight。
 async fn maybe_replan_on_failure(
     store: &Store,
     planner: Option<&Arc<Planner>>,
@@ -867,14 +876,16 @@ fn apply_replan_decision(
     match decision.decision {
         ReplanAction::Retry => {
             // 重置 task → Ready（下轮 tick 重派；dispatch_one 会 carry-forward failure_count）。
+            // result 通过 update_task_status 的 COALESCE(?2, result) 保留——
+            // 先前 circuit-breaker 写入的失败 result 不会被 None 清空（Task 14 Finding 2）。
             store.update_task_status(task_id, TaskStatus::Ready, None)?;
         }
         ReplanAction::Reassign => {
-            // 换 assignment：若有新 assignment，先更新（Store 暂无 update_task_assignment，
-            // 通过先删后建模拟；YAGNI——Phase 2 只读路径用，留待将来扩 API）。
-            // 此处保守做法：若有 assignment，把它写进 result 字段供排障，task 重置 Ready。
-            // （真正落地 reassign 需要 Store 扩 API，但 Phase 2 mock 测试只关心 Ready 重置。）
+            // 换 assignment（Task 14 Finding 1：让 Reassign 真正生效）。
+            // 若 decision 带 assignment → 先写库（Store::update_task_assignment 用 JSON
+            // TEXT 覆盖 task.assignment），再重置 Ready；assignment=None 时退化为 Retry。
             if let Some(a) = &decision.assignment {
+                store.update_task_assignment(task_id, a)?;
                 let note = format!(
                     "replan reassigned to runtime={} tool={} model={}",
                     a.runtime.as_str(),
@@ -1800,6 +1811,83 @@ mod tests {
         assert!(
             inbox.iter().any(|m| m.kind == MessageType::Escalation),
             "Escalate 决策应写一条 escalation 消息到 coordinator inbox"
+        );
+    }
+
+    // ===== Case 5c: 失败熔断 → replan(Reassign) → assignment 被更新 + task 回 Ready =====
+    //
+    // Task 14 Finding 1 回归：Reassign 必须真正修改 task.assignment（不能只是把
+    // 任务退回 Ready），否则 Reassign 在行为上等价于 Retry。此用例预置一个
+    // assignment=(sdk, sonnet) 的任务，让 planner 回放 reassign→(cli, glm-5.2)，
+    // 断言任务最终 assignment 已被替换且 status=Ready。
+    #[tokio::test]
+    async fn coordinator_with_planner_replan_reassign_updates_assignment() {
+        let fx = Fixture::new();
+        // 预创建一个带初始 assignment 的 task。
+        let mut t = Task {
+            id: "A".to_string(),
+            parent_id: None,
+            spec: "needs a different runtime".to_string(),
+            status: TaskStatus::Pending,
+            deps: vec![],
+            result: None,
+            assignment: Some(AgentAssignment {
+                runtime: RuntimeKind::Sdk,
+                tool: "claude-sdk".to_string(),
+                model: "sonnet".to_string(),
+            }),
+            created_at: "2026-06-28T00:00:00Z".to_string(),
+            completed_at: None,
+        };
+        fx.store.create_task(t.clone()).unwrap();
+
+        let _run = fx
+            .store
+            .create_run("reassign goal", COORDINATOR_HANDLE, 5)
+            .unwrap();
+
+        // planner 回放 reassign → (cli, glm-5.2)。
+        let replan_json = r#"{"decision":"reassign","reason":"sonnet 不稳","assignment":{"runtime":"cli","model":"glm-5.2"}}"#;
+        fx.runtime
+            .program_wildcard(text_deltas_then_done_replan(replan_json));
+
+        let coord = fx.coordinator_with_planner("reassign goal");
+
+        // 3 次失败熔断。
+        for i in 1..=3 {
+            fx.program(
+                "A",
+                vec![AgentEvent::Failed {
+                    error: format!("boom-{i}"),
+                }],
+            );
+            let _o = coord.tick().await.unwrap();
+            fx.yield_for_watchers().await;
+            if i == 3 {
+                for _ in 0..32 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+
+        let a_final = fx.store.get_task("A").unwrap().unwrap();
+        assert_eq!(
+            a_final.status,
+            TaskStatus::Ready,
+            "Reassign 决策应把 task 重置回 Ready"
+        );
+        let updated = a_final
+            .assignment
+            .as_ref()
+            .expect("assignment present after reassign");
+        assert_eq!(
+            updated.runtime,
+            RuntimeKind::Cli,
+            "Reassign 必须真正更新 task.assignment 的 runtime"
+        );
+        assert_eq!(
+            updated.model, "glm-5.2",
+            "Reassign 必须真正更新 task.assignment 的 model"
         );
     }
 

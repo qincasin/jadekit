@@ -507,6 +507,8 @@ impl Store {
         let updated = tx
             .execute(
                 // M1: result 用 COALESCE(?, result) —— None 不覆盖既有值。
+                // 因此 Coordinator 在 Retry 路径调用 update_task_status(id, Ready, None)
+                // 时，先前 circuit-breaker 写入的失败 result 会被保留（Finding 2 验证）。
                 "UPDATE tasks SET status = ?1,
                                       result = COALESCE(?2, result),
                                       completed_at = COALESCE(?3, completed_at)
@@ -520,6 +522,31 @@ impl Store {
         // 完成后立即提升下游 pending 任务（同事务）。
         if matches!(new_status, TaskStatus::Completed) {
             Self::promote_ready_tasks_in_tx(tx, id)?;
+        }
+        Ok(())
+    }
+
+    /// 更新 task 的 assignment（Phase 2 Task 14 Finding 1：让 Reassign 真正生效）。
+    ///
+    /// 与 [`Store::create_task`] 写入 assignment 时一致——JSON TEXT 序列化。
+    /// 不动 status / result / completed_at（reassign 的语义是「换兵」，状态变化由
+    /// 调用方在前后用 [`Store::update_task_status`] 控制）。
+    pub fn update_task_assignment(
+        &self,
+        task_id: &str,
+        assignment: &AgentAssignment,
+    ) -> Result<(), String> {
+        let json = serde_json::to_string(assignment)
+            .map_err(|e| format!("Failed to serialize assignment: {e}"))?;
+        let conn = lock_conn!(self.conn);
+        let updated = conn
+            .execute(
+                "UPDATE tasks SET assignment = ?1 WHERE id = ?2",
+                params![json, task_id],
+            )
+            .map_err(|e| format!("UPDATE tasks.assignment failed: {e}"))?;
+        if updated == 0 {
+            return Err(format!("Task not found: {task_id}"));
         }
         Ok(())
     }
@@ -1889,6 +1916,70 @@ mod tests {
             got2.result.as_deref(),
             Some("result-text"),
             "None must not clobber existing result"
+        );
+    }
+
+    /// T7 (Task 14 Finding 1): update_task_assignment 把新 assignment 写入 task。
+    #[test]
+    fn update_task_assignment_overwrites() {
+        let store = Store::open_in_memory().unwrap();
+        // 用带初始 assignment 的 task。
+        let mut t = sample_task("asg", vec![]);
+        t.assignment = Some(AgentAssignment {
+            runtime: RuntimeKind::Sdk,
+            tool: "claude-sdk".to_string(),
+            model: "sonnet".to_string(),
+        });
+        store.create_task(t).unwrap();
+
+        // 回读确认初始值。
+        let before = store.get_task("asg").unwrap().unwrap();
+        assert_eq!(before.assignment.as_ref().unwrap().model, "sonnet");
+
+        // 换兵：runtime=cli, model=glm-5.2。
+        let new_assignment = AgentAssignment {
+            runtime: RuntimeKind::Cli,
+            tool: "claude-cli".to_string(),
+            model: "glm-5.2".to_string(),
+        };
+        store.update_task_assignment("asg", &new_assignment).unwrap();
+
+        let after = store.get_task("asg").unwrap().unwrap();
+        let a = after.assignment.expect("assignment present after update");
+        assert_eq!(a.runtime, RuntimeKind::Cli);
+        assert_eq!(a.tool, "claude-cli");
+        assert_eq!(a.model, "glm-5.2");
+
+        // 找不到 task → Err。
+        let err = store.update_task_assignment("missing", &new_assignment);
+        assert!(err.is_err(), "update_task_assignment on missing task errors");
+    }
+
+    /// T8 (Task 14 Finding 2 回归): Retry 的 update_task_status(Ready, None)
+    /// 不清空先前 circuit-breaker 写入的失败 result——SQL 用 COALESCE 保留。
+    #[test]
+    fn retry_preserves_circuit_broken_result() {
+        let store = Store::open_in_memory().unwrap();
+        store.create_task(sample_task("cb", vec![])).unwrap();
+
+        // 模拟失败 → Failed + 失败 result。
+        store
+            .update_task_status("cb", TaskStatus::Failed, Some("circuit broken: 3 fails"))
+            .unwrap();
+        let failed = store.get_task("cb").unwrap().unwrap();
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.result.as_deref(), Some("circuit broken: 3 fails"));
+
+        // Coordinator Retry 路径：update_task_status(Ready, None)。
+        store
+            .update_task_status("cb", TaskStatus::Ready, None)
+            .unwrap();
+        let retried = store.get_task("cb").unwrap().unwrap();
+        assert_eq!(retried.status, TaskStatus::Ready);
+        assert_eq!(
+            retried.result.as_deref(),
+            Some("circuit broken: 3 fails"),
+            "Retry(Ready, None) 必须保留失败的 result（COALESCE 语义，Finding 2）"
         );
     }
 }
