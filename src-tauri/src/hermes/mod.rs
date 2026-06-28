@@ -7,6 +7,7 @@ pub mod cli_runtime;
 pub mod coordinator;
 pub mod events;
 pub mod planner;
+pub mod run_lifecycle;
 pub mod runtime;
 pub mod runtime_registry;
 pub mod sdk_runtime;
@@ -33,3 +34,4 @@ pub use planner::{
     build_plan_prompt, build_replan_prompt, parse_plan_response, parse_replan_response,
     Planner, ReplanAction, ReplanDecision, Roster, RosterEntry,
 };
+pub use run_lifecycle::{decide_disposition, WorktreeCleanupInput, WorktreeDisposition};
