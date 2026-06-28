@@ -106,6 +106,19 @@ impl WorktreeManager {
         Ok(!out.trim().is_empty())
     }
 
+    /// 该 worktree 相对 base_branch 是否有领先提交（有产出）。
+    /// `git -C <worktree> rev-list --count <base>..HEAD` > 0。
+    /// Task 13（3d）：sweep_run_worktrees 用它判断 Completed task 是否有产出 → RetainForReview。
+    pub fn has_commits_ahead(worktree_path: &Path, base_branch: &str) -> Result<bool, String> {
+        // rev-list --count base..HEAD：HEAD 领先 base 的提交数。0=无产出。
+        // worktree_path 作为 run() 的 repo_root 参数（与 has_uncommitted_changes 同模式），
+        // 让 git 在 worktree 目录里执行；<base>..HEAD 在同一 repo 的任意 worktree 均可解析。
+        let range = format!("{base_branch}..HEAD");
+        let out = Self::run(worktree_path, &["rev-list", "--count", &range])?;
+        let count: u64 = out.trim().parse().unwrap_or(0);
+        Ok(count > 0)
+    }
+
     /// 相对 HEAD 的改动摘要（含已跟踪文件改动；解析 `git diff --shortstat`）。
     pub fn diff_summary(worktree_path: &Path) -> Result<DiffSummary, String> {
         // 把未跟踪文件登记为 intent-to-add，使其纳入 `git diff` 统计；读完即还原。
@@ -267,6 +280,40 @@ mod tests {
         let s = WorktreeManager::diff_summary(&info.path).unwrap();
         assert!(s.files_changed >= 1, "未跟踪新文件应计入 files_changed");
         assert!(s.insertions >= 2, "未跟踪新文件行数应计入 insertions");
+    }
+
+    #[test]
+    fn has_commits_ahead_detects_commits_past_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        // 捕获默认分支名（main / master 跨系统不一），作为 worktree 的 base。
+        let base = String::from_utf8_lossy(
+            &Command::new("git")
+                .current_dir(&repo)
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let wts = tmp.path().join("worktrees");
+
+        // 干净 worktree（无领先提交）→ false。
+        let clean = WorktreeManager::create(&repo, &wts, "ahead-clean").unwrap();
+        assert!(
+            !WorktreeManager::has_commits_ahead(&clean.path, &base).unwrap(),
+            "新建未提交的 worktree 不应领先 base"
+        );
+
+        // 在 worktree 里 commit 一次 → 领先 base → true。
+        commit_file(&clean.path, "feat.txt", "done", "feat");
+        assert!(
+            WorktreeManager::has_commits_ahead(&clean.path, &base).unwrap(),
+            "worktree 提交后应领先 base"
+        );
     }
 
     #[test]

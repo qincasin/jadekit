@@ -14,6 +14,14 @@
 //! （保守保留中间产物，不丢用户可能想要的工作）。
 
 use crate::hermes::types::TaskStatus;
+use std::path::Path;
+use crate::chat::{WorktreeManager, HELM_BRANCH_PREFIX};
+use crate::hermes::events::{OrchestrationEvent, OrchestrationEventSink};
+use crate::hermes::store::{Store, TaskListFilter};
+
+/// 驾驶舱事件专用的 task 状态 token：worktree 保留待用户 merge/discard。
+/// 非 TaskStatus 枚举值（DB 无此状态）；仅作为 OrchestrationEvent::Task 的 status 字段。
+const TASK_STATUS_AWAITING_MERGE: &str = "awaiting-merge";
 
 /// 单个 worktree 的清理处置（纯决策，不碰 git）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +70,80 @@ pub fn decide_disposition(input: &WorktreeCleanupInput) -> WorktreeDisposition {
         | TaskStatus::Ready
         | TaskStatus::Blocked => WorktreeDisposition::Remove,
     }
+}
+
+/// sweep 结果摘要。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SweepReport {
+    pub removed: usize,
+    pub retained: usize,
+}
+
+/// 收敛后清扫 run 内所有 task 的 worktree（介质无关；用 WorktreeManager 关联函数 + repo_root）。
+///
+/// 流程：枚举 run 内 task → 按 helm/<task_id> 定位其 worktree（WorktreeManager::list）→
+/// 查 has_uncommitted_changes / has_commits_ahead → decide_disposition →
+/// Remove 调 WorktreeManager::remove(force=true)（**删除前再复查 has_uncommitted_changes**，
+/// 意外有改动则降级 RetainForReview，绝不删未保存工作）；RetainForReview 发 Task{awaiting-merge} 事件。
+pub fn sweep_run_worktrees(
+    repo_root: &Path,
+    store: &Store,
+    base_branch: &str,
+    sink: &dyn OrchestrationEventSink,
+    run_id: &str,
+) -> Result<SweepReport, String> {
+    let mut removed = 0usize;
+    let mut retained = 0usize;
+    // 1. 枚举所有 task（TaskListFilter::default 不带过滤，列出全部）。
+    let tasks = store.list_tasks(TaskListFilter::default())?;
+    // 2. 枚举所有 worktree（按分支名 helm/<task_id> 匹配 task）。
+    let worktrees = WorktreeManager::list(repo_root)?;
+    for task in &tasks {
+        let expected_branch = format!("{}{}", HELM_BRANCH_PREFIX, task.id);
+        // 找该 task 的 worktree（按 branch 匹配）。
+        let Some(wt) = worktrees.iter().find(|w| w.branch == expected_branch) else {
+            continue; // 无 worktree（未派发过）→ 跳过。
+        };
+        // 3. 查 has_uncommitted / has_commits_ahead（失败当 false——保守但避免误删）。
+        let has_uncommitted =
+            WorktreeManager::has_uncommitted_changes(&wt.path).unwrap_or(false);
+        let has_commits_ahead =
+            WorktreeManager::has_commits_ahead(&wt.path, base_branch).unwrap_or(false);
+        let input = WorktreeCleanupInput {
+            task_status: task.status,
+            has_uncommitted_changes: has_uncommitted,
+            has_commits_ahead,
+        };
+        let disposition = decide_disposition(&input);
+        match disposition {
+            WorktreeDisposition::Remove => {
+                // 破坏性安全双保险：删除前再复查 has_uncommitted_changes。
+                // 即使纯决策说 Remove（如 Failed），意外有未提交改动则降级 RetainForReview。
+                if WorktreeManager::has_uncommitted_changes(&wt.path).unwrap_or(false) {
+                    sink.emit(OrchestrationEvent::Task {
+                        run_id: run_id.to_string(),
+                        task_id: task.id.clone(),
+                        status: TASK_STATUS_AWAITING_MERGE.to_string(),
+                        dispatch_id: None,
+                    });
+                    retained += 1;
+                } else {
+                    let _ = WorktreeManager::remove(repo_root, &wt.path, true);
+                    removed += 1;
+                }
+            }
+            WorktreeDisposition::RetainForReview => {
+                sink.emit(OrchestrationEvent::Task {
+                    run_id: run_id.to_string(),
+                    task_id: task.id.clone(),
+                    status: TASK_STATUS_AWAITING_MERGE.to_string(),
+                    dispatch_id: None,
+                });
+                retained += 1;
+            }
+        }
+    }
+    Ok(SweepReport { removed, retained })
 }
 
 #[cfg(test)]
@@ -159,5 +241,167 @@ mod tests {
         i.has_uncommitted_changes = true;
         i.has_commits_ahead = true;
         assert_eq!(decide_disposition(&i), WorktreeDisposition::RetainForReview);
+    }
+
+    // ── Task 13：sweep_run_worktrees（真 tempfile git repo，不 mock 关联函数）──
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+    use crate::chat::WorktreeManager;
+    use crate::hermes::events::{OrchestrationEvent, OrchestrationEventSink};
+    use crate::hermes::store::Store;
+    use crate::hermes::types::Task;
+
+    /// 真 git repo 辅助：在 dir 里跑 git，失败即 panic（镜像 worktree.rs::tests）。
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {:?} failed", args);
+    }
+
+    fn init_repo(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.email", "t@t.t"]);
+        git(dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("README.md"), "hi").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "init"]);
+    }
+
+    fn commit_file(dir: &Path, name: &str, content: &str, msg: &str) {
+        std::fs::write(dir.join(name), content).unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", msg]);
+    }
+
+    /// 捕获 repo 当前分支名（git init 默认 main/master 跨系统不一）。
+    fn current_branch(repo: &Path) -> String {
+        String::from_utf8_lossy(
+            &Command::new("git")
+                .current_dir(repo)
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string()
+    }
+
+    /// 收集型 sink：把 emit 的事件收集到 Vec，断言用（镜像 coordinator.rs::tests）。
+    struct CollectSink(Mutex<Vec<OrchestrationEvent>>);
+    impl OrchestrationEventSink for CollectSink {
+        fn emit(&self, ev: OrchestrationEvent) {
+            self.0.lock().unwrap().push(ev);
+        }
+    }
+    impl CollectSink {
+        fn snapshot(&self) -> Vec<OrchestrationEvent> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn sample_task_for_sweep(id: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            parent_id: None,
+            spec: format!("spec for {id}"),
+            status: TaskStatus::Pending, // create_task 会按 deps 推导
+            deps: vec![],
+            result: None,
+            assignment: None,
+            created_at: "2026-06-28T00:00:00Z".to_string(),
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn sweep_run_worktrees_removes_clean_and_retains_with_commits() {
+        // 真 tempfile git repo：task1 = Completed+领先提交 → RetainForReview；
+        // task2 = Failed+干净 → Remove。断言 SweepReport{removed:1, retained:1}。
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let base = current_branch(&repo);
+        let wts_dir = tmp.path().join("worktrees");
+
+        let store = Store::open_in_memory().unwrap();
+
+        // task1 = Completed，建 worktree + commit 一次（领先）→ RetainForReview。
+        store.create_task(sample_task_for_sweep("task1")).unwrap();
+        let wt1 = WorktreeManager::create(&repo, &wts_dir, "task1").unwrap();
+        commit_file(&wt1.path, "feat1.txt", "done", "feat1");
+        store
+            .update_task_status("task1", TaskStatus::Completed, None)
+            .unwrap();
+
+        // task2 = Failed，建 worktree 但保持干净 → Remove。
+        store.create_task(sample_task_for_sweep("task2")).unwrap();
+        let wt2 = WorktreeManager::create(&repo, &wts_dir, "task2").unwrap();
+        store
+            .update_task_status("task2", TaskStatus::Failed, None)
+            .unwrap();
+
+        let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
+        let report =
+            sweep_run_worktrees(&repo, &store, &base, sink.as_ref(), "run_x").unwrap();
+
+        assert_eq!(report, SweepReport { removed: 1, retained: 1 });
+        assert!(wt1.path.exists(), "有产出的 worktree 必须保留");
+        assert!(!wt2.path.exists(), "干净的 Failed worktree 必须删除");
+
+        // 验证事件：一个 awaiting-merge（task1）。
+        let evs = sink.snapshot();
+        let awaiting: Vec<_> = evs
+            .iter()
+            .filter(|e| match e {
+                OrchestrationEvent::Task { status, .. } => {
+                    status.as_str() == TASK_STATUS_AWAITING_MERGE
+                }
+                _ => false,
+            })
+            .collect();
+        assert_eq!(awaiting.len(), 1, "应发一个 awaiting-merge 事件");
+    }
+
+    #[test]
+    fn sweep_downgrades_failed_dirty_worktree_to_retain() {
+        // 破坏性安全双保险：Failed task 但 worktree 意外有未提交改动 → 降级 RetainForReview。
+        // 纯决策对 Failed 一律 Remove，但删除前复查 has_uncommitted_changes 要保留。
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let base = current_branch(&repo);
+        let wts_dir = tmp.path().join("worktrees");
+
+        let store = Store::open_in_memory().unwrap();
+        store.create_task(sample_task_for_sweep("task3")).unwrap();
+        let wt3 = WorktreeManager::create(&repo, &wts_dir, "task3").unwrap();
+        // 意外脏：写未提交文件。
+        std::fs::write(wt3.path.join("uncommitted.txt"), "dirty").unwrap();
+        store
+            .update_task_status("task3", TaskStatus::Failed, None)
+            .unwrap();
+
+        let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
+        let report =
+            sweep_run_worktrees(&repo, &store, &base, sink.as_ref(), "run_y").unwrap();
+
+        assert_eq!(report, SweepReport { removed: 0, retained: 1 });
+        assert!(wt3.path.exists(), "脏 worktree 绝不删（双保险降级）");
+
+        let evs = sink.snapshot();
+        assert!(
+            evs.iter().any(|e| matches!(e,
+                OrchestrationEvent::Task { task_id, status, .. }
+                if task_id == "task3" && status.as_str() == TASK_STATUS_AWAITING_MERGE)),
+            "应发 task3 awaiting-merge 事件"
+        );
     }
 }

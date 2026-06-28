@@ -34,4 +34,6 @@ pub use planner::{
     build_plan_prompt, build_replan_prompt, parse_plan_response, parse_replan_response,
     Planner, ReplanAction, ReplanDecision, Roster, RosterEntry,
 };
-pub use run_lifecycle::{decide_disposition, WorktreeCleanupInput, WorktreeDisposition};
+pub use run_lifecycle::{
+    decide_disposition, sweep_run_worktrees, SweepReport, WorktreeCleanupInput, WorktreeDisposition,
+};
