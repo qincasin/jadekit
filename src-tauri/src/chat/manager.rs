@@ -280,6 +280,25 @@ impl ChatManager {
         });
     }
 
+    /// Hermes 用入口：返回原始 `StreamLine` 接收端，**不** spawn `chat://` 事件
+    /// 发射任务。
+    ///
+    /// 这是与 [`send`](Self::send) 并存的加法式入口：`send` 行为完全不变
+    /// （仍然 spawn 任务消费 mpsc 并 emit `chat://` 事件），本方法把消费权
+    /// 交给调用方（Hermes 的 `SdkRuntime` 适配器），让它自己映射成
+    /// `AgentEvent` 推给引擎。两者复用同一份 `running_client_for` +
+    /// `send_streaming` 路径，daemon 进程语义一致。
+    pub async fn send_raw_stream(
+        &self,
+        agent_id: AgentId,
+        method: String,
+        params: Value,
+    ) -> Result<(String, mpsc::UnboundedReceiver<StreamLine>), String> {
+        let client = self.running_client_for(&agent_id).await?;
+        let (id, rx) = client.send_streaming(method, params).await?;
+        Ok((id, rx))
+    }
+
     /// Send a message to a provider and stream the response to the frontend.
     ///
     /// `agent_id` 决定命中哪个 daemon（独立进程/cwd/session）。`method` is e.g.
