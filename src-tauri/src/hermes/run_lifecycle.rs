@@ -104,9 +104,13 @@ pub fn sweep_run_worktrees(
         let Some(wt) = worktrees.iter().find(|w| w.branch == expected_branch) else {
             continue; // 无 worktree（未派发过）→ 跳过。
         };
-        // 3. 查 has_uncommitted / has_commits_ahead（失败当 false——保守但避免误删）。
+        // 3. 查 has_uncommitted / has_commits_ahead。
+        // 破坏性安全红线：has_uncommitted_changes 在 git 出错时 unwrap_or(true)——
+        // 「查不动」按「有改动」处理（fail-safe，宁可不删也不误删未保存工作）。
+        // has_commits_ahead 保持 unwrap_or(false)（它是「有产出」信号，error→false 无碍；
+        //   且 Completed 下 has_uncommitted 已先守门，has_commits_ahead 的 error 方向不改变安全语义）。
         let has_uncommitted =
-            WorktreeManager::has_uncommitted_changes(&wt.path).unwrap_or(false);
+            WorktreeManager::has_uncommitted_changes(&wt.path).unwrap_or(true);
         let has_commits_ahead =
             WorktreeManager::has_commits_ahead(&wt.path, base_branch).unwrap_or(false);
         let input = WorktreeCleanupInput {
@@ -119,7 +123,8 @@ pub fn sweep_run_worktrees(
             WorktreeDisposition::Remove => {
                 // 破坏性安全双保险：删除前再复查 has_uncommitted_changes。
                 // 即使纯决策说 Remove（如 Failed），意外有未提交改动则降级 RetainForReview。
-                if WorktreeManager::has_uncommitted_changes(&wt.path).unwrap_or(false) {
+                // git 出错也按「脏」处理（unwrap_or(true) fail-safe）：查不动 → 不删 → 保留待查。
+                if WorktreeManager::has_uncommitted_changes(&wt.path).unwrap_or(true) {
                     sink.emit(OrchestrationEvent::Task {
                         run_id: run_id.to_string(),
                         task_id: task.id.clone(),
@@ -128,8 +133,13 @@ pub fn sweep_run_worktrees(
                     });
                     retained += 1;
                 } else {
-                    let _ = WorktreeManager::remove(repo_root, &wt.path, true);
-                    removed += 1;
+                    // remove 失败（worktree 锁/元数据异常）不静默漏删——
+                    // 保守计 retained，提示该 worktree 仍在、需人工处理。
+                    if WorktreeManager::remove(repo_root, &wt.path, true).is_ok() {
+                        removed += 1;
+                    } else {
+                        retained += 1;
+                    }
                 }
             }
             WorktreeDisposition::RetainForReview => {
@@ -402,6 +412,59 @@ mod tests {
                 OrchestrationEvent::Task { task_id, status, .. }
                 if task_id == "task3" && status.as_str() == TASK_STATUS_AWAITING_MERGE)),
             "应发 task3 awaiting-merge 事件"
+        );
+    }
+
+    #[test]
+    fn sweep_retains_when_uncommitted_check_errors_fail_safe() {
+        // 破坏性安全 fail-safe：删除前双保险复查 has_uncommitted_changes 返回 Err
+        // （worktree 元数据损坏 / index.lock 争用 / 权限等）时，按「脏」处理 → RetainForReview。
+        // 构造：Failed task + 真 worktree，然后删掉 worktree 的 .git 文件 →
+        //   `git status --porcelain` 在该路径下 fatal（exit 128）→ has_uncommitted_changes 返回 Err；
+        //   `git worktree list --porcelain` 从 repo_root 仍能列出该 worktree（读主仓 .git/worktrees/ 元数据），
+        //   故 sweep 的 find 仍命中 → 走到双保险复查 → Err 被 unwrap_or(true) 拦下 → RetainForReview。
+        // 断言 fail-safe 方向：git 错误时「不删」而非「删」。
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let base = current_branch(&repo);
+        let wts_dir = tmp.path().join("worktrees");
+
+        let store = Store::open_in_memory().unwrap();
+        store.create_task(sample_task_for_sweep("task4")).unwrap();
+        let wt4 = WorktreeManager::create(&repo, &wts_dir, "task4").unwrap();
+        // Failed + 干净 → decide_disposition 说 Remove；但下面要破坏 git 查询能力。
+        store
+            .update_task_status("task4", TaskStatus::Failed, None)
+            .unwrap();
+
+        // 损坏 worktree 的 git 元数据：删除 .git 文件（worktree 的 .git 是文件不是目录，
+        // 指向主仓 .git/worktrees/<name>/）。删后该路径下 `git status` fatal → Err。
+        let dot_git = wt4.path.join(".git");
+        assert!(dot_git.exists(), "worktree 应有 .git 文件");
+        std::fs::remove_file(&dot_git).unwrap();
+        // 确认 has_uncommitted_changes 现在确实 Err（校验测试前提）。
+        assert!(
+            WorktreeManager::has_uncommitted_changes(&wt4.path).is_err(),
+            "破坏后 has_uncommitted_changes 必须返回 Err"
+        );
+
+        let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
+        let report =
+            sweep_run_worktrees(&repo, &store, &base, sink.as_ref(), "run_z").unwrap();
+
+        // fail-safe：git 错误 → 不删 → retained +1，removed 不增。
+        assert_eq!(report, SweepReport { removed: 0, retained: 1 });
+        // worktree 目录仍在（没被删）。
+        assert!(wt4.path.exists(), "git 查询出错时 worktree 必须 fail-safe 保留");
+
+        let evs = sink.snapshot();
+        assert!(
+            evs.iter().any(|e| matches!(e,
+                OrchestrationEvent::Task { task_id, status, .. }
+                if task_id == "task4" && status.as_str() == TASK_STATUS_AWAITING_MERGE)),
+            "git 出错应发 task4 awaiting-merge 事件（fail-safe 保留）"
         );
     }
 }
