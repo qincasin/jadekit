@@ -36,6 +36,7 @@ import {
 import {CHAT_DAEMON_READY_TIMEOUT_ERROR_KEY} from '../utils/chatDaemonStatus';
 import {CHAT_MODEL_SELECTION_KEY_PREFIX, getDefaultChatModelId,} from '../utils/chatModels';
 import {getNextTabAfterClose} from '../utils/chatUiBehavior';
+import {resolveSendCwd} from './chatSendCwd';
 import {resolveTabForEvent} from './chatEventRouting';
 
 const DRAFT_KEY_PREFIX = 'ccg-chat-draft:';
@@ -319,6 +320,7 @@ export interface ChatSessionTab {
     activeRequestId: string | null;
     sessionId: string | null;
     currentCwd: string | null;
+    worktreePath: string | null;
     activeSession: SessionMeta | null;
     pendingSessionKey: string | null;
     lastSessionLoadMetrics: ChatSessionLoadMetrics | null;
@@ -371,6 +373,8 @@ interface ChatState {
     agentId: string;
     /** 当前会话关联的工作目录，供 @ 文件补全和 daemon cwd 使用 */
     currentCwd: string | null;
+    /** 当前 Agent 绑定的独立 worktree 路径；发送时优先作为 daemon cwd。 */
+    worktreePath: string | null;
     /** 当前从历史中载入的会话元信息 */
     activeSession: SessionMeta | null;
     /** 当前正在切换/加载中的历史会话 key */
@@ -480,6 +484,7 @@ function createTabFromState(
         activeRequestId: state.activeRequestId,
         sessionId: state.sessionId,
         currentCwd: state.currentCwd,
+        worktreePath: state.worktreePath,
         activeSession: state.activeSession,
         pendingSessionKey: state.pendingSessionKey,
         lastSessionLoadMetrics: state.lastSessionLoadMetrics,
@@ -514,6 +519,7 @@ function createEmptyTabFromState(
         activeRequestId: null,
         sessionId: null,
         currentCwd: cwd ?? state.currentCwd,
+        worktreePath: null,
         activeSession: null,
         pendingSessionKey: null,
         lastSessionLoadMetrics: null,
@@ -542,6 +548,7 @@ function projectTabToState(tab: ChatSessionTab): Partial<ChatState> {
         sessionId: tab.sessionId,
         agentId: tab.agentId,
         currentCwd: tab.currentCwd,
+        worktreePath: tab.worktreePath,
         activeSession: tab.activeSession,
         pendingSessionKey: tab.pendingSessionKey,
         lastSessionLoadMetrics: tab.lastSessionLoadMetrics,
@@ -1195,6 +1202,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     sessionId: null,
     agentId: createAgentId(),
     currentCwd: null,
+    worktreePath: null,
     activeSession: null,
     pendingSessionKey: null,
     lastSessionLoadMetrics: null,
@@ -1689,6 +1697,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                     longContextEnabled: sendState.longContextEnabled,
                     messages: sendState.messages,
                     sessionId: sendState.sessionId,
+                    worktreePath: sendState.worktreePath,
                     activeSession: sendState.activeSession,
                     pendingSessionKey: sendState.pendingSessionKey,
                     lastSessionLoadMetrics: sendState.lastSessionLoadMetrics,
@@ -1715,6 +1724,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             longContextEnabled: sendState.longContextEnabled,
             sessionId: sendState.sessionId,
             currentCwd: sendState.currentCwd,
+            worktreePath: sendState.worktreePath,
             activeSession: sendState.activeSession,
             activeRequestId: sendState.activeRequestId,
             contextTokens: sendState.contextTokens,
@@ -1741,6 +1751,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             longContextEnabled,
             reasoningEffort,
             currentCwd,
+            worktreePath,
         } = sendState;
         const requestedModel = opts?.model ?? model;
         const effectiveModel = provider === 'claude'
@@ -1750,7 +1761,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             message: outboundMessage,
             sessionId: provider === 'claude' ? (sessionId ?? undefined) : undefined,
             threadId: provider === 'codex' ? (sessionId ?? undefined) : undefined,
-            cwd: opts?.cwd ?? currentCwd ?? undefined,
+            cwd: resolveSendCwd({worktreePath, cwd: currentCwd}, opts?.cwd),
             model: effectiveModel,
             permissionMode,
             reasoningEffort,
