@@ -72,6 +72,20 @@ codegraph explore judge JudgeVerdict planner replan
 - Test: `hermes_commands.rs::tests`（abort 命令定位 + 调用）、coordinator 单飞 guard 测试维持
 - [ ] **Step 1: 写失败测试** → **Step 2: FAIL** → **Step 3: 实现**（小改，复用已有 abort/cascade）→ **Step 4: cargo test hermes+chat 全绿 + build** → **Step 5: 提交** `feat(hermes): per-agent abort command and small engine cleanups`
 
+## Task 4: mock 运行命令（脚本化 LLM，UI 里点一下就能测，不烧真 token）
+
+> 背景：用户反馈——devtools 命令行测编排太麻烦，要能在 **cockpit UI 里操作感知**地测。引擎测试里已有 `MockRuntime`（脚本化回放 `AgentEvent`：拆解→N 任务→各发 text/tool_use/thinking/done），把它从 `#[cfg(test)]` 提升为可在运行时注入的「脚本介质」，经一个 dev 命令暴露，cockpit 用**正常 UI 流程**就能驱动整条编排闭环并看到真实 `hermes://run|task|agent` 事件——零真 LLM。
+
+**Files:**
+- Create/Modify: `src-tauri/src/hermes/mock_runtime.rs`（把测试里的 MockRuntime 提升为非 test、可配置脚本的 `ScriptedRuntime`：回放一段内置「演示剧本」——含多 worker、tool_use/thinking/text、其中一个 needs-attention、一个 failed，覆盖 cockpit 各状态点）；登记进 `RuntimeRegistry` 的 `mock`/`scripted` 入口
+- Modify: `src-tauri/src/commands/hermes_commands.rs`（`hermes_run_mock(scenario?: string) -> string`：用 ScriptedRuntime 构造 Coordinator 跑一次 run，**复用与 `hermes_run` 完全相同的事件/命令路径**，只换介质）+ `lib.rs` 注册 + 契约同步（标注 dev/演示用途）
+- Test: `mock_runtime.rs::tests`（剧本回放确定性）、`hermes_commands.rs::tests`（命令构造 run）
+
+**Interfaces:** Produces：`hermes_run_mock(scenario?) -> runId`（脚本化介质，发真事件，cockpit 正常渲染）；内置剧本至少覆盖：并行多 worker、working/tool_use、needs-attention（等待）、done、interrupted（失败）、awaiting-merge（保留 worktree）——让驾驶舱所有状态点/泳道/干预点都能被"点出来"看。
+- 非回归：纯新增介质 + 新命令，不动 `hermes_run`/真实 SdkRuntime 路径。
+- [ ] **Step 1: 写失败测试**（ScriptedRuntime 回放 + 命令构造 run）
+- [ ] **Step 2: FAIL** → **Step 3: 实现**（提升 MockRuntime→ScriptedRuntime + 内置剧本 + 命令）→ **Step 4: cargo test hermes+chat 全绿 + build** → **Step 5: 提交** `feat(hermes): scripted mock run command for UI-driven testing without real llm`
+
 ### ✅ GATE（最终，一次过）
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml hermes && cargo test --manifest-path src-tauri/Cargo.toml chat
@@ -81,7 +95,8 @@ git checkout feat/helm && git merge --no-ff feat/helm-phase3.5-bridge -m "merge:
 
 # DoD
 
-- [ ] Task 1–3 完成、各自 commit、过 GATE、`--no-ff` 合回 `feat/helm`。
+- [ ] Task 1–4 完成、各自 commit、过 GATE、`--no-ff` 合回 `feat/helm`。
+- [ ] `hermes_run_mock` 可用：在 cockpit 里点"演示运行"即驱动整条编排闭环、各状态点/泳道/干预点都能被看到，**不烧真 LLM token**（替代 devtools 命令行测）。
 - [ ] `cargo test`（hermes+chat）+ `npm run build` + `git diff --check` 全绿。
 - [ ] 契约 `docs/helm-hermes-ui-contract.md` 补 `hermes_worker_transcript` / `hermes_judge_show` / `hermes_agent_abort` + `MessageDto`/`JudgeVerdictDto`。
 - [ ] 非回归：Phase 2/3 旧行为 byte-identical（新命令不调用即零影响）。

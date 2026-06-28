@@ -337,6 +337,7 @@ git checkout feat/helm && git merge --no-ff feat/helm-phase4d-inspector -m "merg
   - **可选（合适才用，不强求）**：`PromptEnhancerDialog`（增强 goal 文本）、`@` 文件引用（goal 里引文件）。
   - **不适用（务实剔除）**：`/` 斜杠命令、逐条对话补全、"跟 worker 单聊"——Hermes 是**一次性下达 goal 给编排器**（Planner 选兵自动驱动 worker），不存在逐条 chat 回合，别硬塞单聊件。
 - Produces：`buildLaunch(goal, opts, roster): { goal, opts }`（校验 goal 非空、maxConcurrent>0）；提交 → `hermesService.run`。键盘优先（⌘Enter 提交）。
+- **「演示运行」入口（测试用）**：composer 旁加一个「演示运行」按钮 → 调 `hermesService.runMock()`（Phase 3.5 `hermes_run_mock`，脚本化 LLM、不烧 token）；命令未就绪时禁用态 + tooltip「需引擎 Phase 3.5」。让你在 UI 里点一下就能驱动整条编排看效果，不用 devtools。
 - [ ] **Step 1: 写失败测试** —— 空 goal 拒绝；opts 归一化；扇出计划构造。
 - [ ] **Step 2: FAIL** → **Step 3: 实现**（Roster 选兵 + 扇出 + SDK 守卫；空/错态文案；不塞不适用的单聊件）→ **Step 4: vitest+build+lint** → **Step 5: 提交** `feat(helm): composer with roster selection and run launch`
 
@@ -410,7 +411,7 @@ git checkout feat/helm && git merge --no-ff feat/helm-phase4f-intervention -m "m
 - Create: `docs/helm-phase4-verification.md`（§10 质量基线逐条核对 + 真 LLM e2e 步骤）
 
 **审计清单（§10 硬标准逐条）：**
-- [ ] **Step 1: 真事件端到端** —— 起一个真 run（或 mock 事件注入），三栏全联动：舰队板状态点实时刷、点卡进会话、diff/合并可用、干预浮现可应答、⌘K 可跳。
+- [ ] **Step 1: UI 驱动的端到端（首选 mock 运行，不靠 devtools）** —— cockpit 提供「演示运行」入口（composer 旁，调 Phase 3.5 的 `hermes_run_mock`；命令未就绪时禁用态 + tooltip）。点它即在 **UI 里**驱动整条编排，三栏全联动：舰队板状态点实时刷、点卡进会话、diff/合并可用、干预浮现可应答、⌘K 可跳。**这是日常验收主通路**（不用敲 devtools 命令行）；真 LLM run 作为补充手测。
 - [ ] **Step 2: 键盘优先审计** —— 切 agent/扇出/合并/丢弃/应答 gate 全有快捷键且可见焦点。
 - [ ] **Step 3: 实时性 + 可访问性** —— 流式/状态点近实时无卡顿、长列表虚拟化；reduced-motion 尊重；明暗主题 + 移动窄屏过。
 - [ ] **Step 4: 视觉自审（frontend-design）** —— 出截图对照「orca 级、零模板感」，不达标返工。
