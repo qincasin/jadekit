@@ -23,6 +23,7 @@
 use crate::chat::WorktreeManager;
 use crate::hermes::events::{NullEventSink, OrchestrationEvent, OrchestrationEventSink};
 use crate::hermes::planner::{Planner, ReplanAction, ReplanDecision, Roster};
+use crate::hermes::run_lifecycle::sweep_run_worktrees;
 use crate::hermes::runtime::{AgentEvent, AgentHandle, AgentRuntime, RuntimeStartSpec};
 use crate::hermes::runtime_registry::RuntimeRegistry;
 use crate::hermes::store::{InboxFilter, Store, TaskListFilter};
@@ -61,6 +62,20 @@ const DEFAULT_POLL_MS: u64 = 2000;
 /// 取 60s —— 比心跳 / 文本流间隔宽裕，避免误判慢 but healthy 的 worker。
 /// 仅在 Coordinator 注入了 WorkerSupervisor（Task 18）时生效。
 const SUPERVISOR_ACTIVITY_TIMEOUT_SECS: i64 = 60;
+
+/// Task 14（3d）：收敛后清扫 worktree 用的 base 分支（worktree 相对此分支判 has_commits_ahead）。
+/// 默认 feat/helm（Hermes 主功能分支）；测试可用 [`Coordinator::with_base_branch`] 覆盖为
+/// tempfile repo 的默认分支（main/master）。
+pub(crate) const HELM_BASE_BRANCH: &str = "feat/helm";
+
+/// Task 14（3d）：收敛后是否自动清扫 worktree 的**生产默认值**。
+///
+/// brief 要求「常量开关 SWEEP_ON_CONVERGE: bool = true」。但 `const` 无法 per-instance
+/// 覆盖，而测试需要关闭 sweep 避免 worktree 副作用。故采用「实例字段 + const 默认值」模式：
+/// [`Coordinator::sweep_on_converge`] 字段初始化为本常量（true，生产开启）；测试用
+/// [`Coordinator::with_sweep_on_converge`](false) 关闭。这既满足「集中默认值」的意图，
+/// 又允许 per-instance 覆盖（关键非回归保证：默认行为 = 生产 = 开启清扫）。
+const SWEEP_ON_CONVERGE_DEFAULT: bool = true;
 
 // —— Task 3：agent 状态词表（与设计 §10 AgentStateDot 对齐，集中常量，禁止散落魔法串） ——
 /// 有 stream 活动（TextDelta / Thinking / ToolUse）。
@@ -162,6 +177,12 @@ pub struct Coordinator {
     /// Task 10（3c）：可选的取消信号。run() 每轮 tick 前检查；置位则 abort 在飞 + 标 Cancelled。
     /// 默认 None（不注入时 run() 行为与 Phase 2 逐字一致——关键非回归保证）。
     cancel: Option<Arc<AtomicBool>>,
+    /// Task 14（3d）：sweep 用的 base 分支（收敛后查 has_commits_ahead 的基准）。
+    /// 默认 [`HELM_BASE_BRANCH`]；测试用 [`Self::with_base_branch`] 覆盖为 tempfile repo 的默认分支。
+    base_branch: String,
+    /// Task 14（3d）：收敛后是否自动清扫 worktree。默认 [`SWEEP_ON_CONVERGE_DEFAULT`]（true，生产开启）；
+    /// 测试用 [`Self::with_sweep_on_converge`](false) 关闭以避免 worktree 副作用。
+    sweep_on_converge: bool,
 }
 
 impl Coordinator {
@@ -185,6 +206,8 @@ impl Coordinator {
             event_sink: Arc::new(NullEventSink),
             event_run_id: OnceLock::new(),
             cancel: None,
+            base_branch: HELM_BASE_BRANCH.to_string(),
+            sweep_on_converge: SWEEP_ON_CONVERGE_DEFAULT,
         }
     }
 
@@ -257,6 +280,22 @@ impl Coordinator {
     #[allow(dead_code)]
     pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    /// Task 14（3d）：覆盖 sweep 的 base 分支（测试用 tempfile repo 时设为 main/master）。
+    /// 生产默认 [`HELM_BASE_BRANCH`]（feat/helm）。
+    #[allow(dead_code)]
+    pub fn with_base_branch(mut self, base: impl Into<String>) -> Self {
+        self.base_branch = base.into();
+        self
+    }
+
+    /// Task 14（3d）：关闭收敛后自动清扫（测试用，避免 worktree 副作用）。
+    /// 生产默认 [`SWEEP_ON_CONVERGE_DEFAULT`]（true，开启清扫）。
+    #[allow(dead_code)]
+    pub fn with_sweep_on_converge(mut self, on: bool) -> Self {
+        self.sweep_on_converge = on;
         self
     }
 
@@ -842,6 +881,8 @@ impl Coordinator {
                         status: RunStatus::Cancelled.as_str().to_string(),
                         error: Some("cancelled by user".to_string()),
                     });
+                    // Task 14（3d）：cancel 也是终态——abort 在飞后清扫它们的 worktree。
+                    self.sweep_on_terminal(run_id);
                     return Ok(RunStatus::Cancelled);
                 }
             }
@@ -849,6 +890,8 @@ impl Coordinator {
             if outcome.converged {
                 let final_status = self.derive_final_status()?;
                 self.store.update_run(run_id, final_status)?;
+                // Task 14（3d）：收敛后清扫 worktree（best-effort，失败不影响 run 终态）。
+                self.sweep_on_terminal(run_id);
                 return Ok(final_status);
             }
             tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
@@ -856,7 +899,29 @@ impl Coordinator {
 
         // 超过最大迭代仍未收敛——视为失败。
         self.store.update_run(run_id, RunStatus::Failed)?;
+        // Task 14（3d）：超时也是终态——清扫遗留的 worktree（一致性，与收敛/cancel 同路径）。
+        self.sweep_on_terminal(run_id);
         Ok(RunStatus::Failed)
+    }
+
+    /// Task 14（3d）：run 到达终态（Completed/Failed/Cancelled）后、返回前清扫 worktree。
+    ///
+    /// **best-effort**：`sweep_run_worktrees` 返回的 Err 被丢弃（`let _ =`）——
+    /// sweep 失败不改变 run 已写入的终态，也不向上传播为 run 错误（关键非回归保证：
+    /// run 的成功/失败只取决于任务结果，不取决于 worktree 清扫能否完成）。
+    /// `sweep_on_converge=false` 时直接跳过（测试 opt-out，避免 worktree 副作用）。
+    fn sweep_on_terminal(&self, run_id: &str) {
+        if !self.sweep_on_converge {
+            return;
+        }
+        // best-effort：sweep 出错仅丢弃——run 终态已在调用方 update_run 持久化。
+        let _ = sweep_run_worktrees(
+            &self.repo_root,
+            &self.store,
+            &self.base_branch,
+            self.event_sink.as_ref(),
+            run_id,
+        );
     }
 
     /// 开局拆解：planner.plan → 逐条 store.create_task（Store 按 deps 自动设 Ready/Pending）。
@@ -1870,6 +1935,97 @@ mod tests {
             let t = fx.store.get_task(&id).unwrap().unwrap();
             assert_eq!(t.status, TaskStatus::Completed, "任务 {id} 必须 Completed");
         }
+    }
+
+    // ── Task 14（3d）：收敛后自动清扫 worktree ──────────────────────────────
+    //
+    // run() 收敛（Completed/Cancelled）后、返回前调 sweep_run_worktrees，
+    // 清扫本 run 各 task 的 worktree（干净 → Remove；有产出 → RetainForReview）。
+    // sweep 是 best-effort：失败不影响 run 终态。测试用 with_base_branch 对齐
+    // tempfile repo 的默认分支，让 has_commits_ahead 判定正确。
+
+    /// 捕获 repo 当前分支名（git init 默认 main/master 跨系统不一）。
+    /// 与 run_lifecycle.rs::tests::current_branch 同手法。
+    fn current_branch(repo: &std::path::Path) -> String {
+        String::from_utf8_lossy(
+            &Command::new("git")
+                .current_dir(repo)
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string()
+    }
+
+    /// Task 14 RED：run() 收敛（Completed）后应自动清扫 worktree。
+    /// 构造：单 task "s1"，MockRuntime 回放 Done{success:true}（不 commit → worktree 干净）。
+    /// run() 收敛 → sweep → s1 的 worktree 干净 → Remove → 路径已不存在。
+    #[tokio::test]
+    async fn run_sweeps_worktrees_on_convergence() {
+        let fx = Fixture::new();
+        fx.create_task("s1", "sweep me", vec![]);
+        fx.program(
+            "s1",
+            vec![AgentEvent::Done {
+                success: true,
+                files_modified: vec![],
+            }],
+        );
+        let run = fx
+            .store
+            .create_run("sweep run", COORDINATOR_HANDLE, 5)
+            .unwrap();
+        // 关键：with_base_branch 对齐 fixture repo 默认分支（main/master），
+        // 让 has_commits_ahead 正确判（feat/helm 在 tempfile repo 不存在 → Err→false 也 OK，
+        // 但显式对齐更贴近生产语义）。
+        let base = current_branch(&fx.repo_root);
+        let coord = fx.coordinator().with_base_branch(base);
+
+        let final_status = coord.run(&run.id).await.unwrap();
+        assert_eq!(final_status, RunStatus::Completed, "应收敛到 Completed");
+
+        // s1 Completed → converged → sweep。s1 的 worktree 干净（MockRuntime 不 commit）
+        // → decide_disposition(Completed, no_changes, no_commits) = Remove → 路径已删。
+        let wt_path = fx.worktrees_dir.join("s1");
+        assert!(
+            !wt_path.exists(),
+            "收敛后干净 worktree 应被 sweep 删除；仍存在: {wt_path:?}"
+        );
+    }
+
+    /// Task 14 RED：with_sweep_on_converge(false) 应跳过清扫，worktree 仍在。
+    /// 验证 opt-out 开关——测试可关闭 sweep 避免 worktree 副作用。
+    #[tokio::test]
+    async fn run_sweep_disabled_leaves_worktree() {
+        let fx = Fixture::new();
+        fx.create_task("s2", "keep me", vec![]);
+        fx.program(
+            "s2",
+            vec![AgentEvent::Done {
+                success: true,
+                files_modified: vec![],
+            }],
+        );
+        let run = fx
+            .store
+            .create_run("no-sweep run", COORDINATOR_HANDLE, 5)
+            .unwrap();
+        let base = current_branch(&fx.repo_root);
+        let coord = fx
+            .coordinator()
+            .with_base_branch(base)
+            .with_sweep_on_converge(false);
+
+        coord.run(&run.id).await.unwrap();
+
+        // sweep 关闭 → worktree 仍在。
+        let wt_path = fx.worktrees_dir.join("s2");
+        assert!(
+            wt_path.exists(),
+            "with_sweep_on_converge(false) 应跳过清扫，worktree 仍应存在: {wt_path:?}"
+        );
     }
 
     // ── 用例 6：stale-dispatch reaping —— 心跳超时派发被 fail_dispatch ─────────
