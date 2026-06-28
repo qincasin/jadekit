@@ -234,31 +234,27 @@ git checkout feat/helm && git merge --no-ff feat/helm-phase4b-fleet -m "merge: P
 - [ ] **Step 4: 确认通过** → vitest PASS
 - [ ] **Step 5: 提交** `feat(helm): cmd-k jump palette for active agents`
 
-## Task 9: 中栏 agent 真实会话（复用现有 chat 全套渲染，不做瘦摘要）
+## Task 9: 中栏 agent 会话（务实 grounded：先活动流 + 干预，富 transcript 待 Phase 3.5 桥点亮）
 
-> **强约束（§10 复用优先 + 设计评审反馈）**：中栏默认渲染该 agent 的**真实会话 transcript**，**不是状态摘要**。必须复用现有 chat 的整套渲染能力，禁止另写一个功能更少的会话视图。digest/事件流概览只作**次级可折叠层**。
+> **后端事实（务实约束，不画后端给不出的数据）**：Hermes worker 走 `SdkRuntime.send_raw_stream`，流被引擎内部消费，**前端当前只能拿到 `hermes://agent` 粗粒度事件**（status + activity：tool_use/text/thinking），**拿不到 worker 完整 transcript / 富工具块**。因此本 task **按当前后端能给的画**：活动流时间线 + 任务 spec/result + dispatch 信息 + 干预，并把容器做成 **transcript-ready** 形状。worker 完整 transcript（复用 `MessageList`/`toolBlocks`/`ThinkingBlock`/`MessageMeta`）**依赖 Phase 3.5 的 worker-transcript 桥**（`hermes_worker_transcript` 命令，复用 `session_manager::load_messages`）落地后再点亮——届时只换数据源、UI 容器不重做。
 
 **Files:**
 - Create: `src/components/helm/SessionPanel.tsx`、`src/components/helm/sessionHeaderActions.ts`（单-agent 动作纯逻辑）
 - Test: `src/components/helm/sessionSelect.test.ts`、`src/components/helm/sessionHeaderActions.test.ts`
 
 **Interfaces:**
-- **必须复用（codegraph 定位后接入，禁止重写）**：
-  - 真实 transcript：`MessageList` / `ContentBlockRenderer` / `MessageItem` —— **默认就是它**。
-  - **工具链路调用查看**：`src/components/toolBlocks/` 整套（`BashToolBlock`/`BashToolGroupBlock` · `EditToolBlock`+`EditDiffPreview` · `ReadToolBlock`/`ReadToolGroupBlock` · `SearchToolGroupBlock` · `GenericToolBlock` · `AgentGroupBlock` · `TaskExecutionBlock`），逐个可展开看命令·参数·结果·diff。
-  - 子代理：`SubagentHistoryPanel` + `subagentRuns`（按 parentToolUseId 内联展开 sidechain）。
-  - thinking：`ThinkingBlock`；逐条元信息：`MessageMeta`（token/成本/耗时）。
-  - 滚动/流式：`ScrollControl` + `StreamingPlaceholder`/`WaitingIndicator`/`BouncingDots`。
-  - 会话内搜索：`ConversationSearch`。
+- **当前 grounded 数据**：`hermes://agent` 活动流（store 里维护的 `AgentView`：status + activity 时间线）、`TaskDto`（spec/result/status）、`DispatchDto`（assignee/failure_count/时间）。
+- **transcript-ready 容器**：SessionPanel 预留一个 transcript 区，数据源抽象成 `loadWorkerTranscript(agentId): Promise<Message[]|null>`——当前返回 null（走活动流 + 空态「完整执行记录将在引擎接通后显示」）；Phase 3.5 提供 `hermes_worker_transcript` 后此函数接真数据，**届时复用** `MessageList`/`ContentBlockRenderer`/`toolBlocks`/`ThinkingBlock`/`MessageMeta` 渲染，UI 不重写。
+- **可立即复用（grounded）**：`SubagentHistoryPanel` + `subagentRuns`（若 sidechain 数据可得则内联）、`ScrollControl`、流式指示。
 - Produces：
-  - `SessionPanel`（点 WorkerCard → store 设 `selectedAgentId` → 渲染该 agent **真实会话**；toolBlocks/thinking/子代理皆可展开；digest 为次级）。
-  - **会话头单-agent 动作**：`sessionHeaderActions(agent)` → 停止该 agent（`hermes_run_cancel` 暂为 run 级，单-agent abort 见交付报告待办）/ 跳到其 worktree / 重试（failed 时）；不只 working/tool_use 徽章。
-  - **内联干预槽**：该 agent `needs-attention` 时，权限/ask-user/decision-gate 回答 UI 在本会话内联浮现（实现归 4f，本 task 预留挂载点）。
-- [ ] **Step 1: 写失败测试** —— `selectAgent(id)` 设选中 + 切换清理上一个临时态；`sessionHeaderActions(failedAgent)` 含「重试」、`runningAgent` 含「停止」「跳 worktree」。
+  - `SessionPanel`（点 WorkerCard → `selectedAgentId` → 渲染该 agent 活动流 + 任务/派发信息 + transcript-ready 区）。
+  - **会话头单-agent 动作**：`sessionHeaderActions(agent)` → 跳到其 worktree（grounded：worktree 路径已知）/ 重试·停止（**单-agent abort 当前后端只有 run 级 cancel**，故标注：单-agent stop 依赖 Phase 3.5/后续，UI 先给入口或禁用态 + tooltip 说明）。
+  - **内联干预槽**：`needs-attention` 时权限/ask-user/gate 回答 UI 内联浮现（实现归 4f，本 task 预留挂载点）。
+- [ ] **Step 1: 写失败测试** —— `selectAgent(id)` 设选中 + 切换清理临时态；`sessionHeaderActions(runningAgent)` 含「跳 worktree」；`loadWorkerTranscript` 返回 null 时 SessionPanel 走活动流 + 空态（不报错）。
 - [ ] **Step 2: 确认失败** → FAIL
-- [ ] **Step 3: 实现**（复用上列全部，不重写任何渲染；空态「选择左侧一个 agent 查看其会话」；digest 次级可折叠）
+- [ ] **Step 3: 实现**（活动流 + transcript-ready 容器 + 干预槽；空态文案；不画假 transcript）
 - [ ] **Step 4: 确认通过 + build** → 全绿
-- [ ] **Step 5: 提交** `feat(helm): center session reuses full chat transcript, tool blocks, and sub-agents`
+- [ ] **Step 5: 提交** `feat(helm): center session with activity stream and transcript-ready container`
 
 ### ✅ GATE 4c
 ```bash
@@ -334,15 +330,15 @@ git checkout feat/helm && git merge --no-ff feat/helm-phase4d-inspector -m "merg
 - Test: `src/components/helm/launchPlan.test.ts`
 
 **Interfaces:**
-- **必须复用（不要只做 3 个 roster chip + 派发；codegraph `src/components/chat/composer/` 后接入）**：
-  - 模型/provider 选择：`SelectorDropdown`（model/mode/reasoning）+ `ModelIcon` —— 摆在「Roster 选兵 / 手动扇出」语境，而非单聊式「每条选模型」。
-  - 补全：`CompletionMenu` + `useCompletions`（`/` 斜杠命令 + `@` 文件）。
-  - 辅助：`ContextBar`（cwd/上下文）、`TokenIndicator`（token 计数）、`PromptEnhancerDialog`（提示词增强）、`FileTag`（文件附件）。
-  - 安全：SDK 缺失拦截（缺 SDK 拦发送 + 提示安装，复用现有 `ChatComposer` 的守卫逻辑）。
-  - 异构扇出复用 Phase 1b `FanoutComposer` + `roster.ts`。
+- **复用（grounded，对齐 Hermes「下达目标 / 选兵」语境，不照搬单聊）**：
+  - **模型/provider 选择 = Roster**：`SelectorDropdown`（model/mode/reasoning）+ `ModelIcon` + `roster.ts` + provider 管理——选「派哪些 CLI×模型」。这是 grounded 的核心。
+  - 异构扇出：复用 Phase 1b `FanoutComposer`。
+  - 安全：SDK 缺失拦截（复用 `ChatComposer` 守卫逻辑）。
+  - **可选（合适才用，不强求）**：`PromptEnhancerDialog`（增强 goal 文本）、`@` 文件引用（goal 里引文件）。
+  - **不适用（务实剔除）**：`/` 斜杠命令、逐条对话补全、"跟 worker 单聊"——Hermes 是**一次性下达 goal 给编排器**（Planner 选兵自动驱动 worker），不存在逐条 chat 回合，别硬塞单聊件。
 - Produces：`buildLaunch(goal, opts, roster): { goal, opts }`（校验 goal 非空、maxConcurrent>0）；提交 → `hermesService.run`。键盘优先（⌘Enter 提交）。
 - [ ] **Step 1: 写失败测试** —— 空 goal 拒绝；opts 归一化；扇出计划构造。
-- [ ] **Step 2: FAIL** → **Step 3: 实现**（复用上列选择/补全/增强/守卫，不做瘦版；空/错态文案）→ **Step 4: vitest+build+lint** → **Step 5: 提交** `feat(helm): composer reuses model selector, completions, and launch controls`
+- [ ] **Step 2: FAIL** → **Step 3: 实现**（Roster 选兵 + 扇出 + SDK 守卫；空/错态文案；不塞不适用的单聊件）→ **Step 4: vitest+build+lint** → **Step 5: 提交** `feat(helm): composer with roster selection and run launch`
 
 ### ✅ GATE 4e
 ```bash
