@@ -4,6 +4,7 @@
 //! 本模块为纯增量，不影响现有 `chat` 代码。
 
 pub mod coordinator;
+pub mod planner;
 pub mod runtime;
 pub mod sdk_runtime;
 pub mod store;
@@ -20,4 +21,8 @@ pub use store::{GateListFilter, InboxFilter, ReconcileReport, Store, TaskListFil
 pub use types::{
     AgentAssignment, CoordinatorRun, DecisionGate, DispatchContext, DispatchStatus, GateStatus,
     Message, MessageType, RunStatus, RuntimeKind, Task, TaskStatus,
+};
+pub use planner::{
+    build_plan_prompt, build_replan_prompt, parse_plan_response, parse_replan_response,
+    Planner, ReplanAction, ReplanDecision, Roster, RosterEntry,
 };

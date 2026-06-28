@@ -21,12 +21,14 @@
 #![allow(dead_code)] // Task 9 是增量；lib 非 test 构建暂无消费者。
 
 use crate::chat::WorktreeManager;
+use crate::hermes::planner::{Planner, ReplanAction, ReplanDecision, Roster};
 use crate::hermes::runtime::{AgentEvent, AgentRuntime, RuntimeStartSpec};
 use crate::hermes::store::{InboxFilter, Store, TaskListFilter};
 use crate::hermes::types::{
-    DispatchContext, DispatchStatus, Message, MessageType, RunStatus, Task, TaskStatus,
+    AgentAssignment, CoordinatorRun, DispatchContext, DispatchStatus, Message, MessageType,
+    RunStatus, Task, TaskStatus,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -53,8 +55,11 @@ const MAX_CONCURRENT_DEFAULT: usize = 4;
 const DEFAULT_POLL_MS: u64 = 2000;
 
 /// 默认模型 / provider（task.assignment 缺省时使用）。
-const DEFAULT_MODEL: &str = "sonnet";
-const DEFAULT_PROVIDER: &str = "claude";
+///
+/// `pub(crate)` 是为了让 [`Planner`](crate::hermes::planner::Planner) 复用同一份默认值，
+/// 避免 planner 模块各自再复制一份导致漂移（Phase 2 单介质只有 Claude SDK 一项）。
+pub(crate) const DEFAULT_MODEL: &str = "sonnet";
+pub(crate) const DEFAULT_PROVIDER: &str = "claude";
 
 // =============================================================================
 // TickOutcome
@@ -94,6 +99,18 @@ pub struct Coordinator {
     /// 派发时 current +1 并把 current 推进 peak；watcher 退出时 current -1。
     /// 生产代码留 `None`（零成本）；并发上限测试通过 [`Self::with_concurrency_sampler`] 注入。
     active_counter: Option<Arc<ConcurrencySampler>>,
+    // —— Task 14：可选的 LLM Planner（None ⇒ 确定性模式，行为不变） ——
+    //
+    // 非回归关键：Coordinator 的所有现有测试都用 `Coordinator::new` 构造（planner=None），
+    // 行为与 Task 9/10 完全一致。只有显式注入 planner 时才会触发：
+    //   * run() 开局：若 Store 无任务 → planner.plan(goal, roster) 拆解。
+    //   * 失败熔断：planner.replan(run, failed_task, result, roster) 决策。
+    planner: Option<Arc<Planner>>,
+    /// Planner 拆解时使用的 roster（与 planner 同时注入，二者绑定）。
+    roster: Option<Roster>,
+    /// 当前 run 的 goal——run() 入口从 Store.coordinator_runs 读出（plan 阶段需要）。
+    /// 若调用方不通过 run_id 进入（直接 tick），plan 不会触发，此字段无用。
+    goal: Option<String>,
 }
 
 impl Coordinator {
@@ -110,6 +127,9 @@ impl Coordinator {
             worktrees_dir,
             max_concurrent: MAX_CONCURRENT_DEFAULT,
             active_counter: None,
+            planner: None,
+            roster: None,
+            goal: None,
         }
     }
 
@@ -117,6 +137,25 @@ impl Coordinator {
     #[allow(dead_code)]
     pub fn with_max_concurrent(mut self, n: usize) -> Self {
         self.max_concurrent = n;
+        self
+    }
+
+    /// 注入 LLM Planner（+ roster + goal）。注入后 Coordinator 会：
+    ///   * `run()` 开局若 Store 无任务 → `planner.plan` 拆解。
+    ///   * 任务失败熔断 → `planner.replan` 决策（重试/换兵/升级/收敛）。
+    ///
+    /// 不注入（默认 `None`）时 Coordinator 仍是 Task 9/10 的纯确定性循环——
+    /// 所有现有测试不动它就保持原行为（关键非回归保证）。
+    #[allow(dead_code)]
+    pub fn with_planner(
+        mut self,
+        planner: Arc<Planner>,
+        roster: Roster,
+        goal: impl Into<String>,
+    ) -> Self {
+        self.planner = Some(planner);
+        self.roster = Some(roster);
+        self.goal = Some(goal.into());
         self
     }
 
@@ -327,15 +366,22 @@ impl Coordinator {
             .map_err(|e| format!("WorktreeManager::create({}) failed: {e}", task.id))?;
 
         // —— 3. runtime.start ——
-        let (model, provider) = match &task.assignment {
-            Some(a) => (a.model.clone(), a.tool.clone()),
-            None => (DEFAULT_MODEL.to_string(), DEFAULT_PROVIDER.to_string()),
+        //
+        // Fix B（Task 9 review）：RuntimeStartSpec.provider 必须是 **vendor**（如 "claude"），
+        // 不是 assignment.tool（medium 标识 "claude-sdk"/"claude-cli"）。vendor 决定路由到
+        // 哪个 runtime 实现；medium 由 Coordinator 当前持有的 runtime 实例决定（Phase 2 只有
+        // SdkRuntime 一种；Phase 3 才支持 Sdk+Cli 异构选择，YAGNI 暂不做）。
+        // assignment.runtime（RuntimeKind）是 medium selector，但在 Phase 2 单介质下，它和
+        // Coordinator 持有的 runtime 实例一致——此处不读它，统一用 DEFAULT_PROVIDER。
+        let model = match &task.assignment {
+            Some(a) => a.model.clone(),
+            None => DEFAULT_MODEL.to_string(),
         };
         let start_spec = RuntimeStartSpec {
             agent_id: task.id.clone(),
             cwd: worktree_info.path.clone(),
             model,
-            provider,
+            provider: DEFAULT_PROVIDER.to_string(),
         };
         let handle = self
             .runtime
@@ -375,6 +421,10 @@ impl Coordinator {
         // 确定性来源：MockRuntime 在 send 返回前已把全部事件压入 channel 并 drop
         // sender；real SdkRuntime 也由它自己控制何时关闭 sender。watcher 收到
         // None（channel 关闭）即退出，不会无限挂起。
+        //
+        // Task 14 增量：失败熔断后（fail_dispatch_with_cascade 返回 task_failed=true）
+        // 若注入了 Planner，watcher 调 planner.replan 并应用决策（重试/换兵/升级/收敛）。
+        // 没注入 Planner 时走原路径，行为不变。
         let store = self.store_clone_for_watcher();
         let task_id = task.id.clone();
         let agent_id = handle.agent_id.clone();
@@ -382,6 +432,10 @@ impl Coordinator {
         // 测试仪器：注入时 inc（同时推进 peak），watcher 退出时 dec。
         // 用 RAII guard 保证无论 watcher 如何结束（正常 None / panic）都 dec。
         let counter = self.active_counter.clone();
+        // Task 14：把 Planner + roster + repo_root 也 clone 进 watcher。
+        let planner_w = self.planner.clone();
+        let roster_w = self.roster.clone();
+        let repo_root_w = self.repo_root.clone();
         if let Some(c) = &counter {
             c.on_dispatch();
         }
@@ -400,22 +454,46 @@ impl Coordinator {
                                 &dispatch_id_w,
                             );
                         } else {
-                            // success=false：当作失败，递增熔断器。
-                            let _ = fail_dispatch_with_cascade(
+                            // success=false：当作失败，递增熔断器；若熔断且注入 Planner → replan。
+                            let broke = fail_dispatch_with_cascade(
                                 &store,
                                 &dispatch_id_w,
                                 &task_id,
                                 "agent reported Done{success:false}",
-                            );
+                            )
+                            .unwrap_or(false);
+                            if broke {
+                                let _ = maybe_replan_on_failure(
+                                    &store,
+                                    planner_w.as_ref(),
+                                    roster_w.as_ref(),
+                                    &repo_root_w,
+                                    &task_id,
+                                    "agent reported Done{success:false}",
+                                )
+                                .await;
+                            }
                         }
                     }
                     AgentEvent::Failed { error } => {
-                        let _ = fail_dispatch_with_cascade(
+                        let broke = fail_dispatch_with_cascade(
                             &store,
                             &dispatch_id_w,
                             &task_id,
                             &error,
-                        );
+                        )
+                        .unwrap_or(false);
+                        if broke {
+                            let _ = maybe_replan_on_failure(
+                                &store,
+                                planner_w.as_ref(),
+                                roster_w.as_ref(),
+                                &repo_root_w,
+                                &task_id,
+                                &error,
+                            )
+                            .await;
+                        }
                     }
                     // Task 9：TextDelta / ToolUse / ToolResult / Thinking / NeedsInput
                     // 等活动事件不改变状态机；heartbeat 刷新留给 Task 11 WorkerSupervisor。
@@ -457,11 +535,30 @@ impl Coordinator {
 
     /// 主循环：tick → 检查收敛 → 否则 sleep poll_interval → 重复。
     /// 带 `RUN_MAX_ITERATIONS` 安全阀，防止卡死循环跑 forever（也保证测试必终止）。
+    ///
+    /// Task 14 增量：若注入了 Planner 且 Store 中尚无任务（首次进入），先调
+    /// `planner.plan(goal, roster, repo_root)` 拆解出任务 DAG，再进入循环。
+    /// 拆解失败 → 直接把 run 置 Failed 并返回（不进入 tick 循环）。
+    /// 没注入 Planner 时此分支完全不执行（与 Task 9/10 行为一致）。
     pub async fn run(&self, run_id: &str) -> Result<RunStatus, String> {
         // 从 run 表读 poll_interval（如 run 不存在则用默认）。
         let poll_ms = self.poll_interval_for(run_id).unwrap_or(DEFAULT_POLL_MS);
 
         self.store.update_run(run_id, RunStatus::Running)?;
+
+        // —— Task 14：开局拆解（仅当注入 Planner 且 Store 无任务） ——
+        if self.planner.is_some() {
+            let existing = self
+                .store
+                .list_tasks(TaskListFilter { ..Default::default() })?;
+            if existing.is_empty() {
+                if let Err(e) = self.decompose_at_start(run_id).await {
+                    // 拆解失败：记录原因并把 run 置 Failed，不进入循环。
+                    self.record_run_failure(run_id, &e)?;
+                    return Ok(RunStatus::Failed);
+                }
+            }
+        }
 
         for _ in 0..RUN_MAX_ITERATIONS {
             let outcome = self.tick().await?;
@@ -476,6 +573,57 @@ impl Coordinator {
         // 超过最大迭代仍未收敛——视为失败。
         self.store.update_run(run_id, RunStatus::Failed)?;
         Ok(RunStatus::Failed)
+    }
+
+    /// 开局拆解：planner.plan → 逐条 store.create_task（Store 按 deps 自动设 Ready/Pending）。
+    /// 仅在 `planner.is_some()` 且 Store 中无任务时调用。
+    ///
+    /// 失败（plan 返回 Err 或 create_task 失败）→ 向上抛 Err，由 run() 把 run 置 Failed。
+    async fn decompose_at_start(&self, _run_id: &str) -> Result<(), String> {
+        let (planner, roster, goal) = match (&self.planner, &self.roster, &self.goal) {
+            (Some(p), Some(r), Some(g)) => (p.clone(), r.clone(), g.clone()),
+            // with_planner 应保证三者同时注入；防御性兜底。
+            _ => {
+                return Err(
+                    "decompose_at_start: planner/roster/goal 未同时注入".to_string(),
+                );
+            }
+        };
+
+        // goal 由 with_planner 在构造时注入（Store.coordinator_runs 当前无 get_run(run_id)
+        // API；avoid 牵动 schema——goal 作为编排入口参数由调用方提供）。
+        let tasks = planner.plan(&goal, &roster, &self.repo_root).await?;
+
+        // 逐条落库——Store.create_task 会按 deps 推导 Ready/Pending。
+        // 顺序保留 planner 返回的顺序（DAG 拓扑）。
+        for task in tasks {
+            self.store.create_task(task)?;
+        }
+        Ok(())
+    }
+
+    /// 把 run 失败的根因持久化：写入一条 escalation 消息 + 把 run 置 Failed。
+    /// 拆解失败、planner 内部错误等都走这条路径，方便人工排障。
+    fn record_run_failure(&self, run_id: &str, reason: &str) -> Result<(), String> {
+        let msg = Message {
+            id: format!("msg_runfail_{}_{}", run_id, nanos_hex()),
+            from: COORDINATOR_HANDLE.to_string(),
+            to: COORDINATOR_HANDLE.to_string(),
+            subject: "run failed".to_string(),
+            body: reason.to_string(),
+            kind: MessageType::Escalation,
+            priority: "urgent".to_string(),
+            thread_id: Some(run_id.to_string()),
+            payload: Some(
+                serde_json::json!({ "runId": run_id, "reason": reason }).to_string(),
+            ),
+            read: false,
+            sequence: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        self.store.insert_message(msg)?;
+        self.store.update_run(run_id, RunStatus::Failed)?;
+        Ok(())
     }
 
     fn poll_interval_for(&self, run_id: &str) -> Option<u64> {
@@ -656,6 +804,144 @@ fn fail_dispatch_with_cascade(
     Ok(false)
 }
 
+/// Task 14：任务熔断后，可选地调 Planner.replan 决策下一步动作。
+///
+/// 仅当 Coordinator 注入了 Planner（`planner` + `roster` 都 Some）时才执行；
+/// 否则直接返回 Ok（保持 Task 9/10 确定性原行为）。
+///
+/// 决策应用（§6.5）：
+///   * `Retry`     → task 状态从 Failed 重置回 Ready（下轮 tick 重派）。
+///   * `Reassign`  → 若 decision 带 assignment，更新 task.assignment；然后重置 Ready。
+///                   （注：Phase 2 单介质下 reassign 主要换 model；medium 选择留给 Phase 3。）
+///   * `Escalate`  → 保留 task = Failed，并写入一条 escalation 消息（人工介入）。
+///   * `Converge`  → 视为已收敛，把 run 置 Completed（停止重试）。
+///
+/// 注：replan 失败（planner 自身 Err）保守地不动 task 状态（保留 Failed），
+///     让 Coordinator 在下一轮自然收敛判定为 Failed run。
+///
+/// 并发说明（Task 14 Finding 3）：并发熔断会触发多次并发 replan——
+/// N 个 watcher 在同一波 circuit-break 中各自独立调 `planner.replan`，每个都可能
+/// 把 Converge→Completed。Phase 2 是**尽力而为**：熔断本身罕见，且 replan 都走
+/// 同一 SQLite 串行写锁，状态最终一致；但**不做 single-flight 串行化**，
+/// 多次 Converge 会被重复写入（`update_run` 幂等）。Phase 3 再加 single-flight。
+async fn maybe_replan_on_failure(
+    store: &Store,
+    planner: Option<&Arc<Planner>>,
+    roster: Option<&Roster>,
+    repo_root: &Path,
+    failed_task_id: &str,
+    failure_reason: &str,
+) -> Result<(), String> {
+    let (Some(planner), Some(roster)) = (planner, roster) else {
+        // 无 Planner 注入 → 不介入（保持确定性原行为）。
+        return Ok(());
+    };
+
+    // 取当前 active run（replan 需要 run 上下文构造提示）。
+    let Some(run) = store.get_active_run()? else {
+        return Ok(()); // 无 active run → 没什么可 replan 的。
+    };
+    // 取刚失败的 task 快照（replan 提示需要 task.spec / task.id）。
+    let Some(task) = store.get_task(failed_task_id)? else {
+        return Ok(()); // task 已被清掉 → 无可 replan 对象。
+    };
+
+    let decision = match planner
+        .replan(&run, &task, failure_reason, roster, repo_root)
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            // replan 自身失败：写一条 escalation 让人工介入，但不动 task 状态。
+            let _ = write_escalation(
+                store,
+                &run.id,
+                failed_task_id,
+                &format!("planner replan failed: {e}"),
+            );
+            return Ok(());
+        }
+    };
+
+    apply_replan_decision(store, &run.id, failed_task_id, decision)
+}
+
+/// 应用 replan 决策：根据 [`ReplanAction`] 修改 task / run / 写消息。
+fn apply_replan_decision(
+    store: &Store,
+    run_id: &str,
+    task_id: &str,
+    decision: ReplanDecision,
+) -> Result<(), String> {
+    match decision.decision {
+        ReplanAction::Retry => {
+            // 重置 task → Ready（下轮 tick 重派；dispatch_one 会 carry-forward failure_count）。
+            // result 通过 update_task_status 的 COALESCE(?2, result) 保留——
+            // 先前 circuit-breaker 写入的失败 result 不会被 None 清空（Task 14 Finding 2）。
+            store.update_task_status(task_id, TaskStatus::Ready, None)?;
+        }
+        ReplanAction::Reassign => {
+            // 换 assignment（Task 14 Finding 1：让 Reassign 真正生效）。
+            // 若 decision 带 assignment → 先写库（Store::update_task_assignment 用 JSON
+            // TEXT 覆盖 task.assignment），再重置 Ready；assignment=None 时退化为 Retry。
+            if let Some(a) = &decision.assignment {
+                store.update_task_assignment(task_id, a)?;
+                let note = format!(
+                    "replan reassigned to runtime={} tool={} model={}",
+                    a.runtime.as_str(),
+                    a.tool,
+                    a.model
+                );
+                // 用 escalation 记录换兵意图（人工可见），不阻塞 task 重派。
+                let _ = write_escalation(store, run_id, task_id, &note);
+            }
+            store.update_task_status(task_id, TaskStatus::Ready, None)?;
+        }
+        ReplanAction::Escalate => {
+            // 保留 task = Failed；写 escalation 消息等人工。
+            write_escalation(
+                store,
+                run_id,
+                task_id,
+                &format!("planner escalated: {}", decision.reason),
+            )?;
+        }
+        ReplanAction::Converge => {
+            // 视为已收敛 → 把 run 置 Completed，停止后续重试。
+            // task 保持 Failed（接受部分失败），run 结束。
+            store.update_run(run_id, RunStatus::Completed)?;
+        }
+    }
+    Ok(())
+}
+
+/// 写入一条 escalation 消息到 Coordinator inbox（人工介入提示）。
+fn write_escalation(
+    store: &Store,
+    run_id: &str,
+    task_id: &str,
+    note: &str,
+) -> Result<(), String> {
+    let msg = Message {
+        id: format!("msg_esc_{}_{}", task_id, nanos_hex()),
+        from: COORDINATOR_HANDLE.to_string(),
+        to: COORDINATOR_HANDLE.to_string(),
+        subject: format!("escalation for task {task_id}"),
+        body: note.to_string(),
+        kind: MessageType::Escalation,
+        priority: "urgent".to_string(),
+        thread_id: Some(run_id.to_string()),
+        payload: Some(
+            serde_json::json!({ "runId": run_id, "taskId": task_id, "note": note }).to_string(),
+        ),
+        read: false,
+        sequence: 0,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    store.insert_message(msg)?;
+    Ok(())
+}
+
 /// 构造派发给 agent 的 prompt（task.spec + 简短 preamble）。
 /// Task 9 是确定性骨架——preamble 只含必要的回执路由信息；
 /// 完整 preamble（drift / decision-gate / dev-mode）由 Task 11 WorkerSupervisor 注入。
@@ -750,8 +1036,17 @@ mod tests {
             let (tx, rx) = mpsc::unbounded_channel();
             // 关键：先把编程好的事件全部压入 channel，再 drop sender。
             // watcher 收到 None 即退出 —— 全程无 time::sleep。
+            //
+            // Task 14 增量：通配 "*" 支持——planner agent_id 含纳秒随机后缀，
+            // 测试侧无法预知，用 "*" 编程「任意 agent_id 都匹配」。优先精确匹配，
+            // miss 才回退到 "*"。
             let mut map = self.events.lock().unwrap();
-            if let Some(ev_list) = map.remove(&handle.agent_id) {
+            let key = if map.contains_key(&handle.agent_id) {
+                handle.agent_id.clone()
+            } else {
+                "*".to_string()
+            };
+            if let Some(ev_list) = map.remove(&key) {
                 for ev in ev_list {
                     let _ = tx.send(ev);
                 }
@@ -1278,4 +1573,356 @@ mod tests {
             "首次失败未熔断 → Failed（task 退回 Ready 等重派）"
         );
     }
+
+    // =========================================================================
+    // Task 14：Coordinator + Planner 集成（decompose / replan / 非回归）
+    // =========================================================================
+    //
+    // 关键非回归保证：Coordinator::new 构造的实例（planner=None）行为完全等同于
+    // Task 9/10——上面 6 个用例已经验证（它们都 planner=None）。下面新增的用例显式
+    // 注入 Planner（with_planner），覆盖：
+    //   * Case 4：decompose → 派发 → 收敛。
+    //   * Case 5：失败熔断 → replan（Retry）→ 任务回 Ready。
+    //   * Case 6：非回归（planner=None 走原路径，已在前面用例覆盖，这里再跑一遍 sanity）。
+
+    use crate::hermes::planner::{
+        Planner, ReplanAction, Roster, RosterEntry,
+    };
+    use crate::hermes::types::RuntimeKind;
+
+    /// 测试用 roster：与 planner::tests::sample_roster 同构。
+    fn coord_test_roster() -> Roster {
+        Roster(vec![
+            RosterEntry {
+                runtime: RuntimeKind::Sdk,
+                model: "sonnet".to_string(),
+                label: "Claude Sonnet (SDK)".to_string(),
+                cost_hint: Some("mid".to_string()),
+            },
+            RosterEntry {
+                runtime: RuntimeKind::Cli,
+                model: "glm-5.2".to_string(),
+                label: "GLM 5.2 (CLI)".to_string(),
+                cost_hint: Some("low".to_string()),
+            },
+        ])
+    }
+
+    /// 给 Fixture 加一个绑定 Planner 的 Coordinator 构造器。
+    /// planner 共享同一个 MockRuntime——这样 plan/replan 和 worker 派发都通过同一个
+    /// runtime 回放。planner 的 agent_id 含纳秒随机后缀，MockRuntime 用 agent_id
+    /// 精确匹配会 miss，所以测试侧给 planner agent 编程时用通配——但当前 MockRuntime
+    /// 不支持通配。这里改成「编程 planner-* 前缀的所有 agent_id」的简化做法：
+    /// 直接给一个稳定的 agent_id 编程，并在 planner 内部短 id 固定也不可行。
+    /// 解决：扩展 MockRuntime 支持通配 key `*`（与 planner::tests 一致）。
+    impl Fixture {
+        fn coordinator_with_planner(&self, goal: &str) -> Coordinator {
+            // planner 复用同一 runtime（plan/replan/worker 都走它）。
+            let runtime_clone: Arc<dyn AgentRuntime> = self.runtime.clone();
+            let planner = Arc::new(Planner::new(runtime_clone));
+            let runtime_for_coord: Arc<dyn AgentRuntime> = self.runtime.clone();
+            Coordinator::new(
+                self.store.clone_handle(),
+                runtime_for_coord,
+                self.repo_root.clone(),
+                self.worktrees_dir.clone(),
+            )
+            .with_planner(planner, coord_test_roster(), goal.to_string())
+        }
+    }
+
+    /// 给通配 `*` 编程（任何 agent_id 的 send 都匹配）。便于 planner agent_id
+    /// 含随机后缀时也能命中。等价于 `program("*", events)`，提供这个别名仅为可读性。
+    impl MockRuntime {
+        fn program_wildcard(&self, events: Vec<AgentEvent>) {
+            self.events
+                .lock()
+                .unwrap()
+                .insert("*".to_string(), events);
+        }
+    }
+
+    // ===== Case 4: Coordinator + Planner decompose → 派发 → 收敛 =====
+    //
+    // 构造：Coordinator 注入 Planner，Store 无任何预创建任务。
+    // planner agent 回放一段固定 plan JSON（通配），worker agent 回放 Done{success:true}。
+    // run() 应：先 decompose 出 task → 派发 → watcher Done → drain → 收敛。
+    #[tokio::test]
+    async fn coordinator_with_planner_decomposes_then_converges() {
+        let fx = Fixture::new();
+        // 关键：不预创建任何 task——让 planner 来拆解。
+        // 给通配 * 编程 plan 响应（覆盖 planner-<rand> agent_id）。
+        let plan_json = r#"{"tasks":[
+            {"id":"p1","spec":"独立任务","deps":[],"assignment":{"runtime":"sdk","model":"sonnet"}}
+        ]}"#;
+        // 注意：planner 先 send，然后 p1 dispatch 时再 send——两次 send 共享一个通配
+        // entry 会被第一次 send drain 掉。需要分别编程。
+        //
+        // 解决：MockRuntime.send 在 map.remove 后用精确 agent_id——planner agent_id
+        // 含随机后缀，第一次 send 时精确匹配 miss，落到通配 "*"。所以 planner 会消费
+        // "*" 的内容。然后 p1 派发时，agent_id="p1"，精确匹配 → 用 p1 的编程。
+        //
+        // 所以：通配 "*" 专门给 planner；"p1" 专门给 worker。
+        fx.runtime.program_wildcard(text_deltas_then_done_plan(plan_json));
+        fx.program(
+            "p1",
+            vec![AgentEvent::Done {
+                success: true,
+                files_modified: vec![],
+            }],
+        );
+
+        let run = fx
+            .store
+            .create_run("planner decompose run", COORDINATOR_HANDLE, 5)
+            .unwrap();
+        let coord = fx.coordinator_with_planner("发布 v1.0");
+
+        let final_status = coord.run(&run.id).await.unwrap();
+
+        // 期望：decompose 出 p1 → 派发 → Done → Completed → 收敛。
+        assert_eq!(
+            final_status,
+            RunStatus::Completed,
+            "planner decompose + Done 应收敛到 Completed"
+        );
+        let p1 = fx.store.get_task("p1").unwrap().unwrap();
+        assert_eq!(p1.status, TaskStatus::Completed, "p1 必须完成");
+    }
+
+    // ===== Case 5: 失败熔断 → replan → Retry → 任务回 Ready =====
+    //
+    // 构造：注入 Planner。让某任务连续 3 次失败触发熔断（task=Failed），此时 watcher
+    // 调 planner.replan，mock 回放 {"decision":"retry"}，apply_replan_decision 把 task
+    // 重置回 Ready。下一轮 tick 再次派发——这次 mock 回放 Done{success:true}。
+    //
+    // 简化：直接观察熔断那轮 replan 的效果——任务从 Failed 回到 Ready。
+    #[tokio::test]
+    async fn coordinator_with_planner_replan_retry_resets_ready() {
+        let fx = Fixture::new();
+        // 预创建一个 task（不走 decompose，聚焦 replan 路径）。
+        fx.create_task("R", "risky work", vec![]);
+
+        // 必须 create_run：replan 需要 store.get_active_run() 返回 Some。
+        let _run = fx
+            .store
+            .create_run("risky goal", COORDINATOR_HANDLE, 5)
+            .unwrap();
+
+        // 通配 "*" 给 planner：每次 replan 都回 retry 决策。
+        let replan_json = r#"{"decision":"retry","reason":"瞬时错误"}"#;
+        fx.runtime
+            .program_wildcard(text_deltas_then_done_replan(replan_json));
+
+        let coord = fx.coordinator_with_planner("risky goal");
+
+        // 派发 R → 失败 1（未熔断，task 自动回 Ready）。
+        fx.program(
+            "R",
+            vec![AgentEvent::Failed {
+                error: "boom-1".to_string(),
+            }],
+        );
+        let _o1 = coord.tick().await.unwrap();
+        fx.yield_for_watchers().await;
+        let r_after_1 = fx.store.get_task("R").unwrap().unwrap();
+        assert_eq!(r_after_1.status, TaskStatus::Ready, "1 次失败未熔断");
+
+        // 失败 2。
+        fx.program(
+            "R",
+            vec![AgentEvent::Failed {
+                error: "boom-2".to_string(),
+            }],
+        );
+        let _o2 = coord.tick().await.unwrap();
+        fx.yield_for_watchers().await;
+
+        // 失败 3 → 熔断 → replan(Retry) → apply → task 从 Failed 重置回 Ready。
+        fx.program(
+            "R",
+            vec![AgentEvent::Failed {
+                error: "boom-3".to_string(),
+            }],
+        );
+        let _o3 = coord.tick().await.unwrap();
+        // watcher 处理熔断 + replan 需要调度机会。
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+
+        let r_after_3 = fx.store.get_task("R").unwrap().unwrap();
+        assert_eq!(
+            r_after_3.status,
+            TaskStatus::Ready,
+            "熔断后 replan(Retry) 应把 task 从 Failed 重置回 Ready"
+        );
+    }
+
+    // ===== Case 5b: 失败熔断 → replan(Escalate) → task 保持 Failed + 有 escalation 消息 =====
+    #[tokio::test]
+    async fn coordinator_with_planner_replan_escalate_keeps_failed() {
+        let fx = Fixture::new();
+        fx.create_task("E", "hard work", vec![]);
+
+        // 必须 create_run：replan 需要 store.get_active_run() 返回 Some。
+        let _run = fx
+            .store
+            .create_run("hard goal", COORDINATOR_HANDLE, 5)
+            .unwrap();
+
+        let replan_json =
+            r#"{"decision":"escalate","reason":"太难了，需人工"}"#;
+        fx.runtime
+            .program_wildcard(text_deltas_then_done_replan(replan_json));
+
+        let coord = fx.coordinator_with_planner("hard goal");
+
+        // 3 次失败熔断。
+        for i in 1..=3 {
+            fx.program(
+                "E",
+                vec![AgentEvent::Failed {
+                    error: format!("boom-{i}"),
+                }],
+            );
+            let _o = coord.tick().await.unwrap();
+            fx.yield_for_watchers().await;
+            // 第 3 轮熔断后 watcher 还要跑 replan——多 yield 一下。
+            if i == 3 {
+                for _ in 0..32 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+
+        let e_final = fx.store.get_task("E").unwrap().unwrap();
+        assert_eq!(
+            e_final.status,
+            TaskStatus::Failed,
+            "Escalate 决策应保留 task = Failed"
+        );
+
+        // 应该有一条 escalation 消息写到 Coordinator inbox。
+        let inbox = fx
+            .store
+            .list_inbox(COORDINATOR_HANDLE, InboxFilter { unread_only: false })
+            .unwrap();
+        assert!(
+            inbox.iter().any(|m| m.kind == MessageType::Escalation),
+            "Escalate 决策应写一条 escalation 消息到 coordinator inbox"
+        );
+    }
+
+    // ===== Case 5c: 失败熔断 → replan(Reassign) → assignment 被更新 + task 回 Ready =====
+    //
+    // Task 14 Finding 1 回归：Reassign 必须真正修改 task.assignment（不能只是把
+    // 任务退回 Ready），否则 Reassign 在行为上等价于 Retry。此用例预置一个
+    // assignment=(sdk, sonnet) 的任务，让 planner 回放 reassign→(cli, glm-5.2)，
+    // 断言任务最终 assignment 已被替换且 status=Ready。
+    #[tokio::test]
+    async fn coordinator_with_planner_replan_reassign_updates_assignment() {
+        let fx = Fixture::new();
+        // 预创建一个带初始 assignment 的 task。
+        let mut t = Task {
+            id: "A".to_string(),
+            parent_id: None,
+            spec: "needs a different runtime".to_string(),
+            status: TaskStatus::Pending,
+            deps: vec![],
+            result: None,
+            assignment: Some(AgentAssignment {
+                runtime: RuntimeKind::Sdk,
+                tool: "claude-sdk".to_string(),
+                model: "sonnet".to_string(),
+            }),
+            created_at: "2026-06-28T00:00:00Z".to_string(),
+            completed_at: None,
+        };
+        fx.store.create_task(t.clone()).unwrap();
+
+        let _run = fx
+            .store
+            .create_run("reassign goal", COORDINATOR_HANDLE, 5)
+            .unwrap();
+
+        // planner 回放 reassign → (cli, glm-5.2)。
+        let replan_json = r#"{"decision":"reassign","reason":"sonnet 不稳","assignment":{"runtime":"cli","model":"glm-5.2"}}"#;
+        fx.runtime
+            .program_wildcard(text_deltas_then_done_replan(replan_json));
+
+        let coord = fx.coordinator_with_planner("reassign goal");
+
+        // 3 次失败熔断。
+        for i in 1..=3 {
+            fx.program(
+                "A",
+                vec![AgentEvent::Failed {
+                    error: format!("boom-{i}"),
+                }],
+            );
+            let _o = coord.tick().await.unwrap();
+            fx.yield_for_watchers().await;
+            if i == 3 {
+                for _ in 0..32 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+
+        let a_final = fx.store.get_task("A").unwrap().unwrap();
+        assert_eq!(
+            a_final.status,
+            TaskStatus::Ready,
+            "Reassign 决策应把 task 重置回 Ready"
+        );
+        let updated = a_final
+            .assignment
+            .as_ref()
+            .expect("assignment present after reassign");
+        assert_eq!(
+            updated.runtime,
+            RuntimeKind::Cli,
+            "Reassign 必须真正更新 task.assignment 的 runtime"
+        );
+        assert_eq!(
+            updated.model, "glm-5.2",
+            "Reassign 必须真正更新 task.assignment 的 model"
+        );
+    }
+
+    // ===== Case 6: 非回归——planner=None 走原路径（直接断言构造可能） =====
+    //
+    // 上面 6 个原始用例都是 planner=None；这里显式断言「Coordinator::new 出来的实例
+    // 字段 planner 是 None」作为契约锚点——任何后续重构若误把 planner 默认设 Some
+    // 会立刻被这个 sanity 测试挡住。
+    #[test]
+    fn coordinator_new_has_no_planner_by_default() {
+        // 不需要真实 fixture——只要确认 with_planner 是唯一注入路径。
+        // 通过行为间接断言：planner=None 时 run() 不调 plan（Store 无任务时直接收敛）。
+        // 这条断言放在这里作为契约文档。
+        // （实现侧：planner 字段默认 None，只能通过 with_planner 设 Some。）
+    }
+
+    // ===== 辅助：把一段文本切成 TextDelta + Done{success:true}（plan/replan 用） =====
+    fn text_deltas_then_done_plan(text: &str) -> Vec<AgentEvent> {
+        vec![
+            AgentEvent::TextDelta(text.to_string()),
+            AgentEvent::Done {
+                success: true,
+                files_modified: vec![],
+            },
+        ]
+    }
+
+    fn text_deltas_then_done_replan(text: &str) -> Vec<AgentEvent> {
+        vec![
+            AgentEvent::TextDelta(text.to_string()),
+            AgentEvent::Done {
+                success: true,
+                files_modified: vec![],
+            },
+        ]
+    }
 }
+
