@@ -5,6 +5,7 @@
 
 pub mod cli_runtime;
 pub mod coordinator;
+pub mod events;
 pub mod planner;
 pub mod runtime;
 pub mod sdk_runtime;
@@ -17,6 +18,7 @@ pub use runtime::{
     RuntimeStartSpec,
 };
 pub use coordinator::{Coordinator, TickOutcome};
+pub use events::{NullEventSink, OrchestrationEvent, OrchestrationEventSink};
 pub use supervisor::{DEFAULT_MAX_TURN_MS, WorkerStatus, WorkerSupervisor};
 pub use sdk_runtime::{parse_stream_line, SdkRuntime};
 pub use cli_runtime::CliRuntime;

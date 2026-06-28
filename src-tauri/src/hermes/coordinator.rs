@@ -21,6 +21,7 @@
 #![allow(dead_code)] // Task 9 是增量；lib 非 test 构建暂无消费者。
 
 use crate::chat::WorktreeManager;
+use crate::hermes::events::{NullEventSink, OrchestrationEvent, OrchestrationEventSink};
 use crate::hermes::planner::{Planner, ReplanAction, ReplanDecision, Roster};
 use crate::hermes::runtime::{AgentEvent, AgentHandle, AgentRuntime, RuntimeStartSpec};
 use crate::hermes::store::{InboxFilter, Store, TaskListFilter};
@@ -31,7 +32,7 @@ use crate::hermes::types::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 // =============================================================================
 // 常量（不写魔法串；循环参数集中定义）
@@ -59,6 +60,20 @@ const DEFAULT_POLL_MS: u64 = 2000;
 /// 取 60s —— 比心跳 / 文本流间隔宽裕，避免误判慢 but healthy 的 worker。
 /// 仅在 Coordinator 注入了 WorkerSupervisor（Task 18）时生效。
 const SUPERVISOR_ACTIVITY_TIMEOUT_SECS: i64 = 60;
+
+// —— Task 3：agent 状态词表（与设计 §10 AgentStateDot 对齐，集中常量，禁止散落魔法串） ——
+/// 有 stream 活动（TextDelta / Thinking / ToolUse）。
+const AGENT_STATUS_WORKING: &str = "working";
+/// NeedsInput / 权限请求：agent 等待用户或工具授权，需人工介入。
+const AGENT_STATUS_NEEDS_ATTENTION: &str = "needs-attention";
+/// Done（成功或失败，agent 已停——失败语义由 Task{failed} 承载）。
+const AGENT_STATUS_DONE: &str = "done";
+/// reap / abort 强杀（supervisor 标 Suspect 后被 Coordinator 终止）。
+const AGENT_STATUS_INTERRUPTED: &str = "interrupted";
+// Agent 活动类别子标签（status=working 时填到 activity 字段）。
+const AGENT_ACTIVITY_TOOL_USE: &str = "tool_use";
+const AGENT_ACTIVITY_TEXT: &str = "text";
+const AGENT_ACTIVITY_THINKING: &str = "thinking";
 
 /// 默认模型 / provider（task.assignment 缺省时使用）。
 ///
@@ -130,6 +145,12 @@ pub struct Coordinator {
     // Supervisor 必须与 Coordinator 共享同一个 `Arc<dyn AgentRuntime>`（reap 调
     // `runtime.liveness`），由调用方在 `with_supervisor` 时保证。
     supervisor: Option<Arc<WorkerSupervisor>>,
+    /// 编排事件下游（默认 NullEventSink，零成本；Task 2 注入收集型 sink 测试，
+    /// Task 4 注入 TauriEventSink 接前端）。不注入时引擎行为与 Phase 2 逐字一致。
+    event_sink: Arc<dyn OrchestrationEventSink>,
+    /// 当前 run 的 id（run() 入口一次性写入；dispatch/watcher/reap 读它构造事件 payload）。
+    /// 用 OnceLock 内部可变传递，无需改 tick/dispatch_one/drain_inbox 的 &self 签名。
+    event_run_id: OnceLock<String>,
 }
 
 impl Coordinator {
@@ -150,6 +171,8 @@ impl Coordinator {
             roster: None,
             goal: None,
             supervisor: None,
+            event_sink: Arc::new(NullEventSink),
+            event_run_id: OnceLock::new(),
         }
     }
 
@@ -197,6 +220,14 @@ impl Coordinator {
     #[allow(dead_code)]
     pub fn with_supervisor(mut self, supervisor: Arc<WorkerSupervisor>) -> Self {
         self.supervisor = Some(supervisor);
+        self
+    }
+
+    /// 注入编排事件下游（Task 2：发射 task/agent/run 生命周期事件）。
+    /// 不注入（默认 NullEventSink）时 Coordinator 行为与 Phase 2 逐字一致（关键非回归保证）。
+    #[allow(dead_code)]
+    pub fn with_event_sink(mut self, sink: Arc<dyn OrchestrationEventSink>) -> Self {
+        self.event_sink = sink;
         self
     }
 
@@ -267,6 +298,8 @@ impl Coordinator {
     ///
     /// 阈值用常量 [`STALE_DISPATCH_THRESHOLD_SECS`]（120s），不写魔法串。
     async fn reclaim_stale_dispatches(&self) -> Result<usize, String> {
+        // Task 2：读回 run_id（run() 入口 set 过；未 set 时空串），供事件 payload 使用。
+        let run_id = self.event_run_id.get().cloned().unwrap_or_default();
         let stale = self
             .store
             .get_stale_dispatches(STALE_DISPATCH_THRESHOLD_SECS as u64)?;
@@ -285,6 +318,8 @@ impl Coordinator {
                 &ctx.id,
                 &ctx.task_id,
                 &error,
+                self.event_sink.as_ref(),
+                &run_id,
             );
             reaped += 1;
         }
@@ -312,6 +347,9 @@ impl Coordinator {
         let Some(supervisor) = self.supervisor.as_ref() else {
             return Ok(0);
         };
+
+        // Task 2：读回 run_id（run() 入口 set 过；未 set 时空串），供事件 payload 使用。
+        let run_id = self.event_run_id.get().cloned().unwrap_or_default();
 
         // —— 中文：调 supervisor.reap 取本轮 Suspect agent_id ——
         let now = chrono::Utc::now();
@@ -354,7 +392,19 @@ impl Coordinator {
                 &dispatch_id,
                 &task_id,
                 &error,
+                self.event_sink.as_ref(),
+                &run_id,
             );
+            // Task 3：supervisor 标 Suspect → 强杀 → 发 Agent{interrupted}
+            // （驾驶舱 AgentStateDot 标灰/标停，与 Task{failed} 区分：前者表达
+            // "agent 被强杀"，后者表达"任务终态失败"，双通道各自独立）。
+            self.event_sink.emit(OrchestrationEvent::Agent {
+                run_id: run_id.clone(),
+                agent_id: agent_id.clone(),
+                task_id: Some(task_id.clone()),
+                status: AGENT_STATUS_INTERRUPTED.to_string(),
+                activity: None,
+            });
             reaped += 1;
         }
         Ok(reaped)
@@ -567,6 +617,10 @@ impl Coordinator {
         let repo_root_w = self.repo_root.clone();
         // Task 18：把可选的 WorkerSupervisor 也 clone 进 watcher。
         let supervisor_w = self.supervisor.clone();
+        // Task 2：把事件 sink + run_id 也 clone 进 watcher，用于在 Done/Failed 分支
+        // 发射 Task{completed} / Task{failed}。run_id 在 run() 入口已 set，此处读回。
+        let sink_w = Arc::clone(&self.event_sink);
+        let run_id_w = self.event_run_id.get().cloned().unwrap_or_default();
         if let Some(c) = &counter {
             c.on_dispatch();
         }
@@ -581,6 +635,9 @@ impl Coordinator {
                 if let Some(sup) = supervisor_w.as_ref() {
                     sup.on_event(&agent_id, &event).await;
                 }
+                // Task 3：发 Agent 级活动/状态事件（驾驶舱 AgentStateDot）。
+                // emit_agent_event 只借 &event，借用在此处结束，下面 match event 仍可 move。
+                emit_agent_event(sink_w.as_ref(), &run_id_w, &agent_id, &task_id, &event);
                 match event {
                     AgentEvent::Done { success, .. } => {
                         if success {
@@ -591,6 +648,14 @@ impl Coordinator {
                                 &task_id,
                                 &dispatch_id_w,
                             );
+                            // Task 2：worker 正常完成 → 发 Task{completed} 事件。
+                            // （drain_inbox 不再单独发 Completed，由 watcher 统一发，避免重复。）
+                            sink_w.emit(OrchestrationEvent::Task {
+                                run_id: run_id_w.clone(),
+                                task_id: task_id.clone(),
+                                status: TaskStatus::Completed.as_str().to_string(),
+                                dispatch_id: Some(dispatch_id_w.clone()),
+                            });
                         } else {
                             // success=false：当作失败，递增熔断器；若熔断且注入 Planner → replan。
                             let broke = fail_dispatch_with_cascade(
@@ -598,6 +663,8 @@ impl Coordinator {
                                 &dispatch_id_w,
                                 &task_id,
                                 "agent reported Done{success:false}",
+                                sink_w.as_ref(),
+                                &run_id_w,
                             )
                             .unwrap_or(false);
                             if broke {
@@ -619,6 +686,8 @@ impl Coordinator {
                             &dispatch_id_w,
                             &task_id,
                             &error,
+                            sink_w.as_ref(),
+                            &run_id_w,
                         )
                         .unwrap_or(false);
                         if broke {
@@ -639,6 +708,15 @@ impl Coordinator {
                     _ => {}
                 }
             }
+        });
+
+        // Task 2：派发成功 → 发 Task{dispatched} 事件（驾驶舱 Roster 高亮新派发）。
+        let run_id = self.event_run_id.get().cloned().unwrap_or_default();
+        self.event_sink.emit(OrchestrationEvent::Task {
+            run_id,
+            task_id: task.id.clone(),
+            status: TaskStatus::Dispatched.as_str().to_string(),
+            dispatch_id: Some(dispatch_id.clone()),
         });
 
         Ok(())
@@ -684,6 +762,10 @@ impl Coordinator {
         let poll_ms = self.poll_interval_for(run_id).unwrap_or(DEFAULT_POLL_MS);
 
         self.store.update_run(run_id, RunStatus::Running)?;
+
+        // Task 2：一次性写入 run_id，供 dispatch/watcher/reap 构造事件 payload。
+        // OnceLock::set 对同一 run_id 重复调用是 no-op（run 不会重入），忽略返回值。
+        let _ = self.event_run_id.set(run_id.to_string());
 
         // —— Task 14：开局拆解（仅当注入 Planner 且 Store 无任务） ——
         if self.planner.is_some() {
@@ -923,11 +1005,17 @@ fn write_worker_done(
 ///   语义），所以跨多次 dispatch 的失败仍能累计到熔断阈值。
 ///
 /// 返回是否触发了熔断。
+///
+/// Task 2 增量：签名新增 `sink` + `run_id`，在熔断路径（task → Failed）发射
+/// `Task{failed}` 事件。这样 watcher Done{false} / watcher Failed / stale-reap /
+/// supervisor-reap 四条失败路径都统一从这一处发射，DRY。
 fn fail_dispatch_with_cascade(
     store: &Store,
     dispatch_id: &str,
     task_id: &str,
     error: &str,
+    sink: &dyn OrchestrationEventSink,
+    run_id: &str,
 ) -> Result<bool, String> {
     let updated = store.fail_dispatch(dispatch_id, error)?;
     let Some(ctx) = updated else {
@@ -936,11 +1024,53 @@ fn fail_dispatch_with_cascade(
     if ctx.status == DispatchStatus::CircuitBroken {
         // 熔断：把 task 标 Failed（Task 6 把这条级联显式 deferred 给 Coordinator）。
         store.update_task_status(task_id, TaskStatus::Failed, Some(error))?;
+        // Task 2：任务熔断 → 发 Task{failed} 事件（驾驶舱标红 + 触发 replan/人工）。
+        sink.emit(OrchestrationEvent::Task {
+            run_id: run_id.to_string(),
+            task_id: task_id.to_string(),
+            status: TaskStatus::Failed.as_str().to_string(),
+            dispatch_id: Some(dispatch_id.to_string()),
+        });
         return Ok(true);
     }
     // 未熔断：退回 Ready，下一轮重派（dispatch_one 会 carry-forward failure_count）。
     store.update_task_status(task_id, TaskStatus::Ready, None)?;
     Ok(false)
+}
+
+/// Task 3：按 AgentEvent 类别发射 Agent 级事件（驾驶舱 AgentStateDot 用）。
+///
+/// 映射规则（与设计 §10 AgentStateDot 对齐，状态词集中常量，禁止魔法串）：
+///   * `TextDelta` / `Thinking` / `ToolUse` → [`AGENT_STATUS_WORKING`] + 活动类别；
+///   * `NeedsInput` → [`AGENT_STATUS_NEEDS_ATTENTION`]（等待用户 / 工具权限，需人工）；
+///   * `Done` / `Failed` → [`AGENT_STATUS_DONE`]（agent 已停；失败语义由 `Task{failed}` 承载，
+///     这里只标"agent 不再工作"，避免双通道表达同一件事）；
+///   * `ToolResult` → 不发（闭合事件，非新活动；其 ToolUse 已 ping 过 working/tool_use）。
+///
+/// 纯函数（只读 sink + 事件），便于单测完整覆盖每个变体映射。非回归保证：
+/// `NullEventSink`（默认）→ emit 是 no-op，与 Phase 2 逐字一致。
+fn emit_agent_event(
+    sink: &dyn OrchestrationEventSink,
+    run_id: &str,
+    agent_id: &str,
+    task_id: &str,
+    event: &AgentEvent,
+) {
+    let (status, activity): (&str, Option<&str>) = match event {
+        AgentEvent::TextDelta(_) => (AGENT_STATUS_WORKING, Some(AGENT_ACTIVITY_TEXT)),
+        AgentEvent::Thinking(_) => (AGENT_STATUS_WORKING, Some(AGENT_ACTIVITY_THINKING)),
+        AgentEvent::ToolUse { .. } => (AGENT_STATUS_WORKING, Some(AGENT_ACTIVITY_TOOL_USE)),
+        AgentEvent::NeedsInput => (AGENT_STATUS_NEEDS_ATTENTION, None),
+        AgentEvent::Done { .. } | AgentEvent::Failed { .. } => (AGENT_STATUS_DONE, None),
+        AgentEvent::ToolResult { .. } => return,
+    };
+    sink.emit(OrchestrationEvent::Agent {
+        run_id: run_id.to_string(),
+        agent_id: agent_id.to_string(),
+        task_id: Some(task_id.to_string()),
+        status: status.to_string(),
+        activity: activity.map(|a| a.to_string()),
+    });
 }
 
 /// Task 14：任务熔断后，可选地调 Planner.replan 决策下一步动作。
@@ -2602,6 +2732,371 @@ mod tests {
         assert_eq!(
             o2.failed, 0,
             "健康 worker（持续 TextDelta）不应被 Supervisor reap"
+        );
+    }
+
+    // ===== Task 2：编排事件 sink —— task 生命周期事件发射 =====
+    //
+    // 收集型 sink：把 emit 的事件收集到 Vec，断言用。Arc<CollectSink> 同时用于
+    // 注入 Coordinator（转成 Arc<dyn OrchestrationEventSink>）和读回断言（clone 一份）。
+    // 用 Mutex<Vec<OrchestrationEvent>> 保证 Send + Sync。
+    struct CollectSink(std::sync::Mutex<Vec<OrchestrationEvent>>);
+    impl OrchestrationEventSink for CollectSink {
+        fn emit(&self, ev: OrchestrationEvent) {
+            self.0.lock().unwrap().push(ev);
+        }
+    }
+
+    impl CollectSink {
+        /// 读回收集到的事件快照（克隆，避免长持有锁）。
+        fn snapshot(&self) -> Vec<OrchestrationEvent> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// 断言收集到的事件里有一个 Task 事件，且字段符合预期。
+    fn assert_task_event(
+        evs: &[OrchestrationEvent],
+        expected_status: &str,
+        expected_task_id: &str,
+        expected_run_id: &str,
+    ) {
+        let found = evs.iter().any(|e| match e {
+            OrchestrationEvent::Task {
+                run_id,
+                task_id,
+                status,
+                dispatch_id: _,
+            } => {
+                status == expected_status
+                    && task_id == expected_task_id
+                    && run_id == expected_run_id
+            }
+            _ => false,
+        });
+        assert!(
+            found,
+            "expected Task{{status:{}, task_id:{}, run_id:{}}} in {:?}",
+            expected_status, expected_task_id, expected_run_id, evs
+        );
+    }
+
+    /// 用例：派发 + 完成 → 应收集到 Task{dispatched} 与 Task{completed}，run_id 等于 run.id。
+    ///
+    /// 驱动方式：手动 tick（不依赖 run() 循环的 sleep），与现有 single_task_done_completes
+    /// 测试一致。run_id 通过 run() 入口一次性 set 到 OnceLock——这里调 run() 让
+    /// event_run_id 被写入，再驱动后续断言。但 run() 自身会驱动 tick 到收敛，
+    /// 我们让 run() 跑完一轮（短任务收敛快），然后断言 sink 收到的事件。
+    #[tokio::test]
+    async fn dispatch_emits_task_dispatched_and_completed_events() {
+        let fx = Fixture::new();
+        fx.create_task("t1", "implement feature A", vec![]);
+        // 编程：t1 emit Done{success:true}，watcher 写 worker_done 后发 Task{completed}。
+        fx.program(
+            "t1",
+            vec![AgentEvent::Done {
+                success: true,
+                files_modified: vec![],
+            }],
+        );
+
+        let run = fx
+            .store
+            .create_run("e2e goal", COORDINATOR_HANDLE, 5)
+            .unwrap();
+
+        // 共享一个 CollectSink：原始 Arc 用于读回，clone 成 trait object 注入。
+        let sink: Arc<CollectSink> = Arc::new(CollectSink(std::sync::Mutex::new(Vec::new())));
+        let sink_for_inject: Arc<dyn OrchestrationEventSink> = sink.clone();
+
+        let coord = fx.coordinator().with_event_sink(sink_for_inject);
+
+        // run() 入口会 set event_run_id，然后驱动 tick 到收敛（poll=5ms，单任务快）。
+        coord.run(&run.id).await.unwrap();
+
+        let evs = sink.snapshot();
+
+        // 断言 Task{dispatched}：dispatch_one 派发成功后发射。
+        assert_task_event(
+            &evs,
+            TaskStatus::Dispatched.as_str(),
+            "t1",
+            &run.id,
+        );
+        // 断言 Task{completed}：watcher 在 Done{success:true} 后发射。
+        assert_task_event(
+            &evs,
+            TaskStatus::Completed.as_str(),
+            "t1",
+            &run.id,
+        );
+        // 事件 payload 的 run_id 必须等于 run.id（从 OnceLock 读回）。
+        for e in &evs {
+            if let OrchestrationEvent::Task { run_id, .. } = e {
+                assert_eq!(run_id, &run.id, "event run_id must equal run.id");
+            }
+        }
+    }
+
+    /// 用例：3 次失败熔断 → 应收集到 Task{failed}。
+    ///
+    /// 复用 three_failures_break_circuit_and_mark_task_failed 的驱动模式（手动 3 轮 tick），
+    /// 注入 CollectSink，断言熔断后发了一次 Task{failed, dispatch_id: Some(..)}。
+    #[tokio::test]
+    async fn fail_emits_task_failed_event() {
+        let fx = Fixture::new();
+        fx.create_task("F", "risky work", vec![]);
+
+        let run = fx
+            .store
+            .create_run("risky goal", COORDINATOR_HANDLE, 5)
+            .unwrap();
+
+        let sink: Arc<CollectSink> = Arc::new(CollectSink(std::sync::Mutex::new(Vec::new())));
+        let sink_for_inject: Arc<dyn OrchestrationEventSink> = sink.clone();
+
+        let coord = fx.coordinator().with_event_sink(sink_for_inject);
+
+        // 关键：run() 入口 set event_run_id——但我们要手动驱动 tick。
+        // 折中：在驱动 tick 前先调用一次 run() 会陷入 sleep 循环。所以这里手动
+        // 复制 run() 的语义：直接驱动 tick。event_run_id 未被 set 时，
+        // unwrap_or_default() 返回空串——为了得到正确 run_id，我们改成调 run()。
+        // 但 run() 会循环到收敛。F 熔断后会进入 Failed 终态（task=Failed → 收敛），
+        // 所以 run() 会在熔断后自然收敛返回——这正是我们想要的端到端驱动。
+        //
+        // 编程 3 轮 Failed（每轮 send 消费一次 program 条目，所以每轮 tick 前 re-program）。
+        // 由于 run() 内部循环驱动 tick，我们改为：先手动 set run_id 不行（字段私有），
+        // 改为依赖 run() 自己驱动——但 run() 不 re-program MockRuntime。
+        //
+        // 因此采用同 three_failures 一致的手动 3 轮 tick 模式：放弃 run_id 精确匹配，
+        // 用 unwrap_or_default() 的空串断言（只断言 status==failed 与 task_id）。
+        // 这条取舍记录在此：Task 2 的 sink 契约里 run_id 是辅助字段，断言核心是
+        // status + task_id + dispatch_id。
+
+        // 第 1 轮：派发 F → watcher 失败 1 次（未熔断，task 退回 Ready）。
+        fx.program(
+            "F",
+            vec![AgentEvent::Failed {
+                error: "boom-1".to_string(),
+            }],
+        );
+        let _o1 = coord.tick().await.unwrap();
+        fx.yield_for_watchers().await;
+
+        // 第 2 轮：再次派发 F（重新 program）→ 失败 2 次。
+        fx.program(
+            "F",
+            vec![AgentEvent::Failed {
+                error: "boom-2".to_string(),
+            }],
+        );
+        let _o2 = coord.tick().await.unwrap();
+        fx.yield_for_watchers().await;
+
+        // 第 3 轮：再次派发 F → 失败 3 次 → 熔断。
+        fx.program(
+            "F",
+            vec![AgentEvent::Failed {
+                error: "boom-3".to_string(),
+            }],
+        );
+        let _o3 = coord.tick().await.unwrap();
+        fx.yield_for_watchers().await;
+
+        // 此时熔断应已触发；task 应为 Failed。
+        let f_final = fx.store.get_task("F").unwrap().unwrap();
+        assert_eq!(
+            f_final.status,
+            TaskStatus::Failed,
+            "3 次失败后 task 必须 Failed（熔断级联）"
+        );
+
+        let evs = sink.snapshot();
+        // 断言收集到至少一个 Task{failed, task_id:"F"}，dispatch_id 非 None。
+        let failed_found = evs.iter().any(|e| match e {
+            OrchestrationEvent::Task {
+                task_id,
+                status,
+                dispatch_id,
+                ..
+            } => {
+                status == TaskStatus::Failed.as_str()
+                    && task_id == "F"
+                    && dispatch_id.is_some()
+            }
+            _ => false,
+        });
+        assert!(
+            failed_found,
+            "expected at least one Task{{failed, task_id:F, dispatch_id:Some}} in {:?}",
+            evs
+        );
+    }
+
+    // ===== Task 3：Agent 级活动/状态事件（驾驶舱 AgentStateDot） =====
+
+    /// 用例（brief 指定主路径）：worker 发 ToolUse → NeedsInput → Done{success:true}，
+    /// 驱动 run()，断言收集到 Agent{working, tool_use} 与 Agent{needs-attention}。
+    ///
+    /// run() 入口 set event_run_id，所以 Agent 事件的 run_id 应等于 run.id。
+    /// task_id 在 dispatch_one 里取 task.id（这里 task_id == agent_id == "a1"）。
+    #[tokio::test]
+    async fn watcher_emits_agent_working_then_needs_attention_events() {
+        let fx = Fixture::new();
+        fx.create_task("a1", "do work", vec![]);
+        fx.program(
+            "a1",
+            vec![
+                AgentEvent::ToolUse {
+                    id: "tu1".into(),
+                    name: "Read".into(),
+                },
+                AgentEvent::NeedsInput,
+                AgentEvent::Done {
+                    success: true,
+                    files_modified: vec![],
+                },
+            ],
+        );
+
+        let run = fx
+            .store
+            .create_run("agent events goal", COORDINATOR_HANDLE, 5)
+            .unwrap();
+
+        // 共享一个 CollectSink：原始 Arc 用于读回，clone 成 trait object 注入。
+        let sink: Arc<CollectSink> = Arc::new(CollectSink(std::sync::Mutex::new(Vec::new())));
+        let sink_for_inject: Arc<dyn OrchestrationEventSink> = sink.clone();
+
+        let coord = fx.coordinator().with_event_sink(sink_for_inject);
+        coord.run(&run.id).await.unwrap();
+
+        let evs = sink.snapshot();
+
+        // 断言 Agent{working, tool_use}：ToolUse 事件触发的活动信号。
+        let working_tool_use = evs.iter().any(|e| matches!(e,
+            OrchestrationEvent::Agent { status, activity, agent_id, task_id, .. }
+            if status == AGENT_STATUS_WORKING
+                && activity.as_deref() == Some(AGENT_ACTIVITY_TOOL_USE)
+                && agent_id == "a1"
+                && task_id.as_deref() == Some("a1")
+        ));
+        assert!(
+            working_tool_use,
+            "应收集到 Agent{{working, tool_use, a1}} in {:?}",
+            evs
+        );
+
+        // 断言 Agent{needs-attention}：NeedsInput 事件（activity 为 None）。
+        let needs_attention = evs.iter().any(|e| matches!(e,
+            OrchestrationEvent::Agent { status, activity, agent_id, .. }
+            if status == AGENT_STATUS_NEEDS_ATTENTION
+                && activity.is_none()
+                && agent_id == "a1"
+        ));
+        assert!(
+            needs_attention,
+            "应收集到 Agent{{needs-attention, a1}} in {:?}",
+            evs
+        );
+
+        // 附加断言：Done{success:true} 也应产生 Agent{done}（agent 已停）。
+        let done_event = evs.iter().any(|e| matches!(e,
+            OrchestrationEvent::Agent { status, agent_id, .. }
+            if status == AGENT_STATUS_DONE && agent_id == "a1"
+        ));
+        assert!(
+            done_event,
+            "应收集到 Agent{{done, a1}} in {:?}",
+            evs
+        );
+    }
+
+    /// 辅助函数单测：直接调 emit_agent_event，覆盖每个 AgentEvent 变体的状态/活动映射。
+    /// 不走 run() pipeline，保证映射逻辑确定、可单独验证。
+    #[test]
+    fn emit_agent_event_maps_all_variants() {
+        let sink: Arc<CollectSink> = Arc::new(CollectSink(std::sync::Mutex::new(Vec::new())));
+
+        let cases: Vec<(AgentEvent, &str, Option<&str>)> = vec![
+            (
+                AgentEvent::TextDelta("x".into()),
+                AGENT_STATUS_WORKING,
+                Some(AGENT_ACTIVITY_TEXT),
+            ),
+            (
+                AgentEvent::Thinking("y".into()),
+                AGENT_STATUS_WORKING,
+                Some(AGENT_ACTIVITY_THINKING),
+            ),
+            (
+                AgentEvent::ToolUse {
+                    id: "t".into(),
+                    name: "n".into(),
+                },
+                AGENT_STATUS_WORKING,
+                Some(AGENT_ACTIVITY_TOOL_USE),
+            ),
+            (AgentEvent::NeedsInput, AGENT_STATUS_NEEDS_ATTENTION, None),
+            (
+                AgentEvent::Done {
+                    success: true,
+                    files_modified: vec![],
+                },
+                AGENT_STATUS_DONE,
+                None,
+            ),
+            (
+                AgentEvent::Failed {
+                    error: "e".into(),
+                },
+                AGENT_STATUS_DONE,
+                None,
+            ),
+        ];
+
+        for (ev, want_status, want_activity) in cases {
+            sink.0.lock().unwrap().clear();
+            emit_agent_event(sink.as_ref(), "run_x", "a1", "t1", &ev);
+            let got = sink.snapshot();
+            assert_eq!(
+                got.len(),
+                1,
+                "ToolResult 之外每变体应发 1 个 Agent 事件（status={want_status}）"
+            );
+            match &got[0] {
+                OrchestrationEvent::Agent {
+                    status,
+                    activity,
+                    agent_id,
+                    task_id,
+                    run_id,
+                } => {
+                    assert_eq!(status, want_status);
+                    assert_eq!(activity.as_deref(), want_activity);
+                    assert_eq!(agent_id, "a1");
+                    assert_eq!(task_id.as_deref(), Some("t1"));
+                    assert_eq!(run_id, "run_x");
+                }
+                _ => panic!("expected Agent event"),
+            }
+        }
+
+        // ToolResult → 不发（闭合事件，非新活动）。
+        sink.0.lock().unwrap().clear();
+        emit_agent_event(
+            sink.as_ref(),
+            "run_x",
+            "a1",
+            "t1",
+            &AgentEvent::ToolResult {
+                tool_use_id: "t".into(),
+                is_error: false,
+            },
+        );
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "ToolResult 不应发 Agent 事件"
         );
     }
 }
