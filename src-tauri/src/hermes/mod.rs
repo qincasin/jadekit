@@ -5,9 +5,14 @@
 
 pub mod runtime;
 pub mod sdk_runtime;
+pub mod types;
 
 pub use runtime::{
     AgentEvent, AgentHandle, AgentRuntime, Liveness, RuntimeCapabilities, RuntimeError,
     RuntimeStartSpec,
 };
 pub use sdk_runtime::{parse_stream_line, SdkRuntime};
+pub use types::{
+    AgentAssignment, CoordinatorRun, DecisionGate, DispatchContext, DispatchStatus, GateStatus,
+    Message, MessageType, RunStatus, RuntimeKind, Task, TaskStatus,
+};
