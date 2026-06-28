@@ -5,6 +5,7 @@
 
 pub mod runtime;
 pub mod sdk_runtime;
+pub mod store;
 pub mod types;
 
 pub use runtime::{
@@ -12,6 +13,7 @@ pub use runtime::{
     RuntimeStartSpec,
 };
 pub use sdk_runtime::{parse_stream_line, SdkRuntime};
+pub use store::{Store, TaskListFilter};
 pub use types::{
     AgentAssignment, CoordinatorRun, DecisionGate, DispatchContext, DispatchStatus, GateStatus,
     Message, MessageType, RunStatus, RuntimeKind, Task, TaskStatus,
