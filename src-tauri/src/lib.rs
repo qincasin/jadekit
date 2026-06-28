@@ -1054,12 +1054,14 @@ pub fn run() {
             antigravity_commands::ag_get_operation_logs,
             antigravity_commands::ag_get_all_operation_logs,
             antigravity_commands::ag_get_token_status,
-            // Hermes 编排引擎命令（Phase 2g / Task 17）
+            // Hermes 编排引擎命令（Phase 2g / Task 17；Task 4 新增 run_show / agent_list）
             hermes_commands::hermes_run,
             hermes_commands::hermes_task_list,
             hermes_commands::hermes_dispatch_show,
             hermes_commands::hermes_gate_resolve,
             hermes_commands::hermes_run_stop,
+            hermes_commands::hermes_run_show,
+            hermes_commands::hermes_agent_list,
         ])
         .setup(|app| {
             // 初始化数据库

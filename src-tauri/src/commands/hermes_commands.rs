@@ -20,7 +20,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::hermes::{
-    self, Coordinator, DispatchContext, RunStatus, Store, Task, TaskListFilter, TaskStatus,
+    self, Coordinator, DispatchContext, OrchestrationEventSink, RunStatus, Store, Task,
+    TaskListFilter, TaskStatus,
 };
 
 // =============================================================================
@@ -31,12 +32,11 @@ use crate::hermes::{
 pub const HERMES_EVENT_RUN: &str = "hermes://run";
 /// Hermes 编排事件通道：task 级（dispatched / completed / failed）。
 ///
-/// 当前由命令层发射（Task 17 仅接入 run 级事件，task/agent 级事件名先占位，
-/// 后续子阶段接入 supervisor 事件流时启用）。
-#[allow(dead_code)]
+/// Task 4 起：`TauriEventSink` + `event_channel_for` 消费此常量映射通道。
 pub const HERMES_EVENT_TASK: &str = "hermes://task";
 /// Hermes 编排事件通道：agent 级（保留——后续子阶段接 supervisor 事件时使用）。
-#[allow(dead_code)]
+///
+/// Task 4 起：`TauriEventSink` + `event_channel_for` 消费此常量映射通道。
 pub const HERMES_EVENT_AGENT: &str = "hermes://agent";
 
 /// `HermesRunOpts` 字段缺省时的回落值。对齐 `hermes::coordinator::DEFAULT_POLL_MS`。
@@ -202,27 +202,94 @@ fn parse_task_list_filter(dto: Option<TaskListFilterDto>) -> Result<TaskListFilt
 }
 
 // =============================================================================
-// 事件 payload
+// TauriEventSink —— 把 OrchestrationEvent 桥接到 Tauri 事件通道的生产 sink
 // =============================================================================
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RunEventPayload {
-    pub run_id: String,
-    pub goal: String,
-    pub status: String,
-    /// 失败时附错误原因；其它状态为 None。
-    pub error: Option<String>,
+/// Task 4：把 [`OrchestrationEvent`] 桥接到 Tauri 事件通道的生产 sink。
+///
+/// 引擎（Coordinator / Supervisor / watcher）只依赖 [`OrchestrationEventSink`] trait；
+/// 本实现按事件 kind 选择 `hermes://run` / `hermes://task` / `hermes://agent` 通道，
+/// best-effort 发射（`app.emit` 失败不影响引擎循环——典型场景如前端未监听）。
+///
+/// 这条 sink 是「命令层 → Tauri 通道」的唯一耦合面：引擎内部不出现 `AppHandle`。
+pub struct TauriEventSink {
+    app: AppHandle,
+    run_id: String,
 }
 
-/// task 级事件 payload（与 [`HERMES_EVENT_TASK`] 配套，当前为预留——Task 17 不发射）。
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize)]
+impl TauriEventSink {
+    /// 构造 sink。`run_id` 主要用于日志诊断，通道选择由事件 kind 决定。
+    pub fn new(app: AppHandle, run_id: String) -> Self {
+        Self { app, run_id }
+    }
+
+    /// Task 4：暴露 run_id（便于命令层诊断 / spawn 任务引用）。
+    #[allow(dead_code)]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+}
+
+/// Task 4：纯函数——按 [`OrchestrationEvent`] 的 kind 映射到通道名（便于单测）。
+///
+/// 三类 kind 一一对应 `HERMES_EVENT_RUN` / `HERMES_EVENT_TASK` / `HERMES_EVENT_AGENT`。
+/// 不读 payload 内容，只看枚举变体。
+pub fn event_channel_for(ev: &crate::hermes::OrchestrationEvent) -> &'static str {
+    match ev {
+        crate::hermes::OrchestrationEvent::Run { .. } => HERMES_EVENT_RUN,
+        crate::hermes::OrchestrationEvent::Task { .. } => HERMES_EVENT_TASK,
+        crate::hermes::OrchestrationEvent::Agent { .. } => HERMES_EVENT_AGENT,
+    }
+}
+
+impl crate::hermes::OrchestrationEventSink for TauriEventSink {
+    fn emit(&self, ev: crate::hermes::OrchestrationEvent) {
+        let channel = event_channel_for(&ev);
+        // best-effort：emit 失败（如前端未监听）不影响引擎循环。
+        let _ = self.app.emit(channel, ev);
+    }
+}
+
+// =============================================================================
+// DTO —— RunShowDto（hermes_run_show 返回；Task 4）
+// =============================================================================
+
+/// `hermes_run_show` 的返回 DTO：单条 run 概览 + 任务计数（驾驶舱顶部用）。
+///
+/// Task 4 起前端驾驶舱顶部用此结构展示当前 run 的目标 / 状态 / 任务总数 /
+/// 已完成数。字段全部 camelCase（与既有 DTO 风格一致）。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct TaskEventPayload {
-    pub run_id: String,
-    pub task_id: String,
+pub struct RunShowDto {
+    pub id: String,
+    pub goal: String,
     pub status: String,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+    pub task_count: usize,
+    pub completed_count: usize,
+}
+
+/// Task 4：纯函数——从 [`CoordinatorRun`] + 任务列表构造 [`RunShowDto`]。
+///
+/// `task_count` = 任务总数；`completed_count` = `TaskStatus::Completed` 的任务数。
+/// 抽成纯函数便于单测覆盖计数逻辑，无需 Tauri runtime。
+pub fn build_run_show(
+    run: &crate::hermes::CoordinatorRun,
+    tasks: &[Task],
+) -> RunShowDto {
+    RunShowDto {
+        id: run.id.clone(),
+        goal: run.goal.clone(),
+        status: run.status.as_str().to_string(),
+        created_at: run.created_at.clone(),
+        completed_at: run.completed_at.clone(),
+        task_count: tasks.len(),
+        completed_count: tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Completed)
+            .count(),
+    }
 }
 
 // =============================================================================
@@ -274,6 +341,10 @@ impl HermesEngine {
     ///
     /// 立刻返回 run_id（不等 run 完成）；run 进展通过 `hermes://run` /
     /// `hermes://task` 事件流推送给前端。Coordinator 收敛或被 cancel 后退出。
+    ///
+    /// Task 4：所有 run 级事件改走 [`TauriEventSink`]（单一发射口，与引擎内部的
+    /// task/agent 级事件共用同一条 sink trait 注入 Coordinator）。原 `RunEventPayload`
+    /// 路径已删除——`OrchestrationEvent::Run` 取而代之。
     pub fn start_run(
         &self,
         app: AppHandle,
@@ -295,16 +366,17 @@ impl HermesEngine {
             .map_err(|e| format!("HermesEngine runs lock poisoned: {e}"))?
             .insert(run.id.clone(), RunHandle { cancel: cancel.clone() });
 
-        // 发射 run 启动事件（best-effort）。
-        let _ = app.emit(
-            HERMES_EVENT_RUN,
-            RunEventPayload {
-                run_id: run.id.clone(),
-                goal: run.goal.clone(),
-                status: RunStatus::Running.as_str().to_string(),
-                error: None,
-            },
-        );
+        // Task 4：构造 TauriEventSink——run 启动 / 终态 / 引擎内部 task/agent 事件
+        // 都走这一条 sink（单一发射口），Coordinator 也通过 with_event_sink 接它。
+        let sink = Arc::new(TauriEventSink::new(app.clone(), run.id.clone()));
+
+        // 发射 run 启动事件（best-effort，经 sink）。
+        sink.emit(crate::hermes::OrchestrationEvent::Run {
+            run_id: run.id.clone(),
+            goal: run.goal.clone(),
+            status: RunStatus::Running.as_str().to_string(),
+            error: None,
+        });
 
         // spawn 后台 Coordinator 循环。
         let store = self.store.clone_handle();
@@ -313,13 +385,17 @@ impl HermesEngine {
         let run_id = run.id.clone();
         let run_goal = run.goal.clone();
         let cancel_for_task = cancel.clone();
+        // Task 4：把 sink 也 move 进 spawned closure，让错误路径 / 终态 emit 都走 sink。
+        let sink_for_task = sink.clone();
 
         tauri::async_runtime::spawn(async move {
             let coordinator = Coordinator::new(store.clone_handle(), runtime, repo_root, worktrees_dir)
-                .with_max_concurrent(opts.max_concurrent);
+                .with_max_concurrent(opts.max_concurrent)
+                // Task 4：注入 TauriEventSink——引擎内部 task/agent 级事件经此通道落地。
+                .with_event_sink(sink_for_task.clone() as Arc<dyn crate::hermes::OrchestrationEventSink>);
 
             let final_status = if cancel_for_task.load(Ordering::SeqCst) {
-                // 在进入循环前就被 cancel——直接置 Failed。
+                // 在进入循环前就被 cancel——直接置 Failed（保持原语义；Cancelled 是 Task 11 的范围）。
                 let _ = store.update_run(&run_id, RunStatus::Failed);
                 RunStatus::Failed
             } else {
@@ -327,37 +403,50 @@ impl HermesEngine {
                     Ok(status) => status,
                     Err(e) => {
                         let _ = store.update_run(&run_id, RunStatus::Failed);
-                        let _ = app.emit(
-                            HERMES_EVENT_RUN,
-                            RunEventPayload {
-                                run_id: run_id.clone(),
-                                goal: run_goal.clone(),
-                                status: RunStatus::Failed.as_str().to_string(),
-                                error: Some(e),
-                            },
-                        );
+                        // Task 4：错误路径经 sink 发 Run{failed}。
+                        sink_for_task.emit(crate::hermes::OrchestrationEvent::Run {
+                            run_id: run_id.clone(),
+                            goal: run_goal.clone(),
+                            status: RunStatus::Failed.as_str().to_string(),
+                            error: Some(e),
+                        });
                         return;
                     }
                 }
             };
 
-            // 发射 run 终态事件。
-            let _ = app.emit(
-                HERMES_EVENT_RUN,
-                RunEventPayload {
-                    run_id: run_id.clone(),
-                    goal: run_goal,
-                    status: final_status.as_str().to_string(),
-                    error: if final_status == RunStatus::Failed {
-                        Some("run ended in failed state".to_string())
-                    } else {
-                        None
-                    },
+            // Task 4：发射 run 终态事件（经 sink）。
+            sink_for_task.emit(crate::hermes::OrchestrationEvent::Run {
+                run_id: run_id.clone(),
+                goal: run_goal,
+                status: final_status.as_str().to_string(),
+                error: if final_status == RunStatus::Failed {
+                    Some("run ended in failed state".to_string())
+                } else {
+                    None
                 },
-            );
+            });
         });
 
         Ok(run.id)
+    }
+
+    /// Task 4：取一条 run + 它的任务列表，构造 [`RunShowDto`]（驾驶舱顶部用）。
+    ///
+    /// `run_id` 空 / 不存在 → Err。任务列表取该 run 全部任务（无过滤）。
+    pub fn show_run(&self, run_id: &str) -> Result<RunShowDto, String> {
+        let run = self
+            .store
+            .get_run(run_id)?
+            .ok_or_else(|| format!("hermes_run_show: 未找到 run_id {run_id}"))?;
+        let tasks = self.store.list_tasks(TaskListFilter::default())?;
+        Ok(build_run_show(&run, &tasks))
+    }
+
+    /// Task 4：列出当前活跃的派发上下文（驾驶舱 Roster 用）。
+    /// 薄 delegate 到 `Store::list_active_dispatches`。
+    pub fn list_active_agents(&self) -> Result<Vec<DispatchContext>, String> {
+        self.store.list_active_dispatches()
     }
 
     /// 列出任务（薄 delegate 到 Store）。
@@ -467,6 +556,32 @@ pub async fn hermes_run_stop(
 ) -> Result<(), String> {
     // stop_run 是纯内存操作（无 IO），无需 spawn_blocking。
     state.stop_run(&run_id)
+}
+
+/// Task 4：取一条 run 的概览 + 任务计数（驾驶舱顶部用）。
+///
+/// 入参 `run_id` 经 trim；空字符串 → Err。返回 [`RunShowDto`]。
+#[tauri::command]
+pub async fn hermes_run_show(
+    run_id: String,
+    state: State<'_, HermesEngine>,
+) -> Result<RunShowDto, String> {
+    let trimmed = run_id.trim();
+    if trimmed.is_empty() {
+        return Err("hermes_run_show: run_id 不能为空".to_string());
+    }
+    state.show_run(trimmed)
+}
+
+/// Task 4：列出当前活跃的派发上下文（驾驶舱 Roster 用）。
+///
+/// 返回 `Vec<DispatchDto>`（active = `status = Dispatched`）。
+#[tauri::command]
+pub async fn hermes_agent_list(
+    state: State<'_, HermesEngine>,
+) -> Result<Vec<DispatchDto>, String> {
+    let dispatches = state.list_active_agents()?;
+    Ok(dispatches.into_iter().map(DispatchDto::from).collect())
 }
 
 // =============================================================================
@@ -712,5 +827,168 @@ mod tests {
     fn engine_stop_run_rejects_empty_run_id() {
         let engine = build_test_engine();
         assert!(engine.stop_run("   ").is_err());
+    }
+
+    // ── Task 4：event_channel_for + build_run_show 纯函数 ──
+
+    /// Task 4 RED→GREEN：三类 OrchestrationEvent 各映射到对应通道常量。
+    #[test]
+    fn event_channel_for_maps_each_kind() {
+        let run_ev = crate::hermes::OrchestrationEvent::Run {
+            run_id: "r1".into(),
+            goal: "g".into(),
+            status: "running".into(),
+            error: None,
+        };
+        assert_eq!(event_channel_for(&run_ev), HERMES_EVENT_RUN);
+
+        let task_ev = crate::hermes::OrchestrationEvent::Task {
+            run_id: "r1".into(),
+            task_id: "t1".into(),
+            status: "dispatched".into(),
+            dispatch_id: Some("d1".into()),
+        };
+        assert_eq!(event_channel_for(&task_ev), HERMES_EVENT_TASK);
+
+        let agent_ev = crate::hermes::OrchestrationEvent::Agent {
+            run_id: "r1".into(),
+            agent_id: "a1".into(),
+            task_id: Some("t1".into()),
+            status: "working".into(),
+            activity: Some("tool_use".into()),
+        };
+        assert_eq!(event_channel_for(&agent_ev), HERMES_EVENT_AGENT);
+    }
+
+    /// Task 4 RED→GREEN：build_run_show 正确计数 task_count / completed_count，
+    /// 并把 run 字段一对一映射到 DTO（camelCase 由 serde 层保证，这里只断言原值）。
+    #[test]
+    fn build_run_show_counts_tasks() {
+        let run = crate::hermes::CoordinatorRun {
+            id: "run_abc".into(),
+            goal: "ship it".into(),
+            status: RunStatus::Running,
+            coordinator_handle: COORDINATOR_HANDLE.into(),
+            poll_interval_ms: 2000,
+            created_at: "2026-06-28T00:00:00Z".into(),
+            completed_at: None,
+        };
+        // 3 个任务：1 Completed、1 Dispatched、1 Pending。
+        let mk_task = |id: &str, status: TaskStatus| Task {
+            id: id.into(),
+            parent_id: None,
+            spec: format!("spec {id}"),
+            status,
+            deps: vec![],
+            result: None,
+            assignment: None,
+            created_at: "2026-06-28T00:00:00Z".into(),
+            completed_at: None,
+        };
+        let tasks = vec![
+            mk_task("t_done", TaskStatus::Completed),
+            mk_task("t_dispatched", TaskStatus::Dispatched),
+            mk_task("t_pending", TaskStatus::Pending),
+        ];
+
+        let dto = build_run_show(&run, &tasks);
+        assert_eq!(dto.id, "run_abc");
+        assert_eq!(dto.goal, "ship it");
+        assert_eq!(dto.status, RunStatus::Running.as_str());
+        assert_eq!(dto.created_at, "2026-06-28T00:00:00Z");
+        assert_eq!(dto.completed_at, None);
+        assert_eq!(dto.task_count, 3, "task_count = 全部任务数");
+        assert_eq!(
+            dto.completed_count, 1,
+            "completed_count 只数 TaskStatus::Completed"
+        );
+    }
+
+    /// Task 4：build_run_show 对空任务列表也工作（task_count=0、completed_count=0）。
+    #[test]
+    fn build_run_show_handles_empty_task_list() {
+        let run = crate::hermes::CoordinatorRun {
+            id: "run_empty".into(),
+            goal: "noop".into(),
+            status: RunStatus::Completed,
+            coordinator_handle: COORDINATOR_HANDLE.into(),
+            poll_interval_ms: 1000,
+            created_at: "2026-06-28T00:00:00Z".into(),
+            completed_at: Some("2026-06-28T00:01:00Z".into()),
+        };
+        let dto = build_run_show(&run, &[]);
+        assert_eq!(dto.task_count, 0);
+        assert_eq!(dto.completed_count, 0);
+        assert_eq!(dto.status, RunStatus::Completed.as_str());
+        assert_eq!(
+            dto.completed_at.as_deref(),
+            Some("2026-06-28T00:01:00Z")
+        );
+    }
+
+    /// Task 4：show_run 走 Store——建 run + 完成 → show_run 返回正确计数。
+    #[test]
+    fn engine_show_run_returns_dto_with_counts() {
+        let engine = build_test_engine();
+        let run = engine
+            .store
+            .create_run("goal", COORDINATOR_HANDLE, DEFAULT_POLL_INTERVAL_MS)
+            .unwrap();
+        // 建两个任务并完成其中一个。
+        engine
+            .store
+            .create_task(Task {
+                id: "t1".into(),
+                parent_id: None,
+                spec: "do 1".into(),
+                status: TaskStatus::Pending,
+                deps: vec![],
+                result: None,
+                assignment: None,
+                created_at: "2026-06-28T00:00:00Z".into(),
+                completed_at: None,
+            })
+            .unwrap();
+        engine
+            .store
+            .create_task(Task {
+                id: "t2".into(),
+                parent_id: None,
+                spec: "do 2".into(),
+                status: TaskStatus::Pending,
+                deps: vec![],
+                result: None,
+                assignment: None,
+                created_at: "2026-06-28T00:00:00Z".into(),
+                completed_at: None,
+            })
+            .unwrap();
+        engine
+            .store
+            .update_task_status("t1", TaskStatus::Completed, None)
+            .unwrap();
+
+        let dto = engine.show_run(&run.id).unwrap();
+        assert_eq!(dto.id, run.id);
+        assert_eq!(dto.goal, "goal");
+        assert_eq!(dto.task_count, 2);
+        assert_eq!(dto.completed_count, 1);
+    }
+
+    /// Task 4：show_run 对不存在 / 空 run_id 报错。
+    #[test]
+    fn engine_show_run_rejects_missing_and_empty() {
+        let engine = build_test_engine();
+        // 空 run_id（show_run 不做 trim，命令层 trim——这里直测非空校验由命令层保证；
+        // 但「未找到」走 store.get_run → None → Err）。
+        assert!(engine.show_run("run_does_not_exist").is_err());
+    }
+
+    /// Task 4：list_active_agents 委派 Store——空仓库返回空 Vec。
+    #[test]
+    fn engine_list_active_agents_empty_when_no_dispatches() {
+        let engine = build_test_engine();
+        let agents = engine.list_active_agents().unwrap();
+        assert!(agents.is_empty(), "无派发时应返回空 Vec");
     }
 }

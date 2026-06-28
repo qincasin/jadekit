@@ -1140,13 +1140,15 @@ impl Store {
     }
 
     pub fn resolve_gate(&self, gate_id: &str, resolution: String) -> Result<(), String> {
+        // Task 4 (D.5)：resolved_at 改用 chrono RFC3339 绑定（替代 datetime('now')）。
+        let now = chrono::Utc::now().to_rfc3339();
         let conn = lock_conn!(self.conn);
         let updated = conn
             .execute(
                 "UPDATE decision_gates
-                 SET status = ?1, resolution = ?2, resolved_at = datetime('now')
-                 WHERE id = ?3",
-                params![GateStatus::Resolved.as_str(), resolution, gate_id],
+                 SET status = ?1, resolution = ?2, resolved_at = ?3
+                 WHERE id = ?4",
+                params![GateStatus::Resolved.as_str(), resolution, now, gate_id],
             )
             .map_err(|e| format!("Failed to resolve gate: {e}"))?;
         if updated == 0 {
@@ -1235,18 +1237,22 @@ impl Store {
         coordinator_handle: &str,
         poll_interval_ms: u64,
     ) -> Result<CoordinatorRun, String> {
+        // Task 4 (D.5)：显式绑定 RFC3339 created_at，让 DB 行与返回 struct 共用同一个
+        // `now`（此前 DB 走 schema DEFAULT datetime('now')，struct 走 chrono——格式不一致）。
+        let now = chrono::Utc::now().to_rfc3339();
         let id = format!("run_{}", uuid_v4_short());
         let conn = lock_conn!(self.conn);
         conn.execute(
             "INSERT INTO coordinator_runs
-                (id, spec, status, coordinator_handle, poll_interval_ms)
-             VALUES (?, ?, ?, ?, ?)",
+                (id, spec, status, coordinator_handle, poll_interval_ms, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
             params![
                 id,
                 goal,
                 RunStatus::Running.as_str(),
                 coordinator_handle,
                 poll_interval_ms as i64,
+                now,
             ],
         )
         .map_err(|e| format!("Failed to insert coordinator_run: {e}"))?;
@@ -1257,7 +1263,7 @@ impl Store {
             status: RunStatus::Running,
             coordinator_handle: coordinator_handle.to_string(),
             poll_interval_ms,
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: now,
             completed_at: None,
         })
     }
@@ -1267,17 +1273,22 @@ impl Store {
         run_id: &str,
         status: RunStatus,
     ) -> Result<(), String> {
+        // Task 4 (D.5)：用 chrono RFC3339 绑定替代 SQLite `datetime('now')`，
+        // 让所有 runtime 写入的时间戳格式统一（与 create_run / create_dispatch 等
+        // 已用 chrono 的路径一致）。CASE 表达式保持原语义：终态时写 now，否则 NULL
+        // → COALESCE 保留既有值。
+        let now = chrono::Utc::now().to_rfc3339();
         let conn = lock_conn!(self.conn);
         let updated = conn
             .execute(
                 "UPDATE coordinator_runs
                  SET status = ?1,
                      completed_at = COALESCE(
-                        CASE WHEN ?1 IN ('completed', 'failed') THEN datetime('now') ELSE NULL END,
+                        CASE WHEN ?1 IN ('completed', 'failed') THEN ?3 ELSE NULL END,
                         completed_at
                      )
                  WHERE id = ?2",
-                params![status.as_str(), run_id],
+                params![status.as_str(), run_id, now],
             )
             .map_err(|e| format!("Failed to update coordinator_run: {e}"))?;
         if updated == 0 {
@@ -1303,6 +1314,32 @@ impl Store {
         match rows
             .next()
             .map_err(|e| format!("fetch get_active_run: {e}"))?
+        {
+            Some(row) => Ok(Some(Self::row_to_run(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Task 4：按 id 取一条 coordinator run（任意状态）。[`crate::hermes::HermesEngine::show_run`] 用。
+    ///
+    /// 与 [`Store::get_active_run`] 同构，去掉 status 过滤、按 id 精确取一行。
+    /// 不存在 → Ok(None)。
+    pub fn get_run(&self, run_id: &str) -> Result<Option<CoordinatorRun>, String> {
+        let conn = lock_conn!(self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, spec, status, coordinator_handle, poll_interval_ms,
+                        created_at, completed_at
+                 FROM coordinator_runs
+                 WHERE id = ?1",
+            )
+            .map_err(|e| format!("prepare get_run: {e}"))?;
+        let mut rows = stmt
+            .query(params![run_id])
+            .map_err(|e| format!("query get_run: {e}"))?;
+        match rows
+            .next()
+            .map_err(|e| format!("fetch get_run: {e}"))?
         {
             Some(row) => Ok(Some(Self::row_to_run(row)?)),
             None => Ok(None),
@@ -1431,11 +1468,13 @@ impl Store {
                     TaskStatus::Completed,
                     result_text.as_deref(),
                 )?;
+                // Task 4 (D.5)：completed_at 改用 chrono RFC3339 绑定（替代 datetime('now')）。
+                let now = chrono::Utc::now().to_rfc3339();
                 tx.execute(
                     "UPDATE dispatch_contexts
-                     SET status = ?1, completed_at = datetime('now')
-                     WHERE id = ?2",
-                    params![DispatchStatus::Completed.as_str(), dispatch_id],
+                     SET status = ?1, completed_at = ?2
+                     WHERE id = ?3",
+                    params![DispatchStatus::Completed.as_str(), now, dispatch_id],
                 )
                 .map_err(|e| format!("reconcile complete dispatch: {e}"))?;
                 completed_via_worker_done += 1;
@@ -2015,5 +2054,106 @@ mod tests {
             Some("circuit broken: 3 fails"),
             "Retry(Ready, None) 必须保留失败的 result（COALESCE 语义，Finding 2）"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Task 4 —— get_run（任意状态）+ RFC3339 时间戳（D.5）
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Task 4：get_run 按 id 精确取 run，不带 status 过滤——Completed 的 run
+    /// 仍可被 get_run 取回（对比 get_active_run 在 run 进入终态后返回 None）。
+    #[test]
+    fn get_run_returns_any_status() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store
+            .create_run("do something", "coordinator", 1000)
+            .unwrap();
+        // 此时 get_active_run 命中（status = Running）。
+        assert!(store.get_active_run().unwrap().is_some());
+
+        // 推到终态。
+        store.update_run(&run.id, RunStatus::Completed).unwrap();
+        // get_active_run 不再命中（status != Running）。
+        assert!(
+            store.get_active_run().unwrap().is_none(),
+            "Completed run 不应再被 get_active_run 命中"
+        );
+        // get_run 仍能按 id 取回（任意状态）。
+        let got = store
+            .get_run(&run.id)
+            .unwrap()
+            .expect("get_run 应返回 Completed 的 run");
+        assert_eq!(got.id, run.id);
+        assert_eq!(got.status, RunStatus::Completed, "状态回读正确");
+        // Task 4 (D.5)：completed_at 应为 RFC3339（非 SQLite datetime('now') 格式）。
+        // chrono::Utc::now().to_rfc3339() 产出形如 "2026-06-28T08:22:05+00:00"，
+        // 含 'T' 且以 RFC3339 时区后缀（'Z' 或 '+00:00'）结尾。
+        let completed = got
+            .completed_at
+            .as_deref()
+            .expect("Completed run 必须有 completed_at");
+        assert!(
+            is_rfc3339_chrono(completed),
+            "completed_at 必须是 RFC3339（chrono 格式，含 T + 时区后缀），实际值：{completed}"
+        );
+    }
+
+    /// Task 4 (D.5)：create_run 返回的 created_at 与 DB 行的 created_at 一致
+    /// （此前 DB 走 datetime('now')、struct 走 chrono——格式不同）。
+    #[test]
+    fn create_run_struct_and_db_row_agree_on_created_at() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("g", "coordinator", 500).unwrap();
+        // 返回 struct 的 created_at 必须是 RFC3339（chrono 格式）。
+        assert!(
+            is_rfc3339_chrono(&run.created_at),
+            "struct.created_at 必须是 RFC3339（chrono 格式），实际：{}",
+            run.created_at
+        );
+        // DB 行的 created_at 必须与 struct 一致（同一值，不再分歧）。
+        let db_run = store.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(
+            db_run.created_at, run.created_at,
+            "DB 行与返回 struct 的 created_at 必须一致（Task 4 D.5 修复）"
+        );
+    }
+
+    /// Task 4 (D.5)：resolve_gate 的 resolved_at 落库为 RFC3339（非 datetime('now')）。
+    #[test]
+    fn resolve_gate_writes_rfc3339_resolved_at() {
+        let store = Store::open_in_memory().unwrap();
+        store.create_task(sample_task("rg", vec![])).unwrap();
+        let gate = store.create_gate("rg", "Q?", vec!["A".into()]).unwrap();
+        store.resolve_gate(&gate.id, "A".into()).unwrap();
+
+        // 直接 SQL 回读 resolved_at（绕过 row_to_gate——它没暴露 resolved_at 字段）。
+        let conn = store.conn.lock().expect("store conn lock");
+        let resolved_at: Option<String> = conn
+            .query_row(
+                "SELECT resolved_at FROM decision_gates WHERE id = ?1",
+                params![gate.id],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        drop(conn);
+        let resolved_at = resolved_at.expect("resolved_at 必须落库");
+        assert!(
+            is_rfc3339_chrono(&resolved_at),
+            "resolved_at 必须是 RFC3339（chrono 格式），实际：{resolved_at}"
+        );
+    }
+
+    /// 判断时间戳字符串是否为 chrono 的 RFC3339 输出（含 'T' 且以 'Z' 或 '+HH:MM' 结尾）。
+    /// 用来区分 `chrono::Utc::now().to_rfc3339()`（如 `2026-06-28T08:22:05+00:00`）
+    /// 与 SQLite `datetime('now')`（如 `2026-06-28 08:22:05`——空格分隔、无时区）。
+    fn is_rfc3339_chrono(s: &str) -> bool {
+        s.contains('T')
+            && (s.ends_with('Z') || {
+                // 形如 +HH:MM / -HH:MM 的时区后缀。
+                let tail = if s.len() >= 6 { &s[s.len() - 6..] } else { return false; };
+                matches!(tail.as_bytes()[0], b'+' | b'-')
+                    && tail.as_bytes()[3] == b':'
+            })
     }
 }
