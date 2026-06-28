@@ -32,7 +32,7 @@ use crate::hermes::types::{
     RunStatus, RuntimeKind, Task, TaskStatus,
 };
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 // =============================================================================
@@ -159,6 +159,9 @@ pub struct Coordinator {
     /// 当前 run 的 id（run() 入口一次性写入；dispatch/watcher/reap 读它构造事件 payload）。
     /// 用 OnceLock 内部可变传递，无需改 tick/dispatch_one/drain_inbox 的 &self 签名。
     event_run_id: OnceLock<String>,
+    /// Task 10（3c）：可选的取消信号。run() 每轮 tick 前检查；置位则 abort 在飞 + 标 Cancelled。
+    /// 默认 None（不注入时 run() 行为与 Phase 2 逐字一致——关键非回归保证）。
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Coordinator {
@@ -181,6 +184,7 @@ impl Coordinator {
             supervisor: None,
             event_sink: Arc::new(NullEventSink),
             event_run_id: OnceLock::new(),
+            cancel: None,
         }
     }
 
@@ -245,6 +249,14 @@ impl Coordinator {
     #[cfg(test)]
     pub fn with_concurrency_sampler(mut self, sampler: Arc<ConcurrencySampler>) -> Self {
         self.active_counter = Some(sampler);
+        self
+    }
+
+    /// 注入取消信号（Task 10（3c）：mid-run cancel）。不注入（默认 None）时 run()
+    /// 不检查取消，行为与 Phase 2 逐字一致（关键非回归保证）。
+    #[allow(dead_code)]
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
         self
     }
 
@@ -814,6 +826,25 @@ impl Coordinator {
         }
 
         for _ in 0..RUN_MAX_ITERATIONS {
+            // Task 10（3c）：每轮 tick 前检查取消信号。置位 → abort 在飞 dispatch +
+            // 标 Cancelled + emit Run{cancelled} + 退出。走独立分支，不经 derive_final_status。
+            // cancel=None 时此分支完全不执行——run() 行为与 Phase 2 逐字一致（关键非回归保证）。
+            if let Some(cancel) = self.cancel.as_ref() {
+                if cancel.load(Ordering::SeqCst) {
+                    // abort 所有在飞 dispatch 的 agent（best-effort）。
+                    let _ = self.abort_inflight_dispatches().await;
+                    self.store.update_run(run_id, RunStatus::Cancelled)?;
+                    // 发 Run{cancelled} 事件（驾驶舱标灰/标停）。
+                    let run_id_ev = self.event_run_id.get().cloned().unwrap_or_default();
+                    self.event_sink.emit(OrchestrationEvent::Run {
+                        run_id: run_id_ev,
+                        goal: self.goal.clone().unwrap_or_default(),
+                        status: RunStatus::Cancelled.as_str().to_string(),
+                        error: Some("cancelled by user".to_string()),
+                    });
+                    return Ok(RunStatus::Cancelled);
+                }
+            }
             let outcome = self.tick().await?;
             if outcome.converged {
                 let final_status = self.derive_final_status()?;
@@ -897,6 +928,33 @@ impl Coordinator {
             return Ok(RunStatus::Failed);
         }
         Ok(RunStatus::Completed)
+    }
+
+    /// Task 10（3c）：取消时 abort 所有在飞 dispatch 的 agent。best-effort（失败不阻塞
+    /// Cancelled 收敛）。按每个在飞 dispatch 所属 task 的 assignment.runtime 从 registry
+    /// 取介质做 abort（与 [`reap_silent_workers`](Self::reap_silent_workers) 同模式）。
+    ///
+    /// 采用 `.ok().flatten().and_then()` 容错链：DB 读取出错时不 break cancel 路径，
+    /// 跳过该 dispatch 继续下一个（Task 7 reviewer 建议的 tolerant 形式）。
+    async fn abort_inflight_dispatches(&self) -> Result<(), String> {
+        let active = self.store.list_active_dispatches()?;
+        for ctx in active {
+            let handle = AgentHandle {
+                agent_id: ctx.assignee.clone().unwrap_or_default(),
+            };
+            // 按该 task 的 assignment.runtime 选介质（缺省 Sdk）；缺 kind 跳过。
+            let kind = self
+                .store
+                .get_task(&ctx.task_id)
+                .ok()
+                .flatten()
+                .and_then(|t| t.assignment.map(|a| a.runtime))
+                .unwrap_or(RuntimeKind::Sdk);
+            if let Ok(rt) = self.registry.get(kind) {
+                let _ = rt.abort(&handle).await;
+            }
+        }
+        Ok(())
     }
 
     /// 给 watcher 用的 Store 句柄。当前 Store 内部是 `Arc<Mutex<Connection>>`，
@@ -3384,6 +3442,163 @@ mod tests {
             fx.store.get_active_run().unwrap(),
             None,
             "run 已收敛，不再是 active"
+        );
+    }
+
+    // =========================================================================
+    // Task 10（3c）—— mid-run cancel：abort 在飞 + 标 Cancelled + emit Run{cancelled}
+    // =========================================================================
+    //
+    // HangingRuntime：永不关闭的 mock runtime。send 返回的 receiver 的 sender 被持有
+    // （不 drop），watcher 的 recv() 永久阻塞 → dispatch 一直 in-flight。同时记录
+    // abort 调用，以便断言取消时 abort 被调。
+    //
+    // 测试策略（确定性，无 sleep）：
+    //   1. 用 HangingRuntime 派发一个 task（tick）→ watcher 阻塞 → dispatch 在飞。
+    //   2. 置 cancel=true。
+    //   3. 调 run() → 入口 update_run(Running) 后第 1 轮 tick 前 cancel 检查触发
+    //      → abort 在飞 + update_run(Cancelled) + emit Run{cancelled} → 返回 Cancelled。
+    //   4. 断言：run 返回 Cancelled；DB run.status=Cancelled + completed_at 有值；
+    //      HangingRuntime.abort_calls 含在飞 agent；CollectSink 收到 Run{cancelled}。
+
+    /// 永不关闭的 mock runtime：send 返回的 receiver 的 sender 被持有（不 drop），
+    /// watcher 的 recv() 永久阻塞（模拟"在飞 agent"）。同时记录 abort 调用。
+    struct HangingRuntime {
+        abort_calls: std::sync::Mutex<Vec<String>>,
+        /// 持有所有 sender 不 drop → watcher 的 recv() 永久阻塞。
+        _senders: std::sync::Mutex<Vec<mpsc::UnboundedSender<AgentEvent>>>,
+    }
+
+    impl HangingRuntime {
+        fn new() -> Self {
+            Self {
+                abort_calls: std::sync::Mutex::new(Vec::new()),
+                _senders: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn abort_calls(&self) -> Vec<String> {
+            self.abort_calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl AgentRuntime for HangingRuntime {
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities {
+                structured_events: true,
+                supports_resume: false,
+                supports_permission_prompt: false,
+            }
+        }
+
+        async fn start(&self, spec: RuntimeStartSpec) -> Result<AgentHandle, RuntimeError> {
+            Ok(AgentHandle {
+                agent_id: spec.agent_id,
+            })
+        }
+
+        async fn send(
+            &self,
+            _handle: &AgentHandle,
+            _prompt: String,
+        ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, RuntimeError> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            // 关键：把 sender 存起来不 drop → watcher 的 recv() 永久阻塞（dispatch 一直 in-flight）。
+            self._senders.lock().unwrap().push(tx);
+            Ok(rx)
+        }
+
+        async fn abort(&self, handle: &AgentHandle) -> Result<(), RuntimeError> {
+            self.abort_calls
+                .lock()
+                .unwrap()
+                .push(handle.agent_id.clone());
+            Ok(())
+        }
+
+        async fn liveness(&self, _handle: &AgentHandle) -> Liveness {
+            Liveness::Alive
+        }
+
+        async fn stop(&self, _handle: &AgentHandle) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_run_cancel_aborts_inflight_and_marks_cancelled() {
+        let fx = Fixture::new();
+        fx.create_task("long", "never finishes", vec![]);
+
+        // HangingRuntime：send 返回永不关闭的 receiver → dispatch 一直 in-flight。
+        let hanging = Arc::new(HangingRuntime::new());
+        let registry = RuntimeRegistry::single(hanging.clone() as Arc<dyn AgentRuntime>);
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // 同时注入 CollectSink 断言 Run{cancelled} 事件被发射。
+        let sink: Arc<CollectSink> =
+            Arc::new(CollectSink(std::sync::Mutex::new(Vec::new())));
+        let sink_for_inject: Arc<dyn OrchestrationEventSink> = sink.clone();
+
+        let coord = Coordinator::new(
+            fx.store.clone_handle(),
+            registry,
+            fx.repo_root.clone(),
+            fx.worktrees_dir.clone(),
+        )
+        .with_cancel(cancel.clone())
+        .with_event_sink(sink_for_inject);
+
+        let run = fx
+            .store
+            .create_run("cancel run", COORDINATOR_HANDLE, 5)
+            .unwrap();
+
+        // 第 1 轮：手动 tick 派发 long（in-flight——watcher 永久阻塞在 recv）。
+        coord.tick().await.unwrap();
+        fx.yield_for_watchers().await;
+
+        // 确认 dispatch 在飞（active）。
+        let active = fx.store.list_active_dispatches().unwrap();
+        assert_eq!(active.len(), 1, "应有一条在飞 dispatch");
+        assert_eq!(active[0].assignee.as_deref(), Some("long"));
+
+        // 置 cancel。
+        cancel.store(true, Ordering::SeqCst);
+
+        // run() 入口 update_run(Running) 后第 1 轮 tick 前检查 cancel → 已置位
+        // → abort 在飞 + update_run(Cancelled) + emit Run{cancelled} → 返回 Cancelled。
+        let status = coord.run(&run.id).await.unwrap();
+        assert_eq!(status, RunStatus::Cancelled, "run() 应返回 Cancelled");
+
+        // run 行被持久化为 Cancelled + completed_at 有值（终态）。
+        let got = fx.store.get_run(&run.id).unwrap().expect("run present");
+        assert_eq!(got.status, RunStatus::Cancelled, "run 状态必须 Cancelled");
+        assert!(
+            got.completed_at.is_some(),
+            "cancelled 是终态，应记 completed_at"
+        );
+
+        // abort 被调（HangingRuntime 记录到）——证明在飞 dispatch 的介质 abort 被调。
+        let aborts = hanging.abort_calls();
+        assert!(
+            aborts.iter().any(|a| a == "long"),
+            "cancel 应触发在飞 dispatch 的介质 abort 被调；got abort_calls={:?}",
+            aborts
+        );
+
+        // Run{cancelled} 事件被发射（驾驶舱标灰/标停）。
+        let evs = sink.snapshot();
+        let cancelled_run_event = evs.iter().any(|e| matches!(e,
+            OrchestrationEvent::Run { status, error, .. }
+            if status == RunStatus::Cancelled.as_str()
+                && error.is_some()
+        ));
+        assert!(
+            cancelled_run_event,
+            "应收集到 Run{{status:cancelled}} 事件 in {:?}",
+            evs
         );
     }
 }

@@ -1060,6 +1060,7 @@ pub fn run() {
             hermes_commands::hermes_dispatch_show,
             hermes_commands::hermes_gate_resolve,
             hermes_commands::hermes_run_stop,
+            hermes_commands::hermes_run_cancel,
             hermes_commands::hermes_run_show,
             hermes_commands::hermes_agent_list,
         ])
