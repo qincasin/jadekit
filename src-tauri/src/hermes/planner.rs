@@ -87,6 +87,11 @@ const KEY_DECISION: &str = "decision";
 /// replan 响应的 `reason` 键。
 const KEY_REASON: &str = "reason";
 
+/// RuntimeKind::Sdk 对应的默认 tool 标识（Planner 按 runtime 自动选 tool，不让模型指定）。
+const DEFAULT_SDK_TOOL: &str = "claude-sdk";
+/// RuntimeKind::Cli 对应的默认 tool 标识。
+const DEFAULT_CLI_TOOL: &str = "claude-cli";
+
 // =============================================================================
 // Roster —— 可选介质清单（最小可用集）
 // =============================================================================
@@ -487,8 +492,8 @@ fn build_assignment(
 
 fn default_tool(runtime: RuntimeKind) -> &'static str {
     match runtime {
-        RuntimeKind::Sdk => "claude-sdk",
-        RuntimeKind::Cli => "claude-cli",
+        RuntimeKind::Sdk => DEFAULT_SDK_TOOL,
+        RuntimeKind::Cli => DEFAULT_CLI_TOOL,
     }
 }
 
