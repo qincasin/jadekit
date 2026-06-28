@@ -40,10 +40,12 @@ import {
     closeAgent,
     createWorktree,
     type HelmDiffSummary,
+    mergeWorktree,
     worktreeDiff,
 } from '../services/worktreeService';
 import {resolveSendCwd} from './chatSendCwd';
 import {resolveTabForEvent} from './chatEventRouting';
+import type {FanoutPlan} from './fanoutPlan';
 
 const DRAFT_KEY_PREFIX = 'ccg-chat-draft:';
 const REASONING_KEY = 'ccg-chat-reasoning';
@@ -329,6 +331,7 @@ export interface ChatSessionTab {
     worktreePath: string | null;
     worktreeBranch: string | null;
     worktreeDiff: HelmDiffSummary | null;
+    fanoutGroupId: string | null;
     activeSession: SessionMeta | null;
     pendingSessionKey: string | null;
     lastSessionLoadMetrics: ChatSessionLoadMetrics | null;
@@ -386,6 +389,8 @@ interface ChatState {
     /** 当前 Agent worktree 分支名与 diff 摘要，用于 tab 徽章。 */
     worktreeBranch: string | null;
     worktreeDiff: HelmDiffSummary | null;
+    /** 当前 tab 所属的扇出组 id；非扇出 tab 为 null。 */
+    fanoutGroupId: string | null;
     /** 当前从历史中载入的会话元信息 */
     activeSession: SessionMeta | null;
     /** 当前正在切换/加载中的历史会话 key */
@@ -437,6 +442,9 @@ interface ChatState {
         displayText?: string;
         createWorktree?: boolean;
     }) => Promise<boolean>;
+    launchFanout: (repoRoot: string, plan: FanoutPlan) => Promise<void>;
+    discardFanoutAgent: (tabKey: string) => Promise<void>;
+    mergeFanoutWinner: (tabKey: string) => Promise<'merged' | 'conflict'>;
     loadSession: (session: SessionMeta) => Promise<void>;
     loadActiveSessionFullHistory: () => Promise<ChatMessage[] | null>;
     expandActiveSessionHistory: () => Promise<void>;
@@ -499,6 +507,7 @@ function createTabFromState(
         worktreePath: state.worktreePath,
         worktreeBranch: state.worktreeBranch,
         worktreeDiff: state.worktreeDiff,
+        fanoutGroupId: state.fanoutGroupId,
         activeSession: state.activeSession,
         pendingSessionKey: state.pendingSessionKey,
         lastSessionLoadMetrics: state.lastSessionLoadMetrics,
@@ -536,6 +545,7 @@ function createEmptyTabFromState(
         worktreePath: null,
         worktreeBranch: null,
         worktreeDiff: null,
+        fanoutGroupId: null,
         activeSession: null,
         pendingSessionKey: null,
         lastSessionLoadMetrics: null,
@@ -567,6 +577,7 @@ function projectTabToState(tab: ChatSessionTab): Partial<ChatState> {
         worktreePath: tab.worktreePath,
         worktreeBranch: tab.worktreeBranch,
         worktreeDiff: tab.worktreeDiff,
+        fanoutGroupId: tab.fanoutGroupId,
         activeSession: tab.activeSession,
         pendingSessionKey: tab.pendingSessionKey,
         lastSessionLoadMetrics: tab.lastSessionLoadMetrics,
@@ -1235,6 +1246,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     worktreePath: null,
     worktreeBranch: null,
     worktreeDiff: null,
+    fanoutGroupId: null,
     activeSession: null,
     pendingSessionKey: null,
     lastSessionLoadMetrics: null,
@@ -1755,6 +1767,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                     worktreePath: sendState.worktreePath,
                     worktreeBranch: sendState.worktreeBranch,
                     worktreeDiff: sendState.worktreeDiff,
+                    fanoutGroupId: sendState.fanoutGroupId,
                     activeSession: sendState.activeSession,
                     pendingSessionKey: sendState.pendingSessionKey,
                     lastSessionLoadMetrics: sendState.lastSessionLoadMetrics,
@@ -1784,6 +1797,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             worktreePath: sendState.worktreePath,
             worktreeBranch: sendState.worktreeBranch,
             worktreeDiff: sendState.worktreeDiff,
+            fanoutGroupId: sendState.fanoutGroupId,
             activeSession: sendState.activeSession,
             activeRequestId: sendState.activeRequestId,
             contextTokens: sendState.contextTokens,
@@ -1896,6 +1910,196 @@ export const useChatStore = create<ChatState>((set, get) => ({
             })));
             return false;
         }
+    },
+
+    launchFanout: async (repoRoot, plan) => {
+        const normalizedRepo = repoRoot.trim();
+        if (!normalizedRepo) {
+            set({error: '扇出需要先选择 Git 工作目录'});
+            return;
+        }
+        if (plan.agents.length === 0) {
+            set({error: '扇出需要至少选择一个模型'});
+            return;
+        }
+        latestSessionLoadToken += 1;
+        prepareChatTurnStoppedNotificationPermission();
+
+        if (get().providerConfigDirty) {
+            await invoke('chat_restart_daemon');
+            set({
+                providerConfigDirty: false,
+                daemonReady: false,
+                daemonStatus: 'starting',
+                daemonReconnecting: false,
+                error: null,
+            });
+            scheduleDaemonReadyTimeout(get, set);
+        }
+
+        const stateBeforeFanout = get();
+        const prepared: Array<{
+            tab: ChatSessionTab;
+            assistantMessageId: string;
+        }> = [];
+
+        for (const agent of plan.agents) {
+            try {
+                const info = await createWorktree(normalizedRepo, agent.worktreeName);
+                const diff = await worktreeDiff(info.path).catch(() => null);
+                const timestamp = nowMs();
+                const userMsg: ChatMessage = {
+                    id: newId(),
+                    role: 'user',
+                    content: plan.prompt,
+                    raw: buildUserRawMessage(plan.prompt, []),
+                    createdAt: timestamp,
+                };
+                const assistantMsg: ChatMessage = {
+                    id: newId(),
+                    role: 'assistant',
+                    content: '',
+                    streaming: true,
+                    createdAt: timestamp,
+                };
+                prepared.push({
+                    assistantMessageId: assistantMsg.id,
+                    tab: {
+                        ...createEmptyTabFromState(stateBeforeFanout, normalizedRepo, timestamp, `fanout:${plan.groupId}:${agent.agentId}`),
+                        agentId: agent.agentId,
+                        messages: [userMsg, assistantMsg],
+                        provider: agent.pick.chatProvider,
+                        model: agent.pick.model,
+                        currentCwd: normalizedRepo,
+                        worktreePath: info.path,
+                        worktreeBranch: info.branch,
+                        worktreeDiff: diff,
+                        fanoutGroupId: plan.groupId,
+                        status: 'running',
+                        updatedAt: timestamp,
+                    },
+                });
+            } catch (e) {
+                set({error: String(e)});
+                return;
+            }
+        }
+
+        const firstTab = prepared[0].tab;
+        set((state) => ({
+            openTabs: prepared.reduce(
+                (tabs, item) => upsertTab(tabs, item.tab),
+                saveProjectionBeforeSwitch(state),
+            ),
+            activeTabKey: firstTab.key,
+            ...projectTabToState(firstTab),
+            error: null,
+        }));
+
+        for (const item of prepared) {
+            const {tab, assistantMessageId} = item;
+            pendingSendOwners.set(assistantMessageId, {tabKey: tab.key, assistantMessageId});
+            try {
+                const effectiveModel = tab.provider === 'claude'
+                    ? apply1MContextSuffix(tab.model, tab.longContextEnabled)
+                    : tab.model;
+                const requestId = await invoke<string>('chat_send', {
+                    agentId: tab.agentId,
+                    provider: tab.provider,
+                    command: 'send',
+                    params: {
+                        message: plan.prompt,
+                        cwd: resolveSendCwd({worktreePath: tab.worktreePath, cwd: tab.currentCwd}),
+                        model: effectiveModel,
+                        permissionMode: tab.permissionMode,
+                        reasoningEffort: tab.reasoningEffort,
+                        streaming: true,
+                    },
+                });
+                pendingSendOwners.delete(assistantMessageId);
+                requestTabKeys.set(requestId, tab.key);
+                set((state) => updateTabStateByKey(state, tab.key, (current) => ({
+                    ...current,
+                    activeRequestId: requestId,
+                    status: 'running',
+                    error: null,
+                })));
+            } catch (e) {
+                pendingSendOwners.delete(assistantMessageId);
+                notifyStoppedRequestOnce(
+                    `fanout-send-error:${assistantMessageId}`,
+                    'error',
+                    tab.provider,
+                    String(e),
+                );
+                set((state) => updateTabStateByKey(state, tab.key, (current) => ({
+                    ...current,
+                    error: String(e),
+                    status: 'error',
+                    messages: current.messages.map((message) => (
+                        message.id === assistantMessageId
+                            ? {...message, streaming: false, error: String(e)}
+                            : message
+                    )),
+                })));
+            }
+        }
+    },
+
+    discardFanoutAgent: async (tabKey) => {
+        const tab = get().openTabs.find((item) => item.key === tabKey);
+        if (!tab) return;
+        await closeAgent({
+            agentId: tab.agentId,
+            removeWorktree: true,
+            repoRoot: tab.currentCwd,
+            worktreePath: tab.worktreePath,
+            force: true,
+        });
+        retirePendingSendsForTab(tab.key);
+        retireRequestOwnership(tab.activeRequestId);
+        set((state) => {
+            const tabs = saveProjectionBeforeSwitch(state);
+            const nextTabs = removeTab(tabs, tab.key);
+            const nextActive = getNextTabAfterClose({
+                tabs,
+                closingKey: tab.key,
+                activeKey: state.activeTabKey,
+            });
+            const nextTab = nextTabs.find((item) => item.key === nextActive) ?? null;
+            if (!nextTab) {
+                const emptyTab = createEmptyTabFromState(state);
+                return {
+                    openTabs: [],
+                    activeTabKey: null,
+                    ...projectTabToState(emptyTab),
+                };
+            }
+            return {
+                openTabs: nextTabs,
+                activeTabKey: nextTab.key,
+                ...projectTabToState(nextTab),
+            };
+        });
+    },
+
+    mergeFanoutWinner: async (tabKey) => {
+        const tab = get().openTabs.find((item) => item.key === tabKey);
+        const repoRoot = tab?.currentCwd?.trim();
+        const sourceBranch = tab?.worktreeBranch?.trim();
+        if (!tab || !repoRoot || !sourceBranch) {
+            set({error: '无法合并：缺少 worktree 分支信息'});
+            return 'conflict';
+        }
+        const result = await mergeWorktree(repoRoot, sourceBranch);
+        if (result.outcome === 'conflict') {
+            set((state) => updateTabStateByKey(state, tab.key, (current) => ({
+                ...current,
+                error: '合并冲突，已自动回滚，请手动查看差异',
+                status: 'error',
+            })));
+        }
+        return result.outcome;
     },
 
     loadSession: async (session) => {
