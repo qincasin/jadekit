@@ -642,7 +642,7 @@ pub(crate) mod test_support {
     pub struct FakeDaemonClient {
         pub running: AtomicBool,
         pub restart_calls: AtomicUsize,
-        pub stop_calls: AtomicUsize,
+        pub stop_calls: Arc<AtomicUsize>,
         pub config_update_calls: AtomicUsize,
         /// send_streaming 被调用次数（路由命中断言）。
         pub send_calls: AtomicUsize,
@@ -656,7 +656,7 @@ pub(crate) mod test_support {
             Self {
                 running: AtomicBool::new(running),
                 restart_calls: AtomicUsize::new(0),
-                stop_calls: AtomicUsize::new(0),
+                stop_calls: Arc::new(AtomicUsize::new(0)),
                 config_update_calls: AtomicUsize::new(0),
                 send_calls: AtomicUsize::new(0),
                 abort_calls: AtomicUsize::new(0),
@@ -668,7 +668,7 @@ pub(crate) mod test_support {
             Self {
                 running: AtomicBool::new(false),
                 restart_calls: AtomicUsize::new(0),
-                stop_calls: AtomicUsize::new(0),
+                stop_calls: Arc::new(AtomicUsize::new(0)),
                 config_update_calls: AtomicUsize::new(0),
                 send_calls: AtomicUsize::new(0),
                 abort_calls: AtomicUsize::new(0),
@@ -748,6 +748,16 @@ pub(crate) mod test_support {
     /// 构造一个最小 fake daemon client（默认 running），供 pool/manager 测试复用。
     pub fn fake_client() -> std::sync::Arc<dyn ManagerDaemonClient> {
         std::sync::Arc::new(FakeDaemonClient::new(true))
+    }
+
+    /// 构造带外部 stop 计数器的 fake client，用于验证竞态败者被回收。
+    pub fn fake_client_with_stop_counter() -> (
+        std::sync::Arc<dyn ManagerDaemonClient>,
+        std::sync::Arc<AtomicUsize>,
+    ) {
+        let fake = FakeDaemonClient::new(true);
+        let stop_calls = fake.stop_calls.clone();
+        (std::sync::Arc::new(fake), stop_calls)
     }
 }
 
