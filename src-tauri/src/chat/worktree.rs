@@ -1,0 +1,167 @@
+//! 每 Agent 独立 git worktree 的管理：建立/删除/列举/脏检查。
+//! worktree 是 Helm 并行隔离的物理边界——多个 Agent 改同一 repo 互不踩。
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Helm 创建的分支前缀，集中常量避免魔法串。
+pub const HELM_BRANCH_PREFIX: &str = "helm/";
+
+#[derive(Debug, Clone)]
+pub struct WorktreeInfo {
+    pub path: PathBuf,
+    pub branch: String,
+}
+
+pub struct WorktreeManager;
+
+impl WorktreeManager {
+    fn run(repo_root: &Path, args: &[&str]) -> Result<String, String> {
+        let out = Command::new("git")
+            .current_dir(repo_root)
+            .args(args)
+            .output()
+            .map_err(|e| format!("git 执行失败: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git {:?} 失败: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// 在 worktrees_dir/name 建立新分支 helm/<name> 的 worktree（基线 = repo HEAD）。
+    pub fn create(
+        repo_root: &Path,
+        worktrees_dir: &Path,
+        name: &str,
+    ) -> Result<WorktreeInfo, String> {
+        std::fs::create_dir_all(worktrees_dir)
+            .map_err(|e| format!("创建 worktrees 目录失败: {e}"))?;
+        let path = worktrees_dir.join(name);
+        let branch = format!("{HELM_BRANCH_PREFIX}{name}");
+        let path_str = path.to_string_lossy();
+        Self::run(repo_root, &["worktree", "add", "-b", &branch, &path_str, "HEAD"])?;
+        let path = path.canonicalize().unwrap_or(path);
+        Ok(WorktreeInfo { path, branch })
+    }
+
+    /// 删除 worktree。非 force 时若有未提交改动则拒绝。
+    pub fn remove(repo_root: &Path, worktree_path: &Path, force: bool) -> Result<(), String> {
+        if !force && Self::has_uncommitted_changes(worktree_path)? {
+            return Err("worktree 有未提交改动，拒绝删除（需显式 force）".into());
+        }
+        let path_str = worktree_path.to_string_lossy();
+        if force {
+            Self::run(repo_root, &["worktree", "remove", "--force", &path_str])?;
+        } else {
+            Self::run(repo_root, &["worktree", "remove", &path_str])?;
+        }
+        Ok(())
+    }
+
+    /// 列出 repo 的所有 worktree（解析 `git worktree list --porcelain`）。
+    pub fn list(repo_root: &Path) -> Result<Vec<WorktreeInfo>, String> {
+        let out = Self::run(repo_root, &["worktree", "list", "--porcelain"])?;
+        let mut result = Vec::new();
+        let mut cur_path: Option<PathBuf> = None;
+        for line in out.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                let path = PathBuf::from(p.trim());
+                cur_path = Some(path.canonicalize().unwrap_or(path));
+            } else if let Some(b) = line.strip_prefix("branch ") {
+                if let Some(path) = cur_path.take() {
+                    let branch = b
+                        .trim()
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(b.trim())
+                        .to_string();
+                    result.push(WorktreeInfo { path, branch });
+                }
+            } else if line.is_empty() {
+                cur_path = None;
+            }
+        }
+        Ok(result)
+    }
+
+    /// 该 worktree 是否有未提交改动（含未跟踪文件）。
+    pub fn has_uncommitted_changes(worktree_path: &Path) -> Result<bool, String> {
+        let out = Self::run(worktree_path, &["status", "--porcelain"])?;
+        Ok(!out.trim().is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorktreeManager;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {:?} failed", args);
+    }
+
+    fn init_repo(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.email", "t@t.t"]);
+        git(dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("README.md"), "hi").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "init"]);
+    }
+
+    #[test]
+    fn create_then_list_then_remove() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let wts = tmp.path().join("worktrees");
+
+        let info = WorktreeManager::create(&repo, &wts, "task-a").unwrap();
+        assert!(info.path.exists());
+        assert_eq!(info.branch, "helm/task-a");
+        assert!(
+            info.path.join("README.md").exists(),
+            "worktree 是完整 checkout"
+        );
+
+        let listed = WorktreeManager::list(&repo).unwrap();
+        assert!(listed.iter().any(|w| w.path == info.path));
+
+        assert!(!WorktreeManager::has_uncommitted_changes(&info.path).unwrap());
+
+        WorktreeManager::remove(&repo, &info.path, false).unwrap();
+        assert!(!info.path.exists());
+    }
+
+    #[test]
+    fn remove_without_force_refuses_dirty_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let wts = tmp.path().join("worktrees");
+        let info = WorktreeManager::create(&repo, &wts, "task-b").unwrap();
+
+        std::fs::write(info.path.join("new.txt"), "dirty").unwrap();
+        assert!(WorktreeManager::has_uncommitted_changes(&info.path).unwrap());
+        assert!(
+            WorktreeManager::remove(&repo, &info.path, false).is_err(),
+            "脏工作树非 force 必须拒删"
+        );
+        assert!(
+            WorktreeManager::remove(&repo, &info.path, true).is_ok(),
+            "force 可删"
+        );
+    }
+}

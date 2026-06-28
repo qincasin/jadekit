@@ -25,6 +25,7 @@ mod protocol;
 mod resources;
 mod sdk_installer;
 mod slash_commands;
+mod worktree;
 
 pub use agent_id::{sanitize_agent_id, AgentId, DEFAULT_AGENT_ID};
 pub use manager::ChatManager;
@@ -36,3 +37,4 @@ pub use permission_watcher::{
 pub use resources::permission_dir;
 pub use sdk_installer::SdkStatus;
 pub use slash_commands::list_slash_commands;
+pub use worktree::{WorktreeInfo, WorktreeManager};
