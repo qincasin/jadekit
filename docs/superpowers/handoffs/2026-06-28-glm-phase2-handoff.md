@@ -1,10 +1,21 @@
 # 交接：GLM 全量执行 Helm × Hermes — Phase 2（Hermes 编排引擎）
 
-> 给执行 agent（GLM）的冷启动交接。GLM 单会话**从头干到尾**(Task 1→18)，但每个子阶段结尾的 GATE 必须停下自检 + 合并。本文件 + 引用文档即全部所需，逐字遵守纪律。
+> 给执行 agent（GLM）的冷启动交接。GLM 从 Task 1 推进到 Task 18，每个子阶段结尾的 GATE 必须停下自检 + 合并。本文件 + 引用文档即全部所需，逐字遵守纪律。
 
-## 0. 环境要求
+## 0. 执行方式（防跑偏，最重要）
 
-可写工作区 + 可执行 `git`/`cargo`/`npm`；可能新增 Rust 依赖（`async-trait`、`portable-pty`）需联网 `cargo fetch`。请在 workspace-write + 网络可用模式运行。若 superpowers 技能可用就激活 `executing-plans`；不可用则按计划正文 TDD 步骤执行。codegraph 优先用 MCP，没有就用 codegraph CLI。
+**首选 `subagent-driven-development` 技能**——Phase 2 是 18 任务、并发重灾区的长计划，这套机制防漂移最强：
+- **每个 task 派一个全新子 agent**，只给它该 task 的 brief（看不到其他任务），干完即弃 → 不累积上下文、不顺手改无关代码、不被前文带偏。
+- **每个 task 完成后强制过两道审查**（spec-compliance + code-quality）才接收、才打勾、才 commit → 跑偏当场拦截。
+- 用 `.superpowers/sdd/progress.md` 持久化检查点 → 长跑/压缩后能精确恢复到第几任务。
+
+**GLM 在此模式下是协调者，不是执行者**：你负责按计划把 task 切成 brief、派子 agent、跑两道审查、按 progress.md 推进；**绝不自己埋头写代码**，绝不跳过审查，绝不用"未完成任务总表"代替当前任务的定向验证。
+
+> 若 `subagent-driven-development` 不可用，降级用 `executing-plans`（单会话直跑），并更严格地守住计划里的 6 个子阶段 GATE。两者都不可用时，按计划正文 TDD 步骤手动执行。
+
+## 0b. 环境要求
+
+可写工作区 + 可执行 `git`/`cargo`/`npm`；可能新增 Rust 依赖（`async-trait`、`portable-pty`）需联网 `cargo fetch`。请在 workspace-write + 网络可用模式运行。codegraph 优先用 MCP，没有就用 codegraph CLI。
 
 ## 1. 角色与目标
 

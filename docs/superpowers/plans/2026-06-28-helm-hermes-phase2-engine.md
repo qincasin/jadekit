@@ -1,6 +1,6 @@
 # Helm × Hermes — Phase 2：Hermes 编排引擎（GLM 全量执行）实现计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans（推荐，GLM 单会话全量执行）或 subagent-driven-development 逐 task 实施。Steps 用 checkbox（`- [ ]`）跟踪。
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development（**推荐**，防跑偏最强：每 task 全新子 agent + 两道审查 + progress.md 检查点；GLM 作协调者不自己写）。不可用时降级 superpowers:executing-plans（单会话直跑，更严守 6 个子阶段 GATE）。Steps 用 checkbox（`- [ ]`）跟踪。
 
 **Goal:** 在 Helm（Phase 0/1/1b：daemon 池 + worktree 隔离 + 异构扇出）之上，构建 **Hermes 编排引擎**：可插拔 `AgentRuntime` 契约 + SQLite 持久化状态机 + 确定性 Coordinator 循环 + WorkerSupervisor 判活 + LLM Planner（拆解/选兵/replan）+ CliRuntime（裸 CLI 介质）。让"给一个目标 → 自动拆解 → 选兵 → 并行调度 → 收敛"成为后端可持久化、可崩溃恢复的能力。
 
@@ -297,6 +297,10 @@ pub struct RuntimeError(pub String);
 - **类型一致**：`AgentRuntime`/`AgentEvent`/`RuntimeStartSpec`（2a）贯穿 SdkRuntime/CliRuntime（2a/2f）、Coordinator（2c）、Supervisor（2d）、Planner（2e）；`Task`/`DispatchContext`/枚举（2b）贯穿 Store/Coordinator。
 - **并发安全**：promote_ready 与 update_status 同事务（Task 6）；熔断 3 次（Task 6/9）；判活分级 + WaitingInput 不被杀（Task 11-12）；崩溃恢复对账（Task 7）。
 
-## GLM 执行说明（全量款）
+## GLM 执行说明（全量款，首选 subagent-driven-development）
 
-GLM 单会话从 Task 1 顺序执行到 Task 18，**每个子阶段(2a–2g)结尾的 GATE 必须停下自检**（跑该子阶段测试 + cargo check），自检过了再继续下一子阶段；**每个 GATE 处 `--no-ff` merge 回 `feat/helm`**。全程 TDD、逐 task commit、不攒批、不改测试凑绿。任一并发不变量测试失败 → systematic debugging 定位根因，不猜。做完 Task 18 出交付报告（DoD 逐条 + git log + 自动门输出 + 手动 e2e 状态 + 偏差未决）。
+GLM 作**协调者**用 `subagent-driven-development` 从 Task 1 推进到 Task 18：每个 task 派全新子 agent（只给该 task brief）→ 子 agent TDD 实现 → **两道审查（spec-compliance + code-quality）过了**才接收、定向打勾、commit → 下一 task；进度记 `.superpowers/sdd/progress.md`。GLM **不自己埋头写代码**、不跳审查、不用未完成任务总表代替当前任务验证。
+
+**每个子阶段(2a–2g)结尾的 GATE 必须停下自检**（跑该子阶段测试 + cargo check），过了 `--no-ff` merge 回 `feat/helm` 再进下一子阶段。全程 TDD、逐 task commit、不攒批、不改测试凑绿。任一并发不变量测试失败 → systematic debugging 定位根因，不猜。做完 Task 18 出交付报告（DoD 逐条 + git log + 自动门输出 + 手动 e2e 状态 + 偏差未决）。
+
+> 降级：若 SDD 不可用，用 `executing-plans` 单会话直跑，并更严格守住上面的 6 个子阶段 GATE。
