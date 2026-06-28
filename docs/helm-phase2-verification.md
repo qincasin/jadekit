@@ -360,6 +360,15 @@ heavy parallel test execution; they pass deterministically in isolation. The
 Hermes engine logic itself (Coordinator / Store / Supervisor / Planner /
 SdkRuntime) has zero flaky tests.
 
+### D.8 Worktree / branch leak on completed runs (Phase 3)
+
+`cleanup_prior_worktree` only runs on **re-dispatch**. A converged run with N
+completed tasks leaves N git worktrees + N `helm/<task_id>` branches on disk
+permanently — there is no end-of-run sweep. Invisible under mock-runtime
+testing (no filesystem assertions); will surface as disk litter in real-LLM
+e2e. Engine correctness is unaffected; a Phase-3 end-of-run cleanup pass
+(merge-or-discard each worktree when the run converges) is the first item.
+
 ---
 
 ## E. Self-review
