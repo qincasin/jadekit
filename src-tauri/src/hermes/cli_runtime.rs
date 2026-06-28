@@ -73,7 +73,8 @@ struct CliSession {
     /// 的窗口期，liveness/abort 容错处理（见各自实现）。
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     /// 一旦子进程已退出（被 abort/stop 或自然退出），置为 true；
-    /// 防止 abort 后再次 kill 已死进程时报错。
+    /// 防止 abort 后再次 kill 已死进程时报错；同时被 reader-EOF wait 任务
+    /// 读取，若为 true 则**跳过** Done 发送（abort/stop 已接管终止语义）。
     killed: bool,
     /// 当前活跃的 reader task。每次新 send 前会 await 上一次的（若有），
     /// 防止多个并发读任务交错写同一 channel。CLI agent 一次只处理一条 prompt，
@@ -133,6 +134,33 @@ fn signal_process_group(
     _master: &Box<dyn portable_pty::MasterPty + Send>,
     _sig: i32,
 ) -> bool {
+    false
+}
+
+// === 平台门控的「具体信号」helper ============================================
+//
+// 设计目的：把 `libc::SIGHUP` / `libc::SIGKILL` 字面量**封装进** `#[cfg(unix)]`
+// 的函数体里，使 call site（`abort`/`stop` 这些非平台门控的方法）永远不直接
+// 引用 `libc::` 常量——否则 Windows 上 `libc::SIGHUP` 是未定义符号，编译失败
+// （项目按 CLAUDE.md 发布 Windows .exe/.msi，必须可编译）。Windows 桩返回 false
+// （调用方据此回退到 `child.kill()` 走 TerminateProcess）。
+#[cfg(unix)]
+fn signal_group_hup(master: &Box<dyn portable_pty::MasterPty + Send>) -> bool {
+    signal_process_group(master, libc::SIGHUP)
+}
+
+#[cfg(unix)]
+fn signal_group_kill(master: &Box<dyn portable_pty::MasterPty + Send>) -> bool {
+    signal_process_group(master, libc::SIGKILL)
+}
+
+#[cfg(not(unix))]
+fn signal_group_hup(_master: &Box<dyn portable_pty::MasterPty + Send>) -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+fn signal_group_kill(_master: &Box<dyn portable_pty::MasterPty + Send>) -> bool {
     false
 }
 
@@ -343,23 +371,37 @@ impl AgentRuntime for CliRuntime {
                         Err(_) => return,
                     };
 
-                // 第 3 步：再取锁还回 child，标记 killed，发 Done。
-                let mut sessions = sessions_clone.lock().await;
-                if let Some(session) = sessions.get_mut(&agent_id) {
-                    // 还回 child（若 session 仍存在）。若 stop 已移除 session，
-                    // child 在此 drop —— wait 已完成，资源被回收。
-                    session.child = Some(child_back);
-                    session.killed = true; // 标记已退出，避免后续 abort 再 kill。
+                // 第 3 步：再取短锁还回 child，标记 killed，**条件**发 Done。
+                let already_killed;
+                {
+                    let mut sessions = sessions_clone.lock().await;
+                    if let Some(session) = sessions.get_mut(&agent_id) {
+                        // 读 killed：若 abort 已在 EOF 与此处之间先到并标 true，
+                        // 说明 abort 已经接管了终止语义——我们跳过 Done 发送
+                        // （M3：避免重复终止事件；abort 不发 Done，调用方应通过
+                        // abort 返回的 Ok 感知终止）。receiver 此时通常也已被
+                        // 调用方丢弃，send 必然失败——此检查只是把语义说清楚。
+                        already_killed = session.killed;
+                        // 还回 child（若 session 仍存在）。若 stop 已移除 session，
+                        // child 在此 drop —— wait 已完成，资源被回收。
+                        session.child = Some(child_back);
+                        session.killed = true; // 标记已退出，避免后续 abort 再 kill。
+                    } else {
+                        // session 已被 stop 移除：child 在此 drop；调用方已走 stop
+                        // 路径，不需要 Done（stop 自身不发 Done，调用方通过 Ok 感知）。
+                        already_killed = true;
+                    }
                 }
-                // Done 事件发出：即便 session 已被 stop 移除也发，让调用方
-                // 知道 agent 真实终止状态（与 stop 协议兼容：stop 后接收方
-                // 可能已丢弃 receiver，send 失败被忽略）。
-                let _ = tx.send(AgentEvent::Done {
-                    success,
-                    // files_modified：CLI 输出不携带文件变更信息，恒为空。
-                    // 文件级变更检测必须由 Coordinator 在 done 后做工作区 diff。
-                    files_modified: vec![],
-                });
+                if !already_killed {
+                    // 仅当 abort/stop 未抢先标记 killed 时才发 Done：让自然退出的
+                    // 调用方拿到真实 exit status。
+                    let _ = tx.send(AgentEvent::Done {
+                        success,
+                        // files_modified：CLI 输出不携带文件变更信息，恒为空。
+                        // 文件级变更检测必须由 Coordinator 在 done 后做工作区 diff。
+                        files_modified: vec![],
+                    });
+                }
             });
         });
 
@@ -371,54 +413,79 @@ impl AgentRuntime for CliRuntime {
     }
 
     async fn abort(&self, handle: &AgentHandle) -> Result<(), RuntimeError> {
-        let mut sessions = self.sessions.lock().await;
-        let Some(session) = sessions.get_mut(&handle.agent_id) else {
-            return Ok(()); // 会话不存在视为已 abort，幂等。
-        };
-        if session.killed {
-            return Ok(());
-        }
-        // C2 修复：可靠地 kill 整个进程组。
+        // P2/M1 修复：`abort` 不能持锁跨越 grace 轮询——否则会阻塞其它 agent
+        // 的 send/liveness/abort 以及 Supervisor 的 reap（同一把 `sessions` 锁）。
+        // 模式：第 1 步短锁（发 SIGHUP + take 出 child + 标记 killed 占位）；
+        // 第 2 步完全锁外做 grace 轮询 + 必要的 SIGKILL；第 3 步短锁还回 child
+        // 并最终确认 killed=true。SIGHUP 的 `kill()` 系统调用本身是 O(1) 非阻
+        // 塞的，所以放在第 1 步的短锁里是安全的；只有 grace 轮询（最长 300ms）
+        // 必须挪出锁外。
         //
-        // 不再用 `clone_killer().kill()`——portable-pty 的 `ProcessSignaller::kill`
-        // 只发 SIGHUP（lib.rs:313-322），trap/ignore SIGHUP 的 CLI 杀不死。改用：
-        // (a) 先对整个进程组发 SIGHUP（`kill(-pgid, SIGHUP)`，PTY slave 子进程是
-        //     session leader，SIGHUP 扩散到同 session 全部子进程，包括它 spawn 的
-        //     tool server / build helper）；
-        // (b) 轮询 `try_wait` 给最多 ~300ms grace period；
-        // (c) 若仍存活，对进程组发 SIGKILL（`kill(-pgid, SIGKILL)`）兜底；
-        // (d) 若 pgid 拿不到（非 Unix 或 tcgetpgrp 失败），回退到 `child.kill()`
-        //     （portable-pty 的 `Child::kill` 实现 = SIGHUP + grace + SIGKILL）。
+        // C2 修复（仍保留）：不再用 `clone_killer().kill()`——portable-pty 的
+        // `ProcessSignaller::kill` 只发 SIGHUP（lib.rs:313-322），trap/ignore
+        // SIGHUP 的 CLI 杀不死。改用 SIGHUP → grace → SIGKILL 的进程组阶梯。
         //
         // 注意：child 可能在 reader-EOF wait 窗口期被 take 走（child = None）。
-        // 此时 child 正在被 wait 收尸，标记 killed=true 让 EOF wait 完成后不再
-        // 发 Done 重复——但当前实现仍发 Done（成功与否由 wait 决定），这里只
-        // 标记 killed 防 abort 重入。child 不在时跳过实际 kill 信号。
-        let pgid_signal_ok = signal_process_group(&session.master, libc::SIGHUP);
-        let child_taken = session.child.is_none();
+        // 此时 child 正在被 EOF wait 任务收尸；我们在第 3 步把 killed 标 true，
+        // EOF wait 任务在重新拿到锁还回 child 时会**检查** killed，若已 true
+        // 就跳过 Done 发送（避免重复终止事件）。
+        // 第 1 步：短锁。发 SIGHUP、take 出 child、占位标记 killed。
+        let (pgid_signal_ok, mut child_opt) = {
+            let mut sessions = self.sessions.lock().await;
+            let Some(session) = sessions.get_mut(&handle.agent_id) else {
+                return Ok(()); // 会话不存在视为已 abort，幂等。
+            };
+            if session.killed {
+                return Ok(());
+            }
+            let ok = signal_group_hup(&session.master);
+            // 占位标记 killed：即便 grace 还没跑完，也先告诉其它路径「已在终止」。
+            // EOF wait 任务在还回 child 时会读这个标志决定是否发 Done。
+            session.killed = true;
+            (ok, session.child.take())
+        };
 
-        if !child_taken {
-            // child 在 session 里：发完 SIGHUP 后轮询 grace，必要时 SIGKILL。
-            if let Some(child) = session.child.as_mut() {
-                // grace period 内轮询 try_wait。portable-pty Child 是 &mut self。
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_millis(300);
-                let exited = wait_grace_deadline(child, deadline);
-                if !exited {
-                    // SIGHUP 没杀死（trap/ignore）→ SIGKILL 整组兜底。
-                    let kill_ok = signal_process_group(&session.master, libc::SIGKILL);
-                    if !kill_ok {
-                        // pgid 信号失败 → 回退到 portable-pty Child::kill
-                        // （其内部 SIGHUP+grace+SIGKILL，但只针对单进程）。
-                        let _ = child.kill();
+        // 第 2 步：完全锁外。grace 轮询 + 必要的 SIGKILL + 把 child 还回去
+        // 也放锁外（用 `Arc::clone` 拿到 sessions 句柄，重新短锁还 child）。
+        if let Some(child) = child_opt.as_mut() {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(300);
+            let exited = wait_grace_deadline(child, deadline);
+            if !exited {
+                // SIGHUP 没杀死（trap/ignore）→ SIGKILL 整组兜底。
+                // 注意：SIGKILL 需要 master 引用，但 master 仍在 session 里，
+                // 我们不能在锁外拿到它。改回退到 portable-pty `Child::kill`
+                // （其内部就是 SIGHUP + grace + std SIGKILL，单进程）——这是
+                // 锁外能拿到的唯一 kill 路径。grace 已耗尽，Child::kill 的内部
+                // grace 立即超时进入 SIGKILL。
+                //
+                // 为了仍能用进程组 SIGKILL（更强），我们尝试再取一次短锁发信号；
+                // 若拿锁失败/发不出，再回退 Child::kill。
+                let killed_via_pgid = {
+                    let sessions = self.sessions.lock().await;
+                    match sessions.get(&handle.agent_id) {
+                        Some(session) => signal_group_kill(&session.master),
+                        None => false,
                     }
+                };
+                if !killed_via_pgid {
+                    let _ = child.kill();
                 }
             }
         } else if !pgid_signal_ok {
-            // child 被 take 走且 pgid 信号也发不出——只能等 EOF wait 任务自然完成。
-            // 这种竞态只在 reader EOF 与 abort 同时发生时出现，wait 任务会处理。
+            // child 被 EOF wait 任务 take 走且 pgid SIGHUP 也发不出——只能等
+            // EOF wait 任务自然完成。这种竞态只在 reader EOF 与 abort 同时发生
+            // 时出现，EOF wait 任务会处理。
         }
-        session.killed = true;
+
+        // 第 3 步：短锁还回 child（若 session 仍存在）。killed 已在第 1 步置 true。
+        if let Some(child) = child_opt {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(&handle.agent_id) {
+                session.child = Some(child);
+            }
+            // 若 session 已被 stop 移除，child 在此 drop——资源回收。
+        }
         Ok(())
     }
 
@@ -442,19 +509,28 @@ impl AgentRuntime for CliRuntime {
     }
 
     async fn stop(&self, handle: &AgentHandle) -> Result<(), RuntimeError> {
-        // 先 abort（发 kill 信号），再 wait 收尸，最后移除 session。
-        let mut sessions = self.sessions.lock().await;
-        let Some(mut session) = sessions.remove(&handle.agent_id) else {
+        // P2/M1 修复：原实现 `remove` 后**仍持锁**跨 grace 轮询 + `child.wait()`
+        // ——虽然 session 已被移出 map（不影响其它 agent 查表），但 `sessions`
+        // 这把锁本身仍被持有，会阻塞其它 agent 的 send/abort/liveness/stop 和
+        // Supervisor 的 reap。修：`remove` 后**立即 drop 锁**，session 转为本地
+        // 所有权，所有后续工作（SIGHUP → grace → SIGKILL → wait）全在锁外。
+        let Some(mut session) = ({
+            let mut sessions = self.sessions.lock().await;
+            sessions.remove(&handle.agent_id)
+        }) else {
             return Ok(()); // 幂等。
         };
+        // 到这里锁已释放，session 是本地所有权。后续不再触碰 `self.sessions`。
+
         if !session.killed {
             // 复用 abort 的进程组 kill 逻辑：SIGHUP → grace → SIGKILL。
-            let _ = signal_process_group(&session.master, libc::SIGHUP);
+            // signal_group_* 是平台门控 helper（Unix 走进程组，Windows 返回 false）。
+            let _ = signal_group_hup(&session.master);
             if let Some(child) = session.child.as_mut() {
                 let deadline = std::time::Instant::now()
                     + std::time::Duration::from_millis(300);
                 if !wait_grace_deadline(child, deadline) {
-                    let kill_ok = signal_process_group(&session.master, libc::SIGKILL);
+                    let kill_ok = signal_group_kill(&session.master);
                     if !kill_ok {
                         let _ = child.kill();
                     }
