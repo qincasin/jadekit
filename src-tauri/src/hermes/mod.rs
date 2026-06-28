@@ -24,5 +24,5 @@ pub use types::{
 };
 pub use planner::{
     build_plan_prompt, build_replan_prompt, parse_plan_response, parse_replan_response,
-    ReplanAction, ReplanDecision, Roster, RosterEntry,
+    Planner, ReplanAction, ReplanDecision, Roster, RosterEntry,
 };

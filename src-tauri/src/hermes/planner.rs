@@ -1,9 +1,10 @@
 #![allow(dead_code)]
-//! Hermes Planner —— 唯一的 LLM 钩子层（Task 13：纯函数）。
+//! Hermes Planner —— 唯一的 LLM 钩子层。
 //!
-//! 注意：本模块的公开 API（提示构造 / 解析 / Roster / ReplanAction）当前尚无调用方——
-//! Task 14 才会把它们接到真实 LLM 会话上。为避免 dead_code 噪音污染构建输出，
-//! 在此显式 `allow(dead_code)`；Task 14 接入后可移除。
+//! Task 13 落地了**纯函数层**（提示构造 / 容错 JSON 解析 / Roster / ReplanDecision）。
+//! Task 14（本提交）把纯函数层接到真实 LLM 会话上：[`Planner::plan`] /
+//! [`Planner::replan`] 经 [`AgentRuntime`] 起一个无 worktree 的临时 planner agent，
+//! 发提示 → 收敛 TextDelta → Done 后解析。Coordinator 在开局调 `plan`、失败后调 `replan`。
 //!
 //! Planner 是 Hermes 中唯一让 LLM 介入编排的地方，负责两个决策点：
 //!   * `plan(goal, roster)`：把用户目标拆解成任务 DAG，并为每个任务选兵
@@ -11,8 +12,7 @@
 //!   * `replan(run, failed_task, result)`：某任务失败/完成后，决定下一步动作
 //!     （重试 / 换兵 / 升级 / 收敛）。
 //!
-//! 本文件**只实现 Task 13**——纯函数：prompt 构造 + 容错 JSON 解析 + 不变量校验。
-//! **不调用任何 LLM / AgentRuntime**（网络/IO 留给 Task 14），便于离线单测。
+//! LLM 仅在这两个点介入——其余 Coordinator 循环 / 派发 / 熔断 / 收敛判定全部确定性。
 //!
 //! ## 提示 / 响应契约（Prompt / Response Contract）
 //!
@@ -58,7 +58,10 @@
 //!   * replan 还多一条：`decision = reassign` 时必须带 assignment 且在 roster 内。
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::sync::Arc;
 
+use crate::hermes::runtime::{AgentEvent, AgentRuntime, RuntimeStartSpec};
 use crate::hermes::types::{
     AgentAssignment, CoordinatorRun, RuntimeKind, Task, TaskStatus,
 };
@@ -297,18 +300,24 @@ pub fn build_replan_prompt(run: &CoordinatorRun, failed_task: &Task, result: &st
 /// 从可能被 prose / markdown 围栏包裹的模型输出里，抠出最外层 JSON 对象文本。
 ///
 /// 策略（按优先级）：
-///   1. **围栏优先**：找 ```json ... ``` 或 ``` ... ```，取围栏内的内容。
-///      模型常用围栏包 JSON，即便我们要求「不要围栏」也常常出现，必须容忍。
-///   2. **括号配对**：否则从首个 `{` 起，按 `{`/`}` 深度计数扫描至深度归 0，
+///   1. **围栏优先（双围栏兜底）**：依次枚举每段 ```json ... ``` / ``` ... ``` 围栏内容。
+///      模型常常先吐一段 ```rust``` / ```text``` 闲聊围栏，再吐真正的 ```json``` 围栏——
+///      所以**不能只看第一段围栏**：若第一段围栏不是合法 JSON，要继续尝试后续围栏。
+///   2. **括号配对**：所有围栏都不行时，从首个 `{` 起，按 `{`/`}` 深度计数扫描至深度归 0，
 ///      跳过字符串字面量内的括号（避免 `"{"` 干扰），返回那段子串。
 ///   3. 找不到配对 → `None`。
 ///
 /// 返回的是原始子串（含可能的尾随逗号等小问题也尽量交给 serde 容错）。
 fn extract_json_object(text: &str) -> Option<&str> {
-    // —— 策略 1：markdown 围栏 ——
-    // 匹配 ```json\n...\n``` 或 ```\n...\n```；取第一段围栏内容。
-    if let Some(fenced) = extract_fenced_block(text) {
-        return Some(fenced);
+    // —— 策略 1：逐段围栏尝试 ——
+    // 若第一段围栏不是合法 JSON（serde 反序列化失败），换下一段围栏再试。
+    // 用 serde 是否能解析出 PlanResponseDto/ReplanResponseDto 的最小骨架（`{` 顶层对象）
+    // 来判断合法性——这里统一以「serde_json::from_str::<serde_json::Value> 是否 Ok」为准，
+    // 它要求顶层是合法 JSON 值，能挡住 ```rust``` 这种代码块。
+    for fenced in iter_fenced_blocks(text) {
+        if serde_json::from_str::<serde_json::Value>(fenced).is_ok() {
+            return Some(fenced);
+        }
     }
 
     // —— 策略 2：括号深度配对，跳过字符串字面量 ——
@@ -343,20 +352,47 @@ fn extract_json_object(text: &str) -> Option<&str> {
     None
 }
 
-/// 抠 ```json ... ``` 或 ``` ... ``` 围栏内的内容（不含围栏本身）。
-/// 仅取第一段围栏——Planner 的契约要求单一 JSON 对象。
-fn extract_fenced_block(text: &str) -> Option<&str> {
-    // 直接按字符索引：定位首个 ``` → 跳到行尾（含可选语言标识）→ 找配对的闭合 ```。
-    let open = text.find("```")?;
-    // 跳过 ``` 与可选的语言标识（如 ```json），到行尾。
-    let after_fence = &text[open + 3..];
-    let lang_newline = after_fence.find('\n')?;
-    let content_start = open + 3 + lang_newline + 1;
+/// 枚举 ```json ... ``` / ``` ... ``` 围栏内的内容（不含围栏本身）。
+///
+/// 模型常先吐一段 ```rust```/```text``` 闲聊围栏，再吐真正的 ```json```——
+/// 单看第一段会误中闲聊围栏。这里枚举**所有**围栏内容，让
+/// [`extract_json_object`] 逐段试，挑出第一段能解析为合法 JSON 的。
+///
+/// 实现细节：以 byte 索引推进扫描，每段围栏 = 一对 ```...``` 之间的内容
+/// （跳过可选的语言标识如 ```json 到行尾）。
+fn iter_fenced_blocks(text: &str) -> impl Iterator<Item = &str> {
+    FencedBlockIter { text, cursor: 0 }
+}
 
-    // 在剩余文本里找配对的闭合 ```。
-    let rest = &text[content_start..];
-    let close = rest.find("```")?;
-    Some(&text[content_start..content_start + close])
+/// 围栏迭代器：每次 `next` 返回下一段 ``` ... ``` 内容（不含围栏围栏本身）。
+struct FencedBlockIter<'a> {
+    text: &'a str,
+    cursor: usize,
+}
+
+impl<'a> Iterator for FencedBlockIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let text = self.text;
+        // 从 cursor 起找下一个开围栏 ```。
+        let open = text[self.cursor..].find("```")?;
+        let open_abs = self.cursor + open;
+        // 跳过 ``` 与可选的语言标识（如 ```json），到行尾。
+        let after_fence = &text[open_abs + 3..];
+        let lang_newline = after_fence.find('\n')?;
+        let content_start = open_abs + 3 + lang_newline + 1;
+
+        // 在剩余文本里找配对的闭合 ```。
+        let rest = &text[content_start..];
+        let close = rest.find("```")?;
+        let content_end = content_start + close;
+
+        // 推进游标到闭合围栏之后，下次 next() 从这里继续找下一段。
+        self.cursor = content_end + 3;
+
+        Some(&text[content_start..content_end])
+    }
 }
 
 // =============================================================================
@@ -556,6 +592,175 @@ pub fn parse_replan_response(text: &str, roster: &Roster) -> Result<ReplanDecisi
 fn now_iso() -> String {
     use chrono::Utc;
     Utc::now().to_rfc3339()
+}
+
+// =============================================================================
+// Planner —— LLM 驱动层（Task 14）
+// =============================================================================
+//
+// 设计：Planner 是一个**轻量的 agent wrapper**——它经 AgentRuntime 起一个临时
+// planner agent，发提示，然后**纯文本**地收敛 TextDelta 到一段文本。planner 不
+// 编辑代码、不需要 worktree（cwd 直接 = repo_root）；不消费 ToolUse/ToolResult/
+// NeedsInput（那是 worker agent 的事）。这是 §6.5「Planner 也是一个 Agent」的实现。
+//
+// LLM 介入的两个点严格限定为：
+//   * [`Planner::plan`]：开局拆解。
+//   * [`Planner::replan`]：失败后决策。
+// 其余 Coordinator 循环（派发 / 收敛 / 熔断 / 心跳）全部确定性——Planner 不碰。
+
+/// 默认 planner provider（对齐 Coordinator 的 [`DEFAULT_PROVIDER`](crate::hermes::coordinator::DEFAULT_PROVIDER)）。
+/// 注：Phase 2 只有 Claude SDK 一种介质；Phase 3 才有 Codex/Gemini 等多 provider。
+const DEFAULT_PROVIDER: &str = "claude";
+
+/// 默认 planner 模型（对齐 Coordinator 的 DEFAULT_MODEL）。
+const DEFAULT_MODEL: &str = "sonnet";
+
+/// Planner 驱动器：经 [`AgentRuntime`] 起临时 planner agent，发提示并解析响应。
+///
+/// 不持有状态——每次 `plan`/`replan` 都新起一个 agent，跑完即丢。
+/// runtime 由调用方（Coordinator）注入，便于测试用 MockRuntime 回放固定事件流。
+pub struct Planner {
+    runtime: Arc<dyn AgentRuntime>,
+}
+
+impl Planner {
+    pub fn new(runtime: Arc<dyn AgentRuntime>) -> Self {
+        Self { runtime }
+    }
+
+    /// 开局拆解：起 planner agent → 发 `build_plan_prompt` → 收敛 TextDelta → 解析。
+    ///
+    /// 流程：
+    ///   1. `start` 一个无 worktree 的临时 planner agent（agent_id = `planner-<短 id>`，
+    ///      cwd = repo_root）。
+    ///   2. `send` 提示，拿到事件流 receiver。
+    ///   3. 排空事件流：`TextDelta(text)` 累积到 buffer；`Done{success:true}` 终止；
+    ///      `Failed` / `Done{success:false}` → `Err`。
+    ///      ToolUse/ToolResult/NeedsInput 等 worker 事件忽略（planner 只做文本补全）。
+    ///   4. `parse_plan_response(&buffer, roster)` → `Vec<Task>`。
+    pub async fn plan(
+        &self,
+        goal: &str,
+        roster: &Roster,
+        repo_root: &Path,
+    ) -> Result<Vec<Task>, String> {
+        let prompt = build_plan_prompt(goal, roster);
+        let agent_id = format!("planner-{}", short_id());
+
+        // 起临时 planner agent：无 worktree，cwd = repo_root（planner 不改代码）。
+        let handle = self
+            .runtime
+            .start(RuntimeStartSpec {
+                agent_id: agent_id.clone(),
+                cwd: repo_root.to_path_buf(),
+                model: DEFAULT_MODEL.to_string(),
+                provider: DEFAULT_PROVIDER.to_string(),
+            })
+            .await
+            .map_err(|e| format!("planner start failed: {:?}", e))?;
+
+        // 发提示 → 收敛到一段文本。
+        let mut rx = self
+            .runtime
+            .send(&handle, prompt)
+            .await
+            .map_err(|e| format!("planner send failed: {:?}", e))?;
+        let buffer = collect_text(&mut rx).await?;
+
+        // 解析 → Vec<Task>（含 roster 选兵校验 + DAG 依赖校验）。
+        parse_plan_response(&buffer, roster)
+    }
+
+    /// 失败后决策：起 planner agent → 发 `build_replan_prompt` → 收敛 → 解析。
+    ///
+    /// 与 `plan` 同构；解析结果为 [`ReplanDecision`]，Coordinator 据此决定
+    /// 重试 / 换兵 / 升级 / 收敛。
+    pub async fn replan(
+        &self,
+        run: &CoordinatorRun,
+        failed_task: &Task,
+        result: &str,
+        roster: &Roster,
+        repo_root: &Path,
+    ) -> Result<ReplanDecision, String> {
+        let prompt = build_replan_prompt(run, failed_task, result);
+        let agent_id = format!("planner-replan-{}", short_id());
+
+        let handle = self
+            .runtime
+            .start(RuntimeStartSpec {
+                agent_id: agent_id.clone(),
+                cwd: repo_root.to_path_buf(),
+                model: DEFAULT_MODEL.to_string(),
+                provider: DEFAULT_PROVIDER.to_string(),
+            })
+            .await
+            .map_err(|e| format!("planner(replan) start failed: {:?}", e))?;
+
+        let mut rx = self
+            .runtime
+            .send(&handle, prompt)
+            .await
+            .map_err(|e| format!("planner(replan) send failed: {:?}", e))?;
+        let buffer = collect_text(&mut rx).await?;
+
+        parse_replan_response(&buffer, roster)
+    }
+}
+
+/// 排空 AgentEvent 流，累积 TextDelta 到一段文本。
+///
+/// 终止条件：
+///   * `Done{success:true}` → 返回累积的文本。
+///   * `Done{success:false}` → `Err`（agent 自报失败）。
+///   * `Failed{error}` → `Err`。
+///   * channel 关闭（recv 返回 None）→ `Err`（未 Done 就断流，视为异常）。
+///
+/// 其它事件（ToolUse / ToolResult / Thinking / NeedsInput）忽略——planner
+/// 是纯文本补全，不应触发工具调用；若模型自作主张调工具，事件被忽略，
+/// 最终没有文本可解析时 parse 阶段自然会报错。
+async fn collect_text(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+) -> Result<String, String> {
+    let mut buffer = String::new();
+    let mut done_success: Option<bool> = None;
+    let mut fail_error: Option<String> = None;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::TextDelta(text) => buffer.push_str(&text),
+            AgentEvent::Done { success, .. } => {
+                done_success = Some(success);
+                break;
+            }
+            AgentEvent::Failed { error } => {
+                fail_error = Some(error);
+                break;
+            }
+            // worker 侧的事件，planner 忽略。
+            _ => {}
+        }
+    }
+
+    if let Some(err) = fail_error {
+        return Err(format!("planner agent failed: {err}"));
+    }
+    match done_success {
+        Some(true) => Ok(buffer),
+        Some(false) => Err("planner agent Done{success:false}".to_string()),
+        None => Err("planner agent stream closed without Done".to_string()),
+    }
+}
+
+/// 生成短随机 id（用于 planner agent_id 去重）。与 coordinator::nanos_hex 同源。
+fn short_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // 取低 32 位的 hex，足够 agent_id 去重用。
+    format!("{:x}", (nanos & 0xffff_ffff))
 }
 
 // =============================================================================
@@ -807,5 +1012,270 @@ mod tests {
             assert_eq!(ReplanAction::from_str(v.as_str()).unwrap(), v);
         }
         assert!(ReplanAction::from_str("bogus").is_err());
+    }
+
+    // =========================================================================
+    // Task 14 测试：Planner LLM 驱动 + Fix A 双围栏解析
+    // =========================================================================
+    //
+    // 用 MockRuntime 回放固定的 TextDelta 流 + Done{success:true}，
+    // 模拟 LLM 返回已知的 plan/replan JSON。所有断言离线、确定性。
+
+    use crate::hermes::runtime::{
+        AgentEvent, AgentHandle, Liveness, RuntimeCapabilities, RuntimeError,
+    };
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
+
+    /// 与 coordinator::tests::MockRuntime 同构：每个 agent_id 编程一段事件流，
+    /// send() 返回 receiver 之前压入全部事件并 drop sender。
+    struct PlannerMockRuntime {
+        events: std::sync::Mutex<HashMap<String, Vec<AgentEvent>>>,
+    }
+
+    impl PlannerMockRuntime {
+        fn new() -> Self {
+            Self {
+                events: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+
+        /// 给某个 agent_id（含通配 `*` 表示「任意 agent_id 都匹配」）编程事件流。
+        fn program(&self, agent_id: &str, events: Vec<AgentEvent>) {
+            self.events
+                .lock()
+                .unwrap()
+                .insert(agent_id.to_string(), events);
+        }
+    }
+
+    #[async_trait]
+    impl AgentRuntime for PlannerMockRuntime {
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities {
+                structured_events: true,
+                supports_resume: false,
+                supports_permission_prompt: false,
+            }
+        }
+
+        async fn start(&self, spec: RuntimeStartSpec) -> Result<AgentHandle, RuntimeError> {
+            Ok(AgentHandle {
+                agent_id: spec.agent_id,
+            })
+        }
+
+        async fn send(
+            &self,
+            handle: &AgentHandle,
+            _prompt: String,
+        ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, RuntimeError> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let mut map = self.events.lock().unwrap();
+            // 优先精确匹配 agent_id；否则用 `*` 通配。
+            let key = if map.contains_key(&handle.agent_id) {
+                handle.agent_id.clone()
+            } else {
+                "*".to_string()
+            };
+            if let Some(ev_list) = map.remove(&key) {
+                for ev in ev_list {
+                    let _ = tx.send(ev);
+                }
+            }
+            drop(tx);
+            Ok(rx)
+        }
+
+        async fn abort(&self, _handle: &AgentHandle) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn liveness(&self, _handle: &AgentHandle) -> Liveness {
+            Liveness::Alive
+        }
+
+        async fn stop(&self, _handle: &AgentHandle) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+    }
+
+    /// 把一段文本切成 TextDelta 事件 + Done{success:true} 终止。
+    fn text_deltas_then_done(text: &str) -> Vec<AgentEvent> {
+        vec![
+            AgentEvent::TextDelta(text.to_string()),
+            AgentEvent::Done {
+                success: true,
+                files_modified: vec![],
+            },
+        ]
+    }
+
+    /// 构造一个 Planner，绑定 MockRuntime。返回 (Planner, Arc<MockRuntime>) 以便测试侧 program。
+    fn planner_with_mock() -> (
+        Planner,
+        Arc<PlannerMockRuntime>,
+        std::path::PathBuf,
+    ) {
+        let runtime: Arc<PlannerMockRuntime> = Arc::new(PlannerMockRuntime::new());
+        let planner = Planner::new(runtime.clone() as Arc<dyn AgentRuntime>);
+        let repo_root = std::path::PathBuf::from("/tmp/repo");
+        (planner, runtime, repo_root)
+    }
+
+    // ===== Case 1: Planner::plan with mock → 期望的 Vec<Task> =====
+    #[tokio::test]
+    async fn planner_plan_with_mock_returns_expected_tasks() {
+        let (planner, runtime, repo_root) = planner_with_mock();
+        let roster = sample_roster();
+        // 用通配 `*`——planner agent_id 含纳秒随机后缀，测试侧无法预知。
+        let plan_json = r#"{"tasks":[
+            {"id":"t1","spec":"调研","deps":[],"assignment":{"runtime":"sdk","model":"sonnet"}},
+            {"id":"t2","spec":"实现","deps":["t1"],"assignment":{"runtime":"cli","model":"glm-5.2"}}
+        ]}"#;
+        runtime.program("*", text_deltas_then_done(plan_json));
+
+        let tasks = planner
+            .plan("发布 v1.0", &roster, &repo_root)
+            .await
+            .expect("plan 应成功解析");
+        assert_eq!(tasks.len(), 2);
+
+        // 选兵 + deps 都正确。
+        assert_eq!(tasks[0].id, "t1");
+        assert_eq!(tasks[0].status, TaskStatus::Ready);
+        let a0 = tasks[0].assignment.as_ref().unwrap();
+        assert_eq!(a0.runtime, RuntimeKind::Sdk);
+        assert_eq!(a0.model, "sonnet");
+
+        assert_eq!(tasks[1].id, "t2");
+        assert_eq!(tasks[1].deps, vec!["t1"]);
+        assert_eq!(tasks[1].status, TaskStatus::Pending);
+        let a1 = tasks[1].assignment.as_ref().unwrap();
+        assert_eq!(a1.runtime, RuntimeKind::Cli);
+        assert_eq!(a1.model, "glm-5.2");
+    }
+
+    // ===== Case 2: Planner::replan with mock → 期望的 ReplanDecision =====
+    #[tokio::test]
+    async fn planner_replan_with_mock_returns_expected_decision() {
+        let (planner, runtime, repo_root) = planner_with_mock();
+        let roster = sample_roster();
+        let replan_json =
+            r#"{"decision":"retry","reason":"瞬时错误，重跑一次"}"#;
+        runtime.program("*", text_deltas_then_done(replan_json));
+
+        let run = sample_run();
+        let task = failed_task();
+        let decision = planner
+            .replan(&run, &task, "TypeError: x is undefined", &roster, &repo_root)
+            .await
+            .expect("replan 应成功解析");
+
+        assert_eq!(decision.decision, ReplanAction::Retry);
+        assert_eq!(decision.reason, "瞬时错误，重跑一次");
+        assert!(decision.assignment.is_none());
+    }
+
+    // ===== Case 3: Planner::plan 当 mock emit Failed → Err =====
+    #[tokio::test]
+    async fn planner_plan_when_mock_failed_returns_err() {
+        let (planner, runtime, repo_root) = planner_with_mock();
+        let roster = sample_roster();
+        runtime.program(
+            "*",
+            vec![AgentEvent::Failed {
+                error: "model overloaded".to_string(),
+            }],
+        );
+
+        let err = planner
+            .plan("发布 v1.0", &roster, &repo_root)
+            .await
+            .expect_err("Failed 事件 → Err");
+        assert!(
+            err.contains("model overloaded"),
+            "错误信息应传播原始 error，got: {err}"
+        );
+    }
+
+    // ===== Case 3b: Planner::plan 当 mock emit Done{success:false} → Err =====
+    #[tokio::test]
+    async fn planner_plan_when_done_false_returns_err() {
+        let (planner, runtime, repo_root) = planner_with_mock();
+        let roster = sample_roster();
+        runtime.program(
+            "*",
+            vec![AgentEvent::Done {
+                success: false,
+                files_modified: vec![],
+            }],
+        );
+
+        planner
+            .plan("发布 v1.0", &roster, &repo_root)
+            .await
+            .expect_err("Done{success:false} → Err");
+    }
+
+    // ===== Case 3c: Planner::plan 当 mock 直接关流（无 Done）→ Err =====
+    #[tokio::test]
+    async fn planner_plan_when_stream_closed_without_done_returns_err() {
+        let (planner, runtime, repo_root) = planner_with_mock();
+        let roster = sample_roster();
+        // 不编程任何事件——send 返回空流立刻 None。
+        runtime.program("*", vec![]);
+
+        let err = planner
+            .plan("发布 v1.0", &roster, &repo_root)
+            .await
+            .expect_err("无 Done 关流 → Err");
+        assert!(
+            err.contains("without Done"),
+            "应报 stream closed without Done，got: {err}"
+        );
+    }
+
+    // ===== Case 7 (Fix A): 双围栏响应——先 ```rust``` 再 ```json``` → 正确解析 =====
+    #[test]
+    fn parse_plan_response_handles_dual_fence_rust_then_json() {
+        let roster = sample_roster();
+        // 模型先吐了一段 ```rust``` 闲聊代码块，再吐真正的 ```json``` 围栏。
+        // 单围栏（只看第一段）会把 rust 代码当成 JSON 解析失败；双围栏枚举应跳到 json 段。
+        let text = "Sure, let me think...\n```rust\nfn main() { println!(\"hi\"); }\n```\n\nHere's the plan:\n```json\n{\"tasks\":[\n  {\"id\":\"t1\",\"spec\":\"调研\",\"deps\":[],\"assignment\":{\"runtime\":\"sdk\",\"model\":\"sonnet\"}}\n]}\n```\n";
+        let tasks = parse_plan_response(text, &roster)
+            .expect("双围栏：应跳过 rust 段、解析 json 段");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "t1");
+        assert_eq!(tasks[0].assignment.as_ref().unwrap().model, "sonnet");
+    }
+
+    // ===== Case 7b (Fix A): 三围栏 + prose 都能找到合法 JSON 段 =====
+    #[test]
+    fn parse_replan_response_handles_multi_fence() {
+        let roster = sample_roster();
+        let text = "Thinking...\n```text\nsome notes\n```\n```python\nprint(1)\n```\n```json\n{\"decision\":\"escalate\",\"reason\":\"太难了\"}\n```\n";
+        let d = parse_replan_response(text, &roster)
+            .expect("多围栏：应跳过非 JSON 段、解析 json 段");
+        assert_eq!(d.decision, ReplanAction::Escalate);
+    }
+
+    // ===== Case 7c (Fix A): 单围栏但内容是合法 JSON —— 仍然工作（回归） =====
+    #[test]
+    fn parse_plan_response_single_fence_still_works() {
+        let roster = sample_roster();
+        let text = "```json\n{\"tasks\":[{\"id\":\"t1\",\"spec\":\"x\",\"deps\":[],\"assignment\":{\"runtime\":\"sdk\",\"model\":\"sonnet\"}}]}\n```";
+        let tasks = parse_plan_response(text, &roster).expect("单围栏合法 JSON 仍工作");
+        assert_eq!(tasks.len(), 1);
+    }
+
+    // ===== Case 7d (Fix A): 没有围栏的裸 JSON 仍然工作（回归） =====
+    #[test]
+    fn parse_plan_response_no_fence_still_works() {
+        let roster = sample_roster();
+        let text = r#"前缀文本 {"tasks":[{"id":"t1","spec":"x","deps":[],"assignment":{"runtime":"sdk","model":"sonnet"}}]} 后缀"#;
+        let tasks = parse_plan_response(text, &roster).expect("无围栏裸 JSON 走括号扫描");
+        assert_eq!(tasks.len(), 1);
     }
 }
