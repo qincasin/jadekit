@@ -3,42 +3,57 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Helm Phase 4 驾驶舱静态稿</title>
+  <title>Helm Phase 4 驾驶舱设计稿 (Walkthrough Mockup)</title>
   <style>
     :root {
       color-scheme: light;
       --b1: #ffffff;
       --b2: #f6f7fb;
-      --b3: #d9deea;
-      --bc: #18212f;
+      --b3: #e2e8f0;
+      --bc: #0f172a;
       --primary: #3b82f6;
+      --primary-hover: #2563eb;
       --warning: #f59e0b;
-      --helm-amber-strong: #92400e;
-      --working: #b45309;
-      --error: #ef4444;
+      --helm-amber-strong: #b45309; /* 保证浅色背景下对比度 */
+      --helm-amber-bg: #fef3c7;
+      --helm-amber-border: #78350f;
+      --working: #d97706;
+      --working-border: #92400e;
+      --error: #dc2626;
+      --error-border: #7f1d1d;
       --success: #10b981;
-      --helm-pulse: #2dd4bf;
-      --helm-muted: rgba(24, 33, 47, 0.62);
-      --helm-soft: rgba(59, 130, 246, 0.08);
-      --shadow: 0 14px 35px rgba(15, 23, 42, 0.08);
+      --success-border: #064e3b;
+      --helm-pulse: #0d9488;
+      --helm-muted: #64748b;
+      --helm-soft: rgba(59, 130, 246, 0.06);
+      --shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.08);
+      --shadow-lg: 0 20px 40px -15px rgba(0, 0, 0, 0.12);
+      --border-radius: 0.5rem;
     }
 
     html[data-theme="dark"] {
       color-scheme: dark;
-      --b1: #161b22;
-      --b2: #21262d;
-      --b3: #0d1117;
-      --bc: #e5e7eb;
+      --b1: #0f172a;
+      --b2: #1e293b;
+      --b3: #334155;
+      --bc: #f8fafc;
       --primary: #3b82f6;
+      --primary-hover: #60a5fa;
       --warning: #fbbf24;
-      --helm-amber-strong: #f59e0b;
+      --helm-amber-strong: #fbbf24;
+      --helm-amber-bg: rgba(251, 191, 36, 0.1);
+      --helm-amber-border: #fbbf24;
       --working: #f59e0b;
-      --error: #f87171;
+      --working-border: #f59e0b;
+      --error: #ef4444;
+      --error-border: #f87171;
       --success: #34d399;
+      --success-border: #34d399;
       --helm-pulse: #2dd4bf;
-      --helm-muted: rgba(229, 231, 235, 0.64);
-      --helm-soft: rgba(59, 130, 246, 0.14);
-      --shadow: 0 16px 38px rgba(0, 0, 0, 0.24);
+      --helm-muted: #94a3b8;
+      --helm-soft: rgba(59, 130, 246, 0.12);
+      --shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.3);
+      --shadow-lg: 0 20px 40px -15px rgba(0, 0, 0, 0.4);
     }
 
     * { box-sizing: border-box; }
@@ -46,233 +61,262 @@
     body {
       margin: 0;
       min-height: 100vh;
-      background: var(--b1);
+      background: var(--b2);
       color: var(--bc);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      letter-spacing: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-size: 0.875rem;
+      line-height: 1.5;
     }
 
-    button, input {
-      font: inherit;
+    /* 顶部 Walkthrough 导航指南（可点的 happy-path 指导区） */
+    .walkthrough-guide-bar {
+      background: #0f172a;
+      color: #38bdf8;
+      padding: 0.6rem 1.2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+      border-bottom: 2px solid #0284c7;
+      font-size: 0.85rem;
+      z-index: 100;
+      position: relative;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
     }
 
-    button:focus-visible,
-    input:focus-visible,
-    article:focus-visible,
-    summary:focus-visible,
-    .detail-link:focus-visible {
-      outline: 3px solid var(--primary);
-      outline-offset: 3px;
-      box-shadow: 0 0 0 6px color-mix(in srgb, var(--primary), transparent 78%);
+    .guide-step-tag {
+      background: #0284c7;
+      color: white;
+      padding: 0.15rem 0.5rem;
+      border-radius: 99px;
+      font-weight: 700;
+      font-size: 0.75rem;
+      text-transform: uppercase;
     }
 
+    .guide-action-btn {
+      background: #0284c7;
+      border: 0;
+      color: white;
+      padding: 0.25rem 0.65rem;
+      border-radius: 0.25rem;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.75rem;
+      transition: background 0.15s;
+    }
+
+    .guide-action-btn:hover {
+      background: #0369a1;
+    }
+
+    /* 主应用外壳 */
     .app {
-      min-height: 100vh;
+      min-height: calc(100vh - 2.8rem);
       display: grid;
       grid-template-rows: auto 1fr auto;
-      background:
-        linear-gradient(180deg, color-mix(in srgb, var(--helm-soft), transparent 42%), transparent 260px),
-        var(--b1);
     }
 
+    /* 运行状态条 */
     .runbar {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
       gap: 1rem;
       align-items: center;
-      padding: 1rem 1.25rem 0.75rem;
+      padding: 0.75rem 1.25rem;
       border-bottom: 1px solid var(--b3);
-      background: color-mix(in srgb, var(--b1), transparent 4%);
-    }
-
-    .pane-switcher {
-      display: none;
-      gap: 0.45rem;
-      padding: 0.55rem 0.75rem;
-      border-bottom: 1px solid color-mix(in srgb, var(--b3), var(--bc) 14%);
       background: var(--b1);
-      overflow-x: auto;
     }
 
     .brand {
       display: flex;
       min-width: 0;
-      gap: 0.9rem;
+      gap: 0.75rem;
       align-items: center;
     }
 
     .bridge-mark {
-      width: 2.5rem;
-      height: 2.5rem;
+      width: 2.25rem;
+      height: 2.25rem;
       display: grid;
       place-items: center;
       border: 1px solid var(--b3);
-      border-radius: 0.5rem;
+      border-radius: var(--border-radius);
       background: var(--b2);
-      box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--helm-pulse), transparent 68%);
       font-weight: 800;
+      font-size: 1.1rem;
       color: var(--primary);
-    }
-
-    .eyebrow, .label, .lane-title, .meta {
-      color: var(--helm-muted);
+      box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--helm-pulse), transparent 60%);
     }
 
     .eyebrow {
-      font-size: 0.72rem;
+      font-size: 0.7rem;
       font-weight: 700;
       text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--helm-muted);
     }
 
-    h1 {
-      margin: 0.08rem 0 0;
-      font-size: clamp(1.18rem, 1.7vw, 1.55rem);
-      line-height: 1.15;
-    }
-
-    .run-summary {
-      min-width: 0;
-    }
-
-    .mono {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      font-variant-numeric: tabular-nums;
+    .run-summary h1 {
+      margin: 0;
+      font-size: 1.15rem;
+      font-weight: 700;
+      line-height: 1.2;
     }
 
     .run-actions {
       display: flex;
-      gap: 0.45rem;
+      gap: 0.5rem;
       align-items: center;
-      flex-wrap: wrap;
-      justify-content: flex-end;
     }
 
     .pill, .btn {
       border: 1px solid var(--b3);
-      border-radius: 0.45rem;
-      background: var(--b2);
+      border-radius: 0.375rem;
+      background: var(--b1);
       color: var(--bc);
       min-height: 2rem;
-      padding: 0.35rem 0.65rem;
+      padding: 0.3rem 0.65rem;
       display: inline-flex;
       align-items: center;
       gap: 0.4rem;
       white-space: nowrap;
-    }
-
-    .theme-note {
-      background: var(--b1);
-      color: var(--helm-muted);
+      font-size: 0.8rem;
+      font-weight: 500;
     }
 
     .btn {
       cursor: pointer;
+      transition: all 0.15s ease;
+      user-select: none;
     }
 
-    .btn[disabled] {
-      cursor: not-allowed;
-      opacity: 0.52;
+    .btn:hover:not([disabled]) {
+      background: var(--b2);
+      border-color: color-mix(in srgb, var(--b3), black 10%);
+    }
+
+    .btn:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 2px;
     }
 
     .btn.primary {
       background: var(--primary);
       color: white;
-      border-color: color-mix(in srgb, var(--primary), black 8%);
+      border-color: var(--primary);
     }
 
+    .btn.primary:hover:not([disabled]) {
+      background: var(--primary-hover);
+    }
+
+    .btn[disabled] {
+      cursor: not-allowed;
+      opacity: 0.45;
+    }
+
+    /* 脉冲进度条 */
     .pulse-rail {
       position: relative;
-      height: 0.35rem;
+      height: 0.25rem;
       grid-column: 1 / -1;
       border-radius: 999px;
-      background: color-mix(in srgb, var(--b3), transparent 40%);
+      background: color-mix(in srgb, var(--b3), transparent 20%);
       overflow: hidden;
+      margin-top: 0.25rem;
     }
 
     .pulse-rail::before {
       content: "";
       position: absolute;
       inset: 0 auto 0 0;
-      width: 63%;
+      width: 0%;
       background: linear-gradient(90deg, var(--primary), var(--helm-pulse));
       border-radius: inherit;
+      transition: width 0.5s ease;
     }
 
     .pulse-rail::after {
       content: "";
       position: absolute;
-      top: -0.2rem;
-      left: 61%;
-      width: 0.75rem;
-      height: 0.75rem;
-      border-radius: 999px;
+      top: 0;
+      left: 0%;
+      width: 0.5rem;
+      height: 0.25rem;
       background: var(--helm-pulse);
-      box-shadow: 0 0 0 0.35rem color-mix(in srgb, var(--helm-pulse), transparent 78%);
+      box-shadow: 0 0 8px var(--helm-pulse);
       animation: pulse 1.8s ease-in-out infinite;
+      transition: left 0.5s ease;
     }
 
+    /* 三栏驾驶舱主网格 */
     .cockpit {
-      min-height: 0;
       display: grid;
-      grid-template-columns: minmax(17rem, 0.86fr) minmax(26rem, 1.5fr) minmax(18rem, 0.95fr);
+      grid-template-columns: minmax(18rem, 1fr) minmax(28rem, 1.6fr) minmax(20rem, 1.2fr);
       gap: 0.75rem;
       padding: 0.75rem;
+      min-height: 0;
+      height: 100%;
     }
 
     .pane {
       min-width: 0;
-      min-height: 0;
       display: flex;
       flex-direction: column;
       border: 1px solid var(--b3);
-      border-radius: 0.5rem;
-      background: color-mix(in srgb, var(--b2), var(--b1) 20%);
+      border-radius: var(--border-radius);
+      background: var(--b1);
       box-shadow: var(--shadow);
       overflow: hidden;
+      transition: all 0.25s ease;
+    }
+
+    /* 栏目置灰样式（冷启动或未激活时） */
+    .pane.pane-disabled {
+      border-style: dashed;
+      background: color-mix(in srgb, var(--b1), transparent 30%);
+      opacity: 0.45;
+      pointer-events: none;
     }
 
     .pane-header {
       display: flex;
       justify-content: space-between;
-      align-items: flex-start;
-      gap: 0.7rem;
-      padding: 0.75rem;
+      align-items: center;
+      padding: 0.65rem 0.9rem;
       border-bottom: 1px solid var(--b3);
-      background: color-mix(in srgb, var(--b1), transparent 12%);
-    }
-
-    .pane-title {
-      min-width: 0;
+      background: color-mix(in srgb, var(--b2), transparent 40%);
     }
 
     .pane-title strong {
       display: block;
-      font-size: 0.9rem;
+      font-size: 0.88rem;
+      font-weight: 700;
     }
 
     .pane-title span {
       display: block;
-      margin-top: 0.12rem;
-      font-size: 0.75rem;
+      font-size: 0.73rem;
       color: var(--helm-muted);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      margin-top: 0.05rem;
     }
 
+    /* 舰队泳道 */
     .lane-grid {
       display: grid;
       grid-template-columns: 1fr;
-      gap: 0.625rem;
+      gap: 0.65rem;
       padding: 0.75rem;
-      overflow: auto;
+      overflow-y: auto;
+      flex: 1;
     }
 
     .lane {
-      border: 1px solid color-mix(in srgb, var(--b3), transparent 18%);
-      border-radius: 0.45rem;
-      background: color-mix(in srgb, var(--b1), transparent 8%);
-      padding: 0.55rem;
+      border: 1px solid var(--b3);
+      border-radius: var(--border-radius);
+      background: var(--b2);
+      padding: 0.5rem;
     }
 
     .lane-head {
@@ -280,833 +324,1686 @@
       align-items: center;
       justify-content: space-between;
       margin-bottom: 0.45rem;
-      font-size: 0.73rem;
-      font-weight: 800;
-      text-transform: uppercase;
+      padding: 0 0.25rem;
     }
 
-    .count {
-      min-width: 1.4rem;
-      text-align: center;
-      border-radius: 999px;
-      padding: 0.08rem 0.35rem;
-      background: var(--b2);
+    .lane-title {
+      font-size: 0.75rem;
+      font-weight: 700;
       color: var(--helm-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
     }
 
+    .lane-head .count {
+      background: var(--b3);
+      color: var(--bc);
+      font-size: 0.7rem;
+      font-weight: 700;
+      border-radius: 99px;
+      padding: 0.05rem 0.4rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    /* Worker卡片 */
     .worker {
-      display: grid;
-      gap: 0.45rem;
-      padding: 0.6rem;
-      border: 1px solid var(--b3);
-      border-radius: 0.45rem;
       background: var(--b1);
-      margin-top: 0.45rem;
+      border: 1px solid var(--b3);
+      border-radius: 0.375rem;
+      padding: 0.6rem;
+      margin-bottom: 0.4rem;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: grid;
+      gap: 0.35rem;
     }
 
-    .worker-actions {
-      display: flex;
-      gap: 0.35rem;
-      align-items: center;
-      flex-wrap: wrap;
-      justify-content: flex-end;
+    .worker:last-child {
+      margin-bottom: 0;
+    }
+
+    .worker:hover {
+      border-color: color-mix(in srgb, var(--primary), transparent 30%);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);
     }
 
     .worker.selected {
-      border-color: color-mix(in srgb, var(--primary), var(--b3) 28%);
-      box-shadow: inset 3px 0 0 var(--primary);
+      border-color: var(--primary);
+      box-shadow: 0 0 0 1px var(--primary), 0 4px 12px rgba(59, 130, 246, 0.08);
+      background: var(--helm-soft);
     }
 
-    .worker-top, .worker-bottom, .stream-top, .inspector-meta, .composer-row {
+    .worker-top {
       display: flex;
       align-items: center;
       gap: 0.5rem;
-      min-width: 0;
+      font-size: 0.75rem;
     }
 
-    .tool {
-      width: 1.35rem;
-      height: 1.35rem;
-      display: grid;
-      place-items: center;
-      border-radius: 0.35rem;
-      border: 1px solid var(--b3);
+    .model-badge {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-weight: 600;
+      padding: 0.1rem 0.35rem;
+      border-radius: 0.25rem;
       background: var(--b2);
-      font-size: 0.72rem;
-      font-weight: 800;
-    }
-
-    .model {
-      max-width: 8.4rem;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      border-radius: 0.35rem;
-      background: var(--helm-soft);
-      color: var(--primary);
-      padding: 0.15rem 0.35rem;
-      font-size: 0.72rem;
-    }
-
-    .task {
-      font-size: 0.82rem;
-      line-height: 1.32;
-    }
-
-    .diff {
-      margin-left: auto;
-      font-size: 0.72rem;
-    }
-
-    .plus { color: var(--success); }
-    .minus { color: var(--error); }
-
-    .dot {
-      position: relative;
-      width: 0.8rem;
-      height: 0.8rem;
-      flex: 0 0 auto;
-      border-radius: 999px;
-      border: 2px solid currentColor;
-    }
-
-    .dot.working {
-      color: var(--working);
-      border-top-color: transparent;
-      box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning), transparent 72%);
-      animation: spin 1s linear infinite;
-    }
-
-    .dot.needs {
-      color: var(--helm-amber-strong);
-      background: color-mix(in srgb, var(--warning), transparent 74%);
-      border-color: var(--helm-amber-strong);
-      box-shadow:
-        0 0 0 2px var(--b1),
-        0 0 0 5px color-mix(in srgb, var(--helm-amber-strong), transparent 42%);
-    }
-
-    .dot.needs::after {
-      content: "!";
-      position: absolute;
-      inset: -0.2rem 0 0;
-      display: grid;
-      place-items: center;
-      color: var(--helm-amber-strong);
-      font-size: 0.62rem;
-      font-weight: 900;
-      line-height: 1;
-    }
-
-    .dot.interrupted {
-      color: var(--error);
-      background: transparent;
-      border-radius: 0.22rem;
-      border-width: 2px;
-      box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--error), transparent 30%);
-    }
-
-    .dot.interrupted::after {
-      content: "";
-      position: absolute;
-      inset: 0.18rem;
-      background: var(--error);
-      border-radius: 0.08rem;
-    }
-
-    .dot.done {
-      color: var(--success);
-      border-color: var(--success);
-      background: transparent;
-    }
-
-    .dot.done::after {
-      content: "";
-      position: absolute;
-      left: 0.16rem;
-      top: 0.04rem;
-      width: 0.24rem;
-      height: 0.42rem;
-      border: solid var(--success);
-      border-width: 0 2px 2px 0;
-      transform: rotate(45deg);
-    }
-
-    .session {
-      min-height: 0;
-      padding: 0.75rem;
-      overflow: auto;
-      display: grid;
-      gap: 0.65rem;
-      align-content: start;
-    }
-
-    .stream-card, .empty-card, .diff-card, .judge-card {
       border: 1px solid var(--b3);
-      border-radius: 0.45rem;
+      color: var(--helm-muted);
+    }
+
+    .worker.selected .model-badge {
       background: var(--b1);
-      padding: 0.7rem;
-    }
-
-    .detail-link {
-      border: 0;
-      background: transparent;
       color: var(--primary);
-      padding: 0;
-      cursor: pointer;
-      font-size: 0.76rem;
-      font-weight: 700;
+      border-color: var(--primary);
     }
 
-    .log-preview {
-      border: 1px solid color-mix(in srgb, var(--b3), var(--bc) 12%);
-      border-radius: 0.45rem;
-      background: var(--b2);
-      padding: 0.6rem;
-    }
-
-    .log-preview summary {
-      cursor: pointer;
-      color: var(--primary);
+    .worker-task {
       font-size: 0.8rem;
-      font-weight: 800;
+      font-weight: 500;
+      line-height: 1.35;
+      color: var(--bc);
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
     }
 
-    .log-preview pre {
-      margin: 0.55rem 0 0;
-      max-height: 9rem;
-      overflow: auto;
-      white-space: pre-wrap;
-      color: color-mix(in srgb, var(--bc), transparent 8%);
-      font-size: 0.72rem;
-      line-height: 1.45;
-    }
-
-    .bridge-note {
-      border-left: 3px solid var(--primary);
-      background: color-mix(in srgb, var(--primary), transparent 94%);
-    }
-
-    .message-turn {
-      display: grid;
-      gap: 0.55rem;
-      border: 1px solid var(--b3);
-      border-radius: 0.5rem;
-      background: var(--b1);
-      padding: 0.72rem;
-    }
-
-    .message-turn.agent {
-      border-color: color-mix(in srgb, var(--primary), var(--b3) 50%);
-    }
-
-    .message-head {
+    .worker-bottom {
       display: flex;
       justify-content: space-between;
-      gap: 0.6rem;
       align-items: center;
-      min-width: 0;
+      font-size: 0.7rem;
+      color: var(--helm-muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      margin-top: 0.15rem;
     }
 
-    .message-meta {
-      color: var(--helm-muted);
-      font-size: 0.72rem;
+    .worker-branch {
+      max-width: 9rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
       white-space: nowrap;
     }
 
-    .thinking-block,
-    .tool-block,
-    .subagent-card,
-    .intervention-card {
-      border: 1px solid color-mix(in srgb, var(--b3), var(--bc) 8%);
-      border-radius: 0.45rem;
-      background: color-mix(in srgb, var(--b2), var(--b1) 20%);
-      padding: 0.65rem;
+    .diff-badge {
+      display: inline-flex;
+      gap: 0.25rem;
+      font-weight: 600;
+    }
+    .diff-add { color: var(--success); }
+    .diff-del { color: var(--error); }
+
+    /* AgentStateDot 状态小圆点 */
+    .state-dot-container {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
     }
 
+    .state-dot {
+      position: relative;
+      width: 0.85rem;
+      height: 0.85rem;
+      border-radius: 99px;
+      flex-shrink: 0;
+      border: 2px solid transparent;
+      display: inline-grid;
+      place-items: center;
+    }
+
+    /* 态 1：working (黄/转圈) —— 增加高对比度暗黄色描边 */
+    .state-dot.working {
+      border-color: var(--working-border);
+      border-top-color: transparent;
+      animation: spin 1s linear infinite;
+    }
+    .state-dot.working::after {
+      content: "";
+      width: 0.25rem;
+      height: 0.25rem;
+      background: var(--working);
+      border-radius: 99px;
+    }
+
+    /* 态 2：needs-attention (琥珀，等待介入) —— 实心感叹号，高对比度描边 */
+    .state-dot.needs-attention {
+      background: var(--warning);
+      border-color: var(--helm-amber-border);
+      box-shadow: 0 0 0 2px var(--helm-amber-bg);
+    }
+    .state-dot.needs-attention::after {
+      content: "!";
+      color: var(--helm-amber-border);
+      font-size: 0.65rem;
+      font-weight: 900;
+      line-height: 1;
+      font-family: system-ui, sans-serif;
+    }
+
+    /* 态 3：done (翠绿勾) —— 翠绿圆环带勾 */
+    .state-dot.done {
+      border-color: var(--success-border);
+      background: var(--b1);
+    }
+    .state-dot.done::after {
+      content: "";
+      width: 0.2rem;
+      height: 0.38rem;
+      border: solid var(--success-border);
+      border-width: 0 2px 2px 0;
+      transform: rotate(45deg);
+      margin-top: -0.05rem;
+    }
+
+    /* 态 4：interrupted (红，强杀/中断) —— 红色方形，配内部实体方形 */
+    .state-dot.interrupted {
+      border-color: var(--error-border);
+      border-radius: 0.2rem;
+      background: var(--b1);
+    }
+    .state-dot.interrupted::after {
+      content: "";
+      width: 0.3rem;
+      height: 0.3rem;
+      background: var(--error);
+      border-radius: 0.05rem;
+    }
+
+    /* 中栏：会话区 */
+    .session-container {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      min-height: 0;
+    }
+
+    /* 顶部切换导航 */
+    .session-header-tabs {
+      display: flex;
+      padding: 0.35rem 0.5rem 0;
+      border-bottom: 1px solid var(--b3);
+      background: var(--b2);
+      gap: 0.25rem;
+    }
+
+    .session-tab {
+      padding: 0.45rem 0.8rem;
+      border: 1px solid transparent;
+      border-bottom: 0;
+      border-radius: 0.375rem 0.375rem 0 0;
+      background: transparent;
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--helm-muted);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .session-tab:hover {
+      color: var(--bc);
+      background: color-mix(in srgb, var(--b1), transparent 40%);
+    }
+
+    .session-tab.active {
+      color: var(--primary);
+      background: var(--b1);
+      border-color: var(--b3);
+      box-shadow: 0 -2px 0 var(--primary) inset;
+    }
+
+    .session-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0.9rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.8rem;
+    }
+
+    /* 顶部桥接提示小字 */
+    .bridge-banner {
+      border: 1px solid color-mix(in srgb, var(--primary), transparent 80%);
+      border-left: 4px solid var(--primary);
+      background: var(--helm-soft);
+      border-radius: 0.375rem;
+      padding: 0.55rem 0.75rem;
+      font-size: 0.75rem;
+      color: var(--primary);
+      display: flex;
+      flex-direction: column;
+      gap: 0.15rem;
+    }
+    .bridge-banner strong {
+      font-weight: 700;
+    }
+
+    /* 单 Agent 控制面板 */
+    .agent-control-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.55rem 0.75rem;
+      border: 1px solid var(--b3);
+      border-radius: 0.375rem;
+      background: var(--b2);
+      font-size: 0.78rem;
+    }
+
+    .agent-control-bar .actions {
+      display: flex;
+      gap: 0.35rem;
+    }
+
+    /* 干净会话流消息轮次 */
+    .msg-turn {
+      border: 1px solid var(--b3);
+      border-radius: var(--border-radius);
+      background: var(--b1);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
+    }
+
+    .msg-turn.agent {
+      border-color: color-mix(in srgb, var(--primary), transparent 75%);
+    }
+
+    .msg-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.55rem 0.75rem;
+      background: color-mix(in srgb, var(--b2), transparent 50%);
+      border-bottom: 1px solid var(--b3);
+      font-size: 0.78rem;
+    }
+
+    .msg-head strong {
+      font-weight: 700;
+    }
+
+    .msg-meta {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: var(--helm-muted);
+      font-size: 0.72rem;
+    }
+
+    .msg-body {
+      padding: 0.75rem;
+      font-size: 0.85rem;
+      line-height: 1.5;
+    }
+
+    /* 派发详情的折叠容器 */
+    .dispatch-details {
+      margin-top: 0.4rem;
+      font-size: 0.75rem;
+      background: var(--b2);
+      border-radius: 0.25rem;
+      border: 1px solid var(--b3);
+      padding: 0.5rem;
+    }
+
+    .dispatch-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .dispatch-table td {
+      padding: 0.15rem 0.35rem;
+    }
+
+    .dispatch-table td:first-child {
+      color: var(--helm-muted);
+      width: 7rem;
+    }
+
+    /* ThinkingBlock */
     .thinking-block {
       border-left: 3px solid var(--helm-pulse);
+      background: color-mix(in srgb, var(--helm-pulse), transparent 96%);
+      padding: 0.6rem;
+      margin: 0 0.75rem 0.75rem;
+      border-radius: 0 0.25rem 0.25rem 0;
+      font-size: 0.8rem;
     }
 
+    .thinking-title {
+      font-weight: 700;
+      color: var(--helm-pulse);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      margin-bottom: 0.2rem;
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+    }
+
+    /* ToolBlocks */
     .tool-block {
-      display: grid;
-      gap: 0.5rem;
+      border: 1px solid var(--b3);
+      border-radius: 0.375rem;
+      margin: 0 0.75rem 0.75rem;
+      background: var(--b1);
+      overflow: hidden;
     }
 
     .tool-head {
+      padding: 0.45rem 0.65rem;
+      background: var(--b2);
+      border-bottom: 1px solid var(--b3);
+      cursor: pointer;
       display: flex;
-      gap: 0.45rem;
-      align-items: center;
       justify-content: space-between;
-      min-width: 0;
+      align-items: center;
+      font-size: 0.76rem;
     }
 
     .tool-title {
       display: flex;
-      gap: 0.45rem;
       align-items: center;
-      min-width: 0;
-      font-weight: 800;
-      font-size: 0.84rem;
+      gap: 0.45rem;
+      font-weight: 700;
     }
 
-    .tool-chip {
-      border-radius: 0.35rem;
+    .tool-badge {
       background: var(--helm-soft);
+      border: 1px solid color-mix(in srgb, var(--primary), transparent 70%);
       color: var(--primary);
-      padding: 0.1rem 0.38rem;
-      font-size: 0.72rem;
+      padding: 0.05rem 0.35rem;
+      border-radius: 0.25rem;
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     }
 
-    .tool-body,
-    .bash-output {
-      border: 1px solid color-mix(in srgb, var(--b3), transparent 20%);
-      border-radius: 0.35rem;
+    .tool-body {
+      padding: 0.6rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.75rem;
+      white-space: pre-wrap;
       background: var(--b1);
-      padding: 0.5rem;
-      font-size: 0.76rem;
-      line-height: 1.45;
-      overflow: auto;
+      overflow-x: auto;
     }
 
+    /* Diff 预览样式 */
     .diff-preview {
-      display: grid;
-      gap: 0.15rem;
-      font-size: 0.74rem;
-    }
-
-    .subagent-card {
-      border-left: 3px solid var(--primary);
-    }
-
-    .intervention-card {
-      border-color: var(--helm-amber-strong);
-      background: color-mix(in srgb, var(--warning), transparent 88%);
-      box-shadow: inset 4px 0 0 var(--helm-amber-strong);
-    }
-
-    .cold-start {
-      margin: 0.75rem 0.75rem 0;
-      border: 1px dashed color-mix(in srgb, var(--primary), var(--b3) 40%);
-      border-radius: 0.5rem;
-      background: color-mix(in srgb, var(--primary), transparent 94%);
-      padding: 0.8rem;
-      display: grid;
-      gap: 0.45rem;
-    }
-
-    .cold-start strong {
-      font-size: 0.9rem;
-    }
-
-    .timeline {
-      display: grid;
-      gap: 0.55rem;
-    }
-
-    .timeline-item {
-      display: grid;
-      grid-template-columns: auto 1fr;
-      gap: 0.55rem;
-      align-items: start;
-      border: 1px solid var(--b3);
-      border-radius: 0.45rem;
-      background: var(--b1);
-      padding: 0.65rem;
-    }
-
-    .timeline-copy {
-      display: grid;
-      gap: 0.25rem;
-      min-width: 0;
-    }
-
-    .selector-row {
       display: flex;
-      gap: 0.35rem;
-      align-items: center;
-      flex-wrap: wrap;
-    }
-
-    .stream-card.active {
-      border-color: color-mix(in srgb, var(--helm-pulse), var(--b3) 38%);
-    }
-
-    .stream-top {
-      justify-content: space-between;
-      margin-bottom: 0.5rem;
-    }
-
-    .stream-body {
-      margin: 0;
-      color: color-mix(in srgb, var(--bc), transparent 12%);
-      font-size: 0.88rem;
-      line-height: 1.5;
-    }
-
-    .subagent {
-      margin-top: 0.55rem;
-      padding: 0.55rem;
-      border-radius: 0.4rem;
-      background: var(--b2);
-      border: 1px solid color-mix(in srgb, var(--b3), transparent 22%);
-    }
-
-    .inspector-body {
-      min-height: 0;
-      overflow: auto;
-      padding: 0.75rem;
-      display: grid;
-      gap: 0.65rem;
-      align-content: start;
-    }
-
-    .empty-card {
-      border-style: dashed;
-      color: var(--helm-muted);
+      flex-direction: column;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.75rem;
+      border-radius: 0.25rem;
+      overflow: hidden;
     }
 
     .diff-line {
+      display: flex;
+      padding: 0.15rem 0.5rem;
+    }
+
+    .diff-line.del {
+      background: color-mix(in srgb, var(--error), transparent 92%);
+      color: var(--error);
+      border-left: 3px solid var(--error);
+    }
+
+    .diff-line.add {
+      background: color-mix(in srgb, var(--success), transparent 92%);
+      color: var(--success);
+      border-left: 3px solid var(--success);
+    }
+
+    /* 干预卡 (Intervention / Needs-Attention Slot) */
+    .intervention-card {
+      border: 1px solid var(--helm-amber-border);
+      border-left: 4px solid var(--helm-amber-strong);
+      background: var(--helm-amber-bg);
+      border-radius: 0.375rem;
+      padding: 0.75rem;
+      margin: 0 0.75rem 0.75rem;
       display: grid;
-      grid-template-columns: 3rem 1fr;
-      gap: 0.5rem;
-      padding: 0.2rem 0;
-      font-size: 0.76rem;
-      border-bottom: 1px solid color-mix(in srgb, var(--b3), transparent 50%);
+      gap: 0.45rem;
+      box-shadow: 0 4px 12px rgba(180, 83, 9, 0.05);
     }
 
-    .diff-line:last-child { border-bottom: 0; }
-    .line-add { background: color-mix(in srgb, var(--success), transparent 88%); }
-    .line-del { background: color-mix(in srgb, var(--error), transparent 90%); }
-
-    .judge-card strong, .diff-card strong {
-      display: block;
-      margin-bottom: 0.5rem;
-      font-size: 0.86rem;
-    }
-
-    .composer {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 0.75rem;
-      align-items: center;
-      padding: 0.75rem 1rem;
-      border-top: 1px solid var(--b3);
-      background: color-mix(in srgb, var(--b1), var(--b2) 45%);
-    }
-
-    .composer-box {
-      min-width: 0;
+    .intervention-title {
+      font-weight: 700;
+      color: var(--helm-amber-strong);
+      font-size: 0.8rem;
       display: flex;
       align-items: center;
-      gap: 0.55rem;
+      gap: 0.4rem;
+    }
+
+    /* Subagent 侧链卡 */
+    .subagent-card {
       border: 1px solid var(--b3);
-      border-radius: 0.5rem;
-      background: var(--b1);
-      padding: 0.45rem 0.55rem;
+      border-left: 3px solid var(--primary);
+      border-radius: 0.375rem;
+      margin: 0 0.75rem 0.75rem;
+      background: var(--b2);
+      overflow: hidden;
     }
 
-    .composer-box:focus-within {
-      border-color: var(--primary);
-      box-shadow: 0 0 0 4px color-mix(in srgb, var(--primary), transparent 78%);
+    /* 全功能 Chat 规划聊视图 */
+    .planner-view {
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      flex: 1;
+      justify-content: space-between;
     }
 
-    .composer-box input {
-      width: 100%;
-      min-width: 0;
-      border: 0;
-      background: transparent;
+    .planner-chat-history {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0.5rem 0.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .plan-dag-box {
+      border: 1px solid var(--b3);
+      border-radius: var(--border-radius);
+      background: var(--b2);
+      padding: 0.75rem;
+      margin-top: 0.5rem;
+    }
+
+    .plan-dag-title {
+      font-weight: 700;
+      font-size: 0.82rem;
+      margin-bottom: 0.4rem;
       color: var(--bc);
     }
 
-    .roster {
+    .dag-node-list {
       display: flex;
+      flex-direction: column;
       gap: 0.35rem;
-      flex-wrap: wrap;
-      justify-content: flex-end;
+    }
+
+    .dag-node {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.78rem;
+      background: var(--b1);
+      padding: 0.3rem 0.5rem;
+      border-radius: 0.25rem;
+      border: 1px solid var(--b3);
+      transition: all 0.3s;
+    }
+
+    .dag-arrow {
+      align-self: center;
+      color: var(--helm-muted);
+      font-size: 0.7rem;
+      margin: -0.1rem 0;
+      padding-left: 0.75rem;
+    }
+
+    /* 右栏：检查器 (Inspector) */
+    .inspector-body {
+      padding: 0.75rem;
+      overflow-y: auto;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .empty-state {
+      border: 2px dashed var(--b3);
+      border-radius: var(--border-radius);
+      padding: 1.5rem 1rem;
+      text-align: center;
+      color: var(--helm-muted);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.5rem;
+      margin: auto 0;
+    }
+
+    .empty-state strong {
+      font-size: 0.85rem;
+      color: var(--bc);
+    }
+
+    .inspector-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.5rem;
+      margin-top: auto;
+      padding: 0.5rem 0 0;
+      border-top: 1px solid var(--b3);
+    }
+
+    /* 底部 Composer */
+    .composer {
+      background: var(--b1);
+      border-top: 1px solid var(--b3);
+      padding: 0.75rem 1.25rem;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 0.75rem;
+      align-items: center;
+      position: relative;
+    }
+
+    .composer-input-container {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      border: 1px solid var(--b3);
+      border-radius: 0.5rem;
+      padding: 0.45rem 0.65rem;
+      background: var(--b1);
+      position: relative;
+    }
+
+    .composer-input-container:focus-within {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
+    }
+
+    .composer-input-container input {
+      flex: 1;
+      border: 0;
+      background: transparent;
+      color: var(--bc);
+      outline: none;
+      font-size: 0.85rem;
+    }
+
+    .composer-input-container input::placeholder {
+      color: var(--helm-muted);
+    }
+
+    .composer-actions-right {
+      display: flex;
+      gap: 0.45rem;
+      align-items: center;
+    }
+
+    /* @ 联想弹出菜单 */
+    .mention-popup {
+      position: absolute;
+      bottom: calc(100% + 0.4rem);
+      left: 0.5rem;
+      background: var(--b1);
+      border: 1px solid var(--b3);
+      border-radius: var(--border-radius);
+      box-shadow: var(--shadow-lg);
+      width: 18rem;
+      z-index: 50;
+      display: none;
+    }
+
+    .mention-section-title {
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      color: var(--helm-muted);
+      padding: 0.4rem 0.6rem 0.2rem;
+      background: var(--b2);
+      border-bottom: 1px solid var(--b3);
+    }
+
+    .mention-item {
+      padding: 0.45rem 0.6rem;
+      font-size: 0.78rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--b2);
+    }
+
+    .mention-item:hover:not(.disabled) {
+      background: var(--helm-soft);
+      color: var(--primary);
+    }
+
+    .mention-item.disabled {
+      cursor: not-allowed;
+      opacity: 0.45;
+    }
+
+    .mention-item-shortcut {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.68rem;
+      background: var(--b2);
+      padding: 0.05rem 0.25rem;
+      border-radius: 0.2rem;
+      color: var(--helm-muted);
+    }
+
+    /* Tooltip */
+    .tooltip-container {
+      position: relative;
+    }
+
+    .tooltip-text {
+      visibility: hidden;
+      width: 8rem;
+      background-color: #0f172a;
+      color: #fff;
+      text-align: center;
+      border-radius: 4px;
+      padding: 0.35rem;
+      position: absolute;
+      z-index: 101;
+      bottom: 125%;
+      left: 50%;
+      transform: translateX(-50%);
+      opacity: 0;
+      transition: opacity 0.2s;
+      font-size: 0.7rem;
+      line-height: 1.3;
+      pointer-events: none;
+    }
+
+    .tooltip-container:hover .tooltip-text {
+      visibility: visible;
+      opacity: 0.95;
+    }
+
+    .cold-start-banner {
+      border: 1px dashed var(--primary);
+      background: var(--helm-soft);
+      border-radius: var(--border-radius);
+      padding: 1.25rem;
+      margin: auto 0;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      align-items: center;
+    }
+    .cold-start-banner strong {
+      font-size: 1rem;
+      color: var(--primary);
+    }
+    .cold-start-banner p {
+      margin: 0;
+      font-size: 0.8rem;
+      color: var(--helm-muted);
+      max-width: 24rem;
     }
 
     @keyframes spin {
       to { transform: rotate(360deg); }
     }
-
     @keyframes pulse {
-      50% { transform: scale(1.18); opacity: 0.78; }
+      50% { opacity: 0.5; }
     }
 
-    @media (prefers-reduced-motion: reduce) {
-      *, *::before, *::after {
-        animation-duration: 0.01ms !important;
-        animation-iteration-count: 1 !important;
-        scroll-behavior: auto !important;
-      }
-
-      .dot.working {
-        border-top-color: currentColor;
-      }
-    }
-
-    @media (max-width: 1100px) {
-      .pane-switcher {
-        display: flex;
-      }
-      .cockpit {
-        grid-template-columns: minmax(16rem, 0.9fr) minmax(24rem, 1.45fr);
-      }
-      .inspector-pane {
-        grid-column: 1 / -1;
-        max-height: 24rem;
-      }
-    }
-
-    @media (max-width: 760px) {
-      .runbar, .composer {
-        grid-template-columns: 1fr;
-      }
-      .run-actions, .roster {
-        justify-content: flex-start;
-      }
-      .cockpit {
-        grid-template-columns: 1fr;
-      }
-      .pane-header {
-        flex-direction: column;
-        align-items: stretch;
-      }
-      .inspector-meta {
-        flex-wrap: wrap;
-        align-items: flex-start;
-      }
-      .inspector-meta .btn.primary {
-        flex: 1 1 100%;
-        justify-content: center;
-      }
-      .inspector-meta .btn:not(.primary) {
-        flex: 1 1 calc(50% - 0.35rem);
-        justify-content: center;
-      }
-      .inspector-pane {
-        max-height: none;
-      }
-      .fleet-pane {
-        max-height: 42vh;
-      }
+    /* 聚焦状态的醒目红框指示器，引导用户点击 */
+    .guide-highlight {
+      outline: 3px solid #f43f5e !important;
+      outline-offset: 3px !important;
+      box-shadow: 0 0 15px rgba(244, 63, 94, 0.6) !important;
+      animation: pulse 1.5s infinite;
     }
   </style>
 </head>
 <body>
-  <main class="app">
-    <header class="runbar" aria-label="Helm run 状态">
+
+  <!-- 顶部 Walkthrough 导航指南（评审主线） -->
+  <div class="walkthrough-guide-bar" aria-label="Walkthrough 引导">
+    <div style="display: flex; align-items: center; gap: 0.6rem;">
+      <span class="guide-step-tag" id="guide-step-tag">Step 1 / 6</span>
+      <span id="guide-text" style="font-weight: 600; color: #f8fafc;">第一步：在底部 Composer 中输入重构目标并回车，或直接点击下方“填入示例目标”。</span>
+    </div>
+    <div style="display: flex; gap: 0.5rem; align-items: center;">
+      <button class="guide-action-btn" id="btn-quick-fill" onclick="quickFillTarget()">填入示例目标</button>
+      <button class="guide-action-btn" style="background: #475569;" onclick="resetWalkthrough()">重置 Walkthrough</button>
+    </div>
+  </div>
+
+  <main class="app" id="main-app">
+    
+    <!-- 顶部状态栏 -->
+    <header class="runbar" aria-label="Run 状态">
       <div class="brand">
         <div class="bridge-mark" aria-hidden="true">H</div>
         <div class="run-summary">
-          <div class="eyebrow">指挥舰桥 / Hermes run <span class="mono">run_9f42c</span></div>
-          <h1>稳定 provider 切换，同时不破坏聊天历史</h1>
+          <div class="eyebrow" id="run-eyebrow">Helm · Roster 空闲</div>
+          <h1 id="run-title">未启动编排任务 / Waiting for target</h1>
         </div>
       </div>
-      <div class="run-actions">
-        <span class="pill theme-note">默认白色主题</span>
-        <span class="pill"><span class="dot working" aria-hidden="true"></span><span>运行中</span></span>
+      <div class="run-actions" id="run-header-actions" style="opacity: 0.3; pointer-events: none;">
+        <span class="pill" id="run-state-badge" style="border-color: var(--working); color: var(--working); font-weight: 600;">
+          <span class="state-dot working" id="run-state-dot" style="border-color: var(--working-border)" aria-hidden="true"></span>
+          <span>运行中 / Running</span>
+        </span>
         <button class="btn" type="button">Cmd+K 跳转</button>
-        <button class="btn" type="button">Roster 名册</button>
-        <button class="btn" type="button">停止 run</button>
+        <button class="btn" type="button">Roster 编排名册</button>
+        <button class="btn" type="button" style="color: var(--error); border-color: var(--error);">停止 Run</button>
       </div>
-      <div class="pulse-rail" role="progressbar" aria-label="Run 进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="63"></div>
+      <!-- 全局脉冲进度条 -->
+      <div class="pulse-rail" id="run-pulse" style="display: none;" role="progressbar" aria-label="Run 进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
     </header>
 
-    <nav class="pane-switcher" aria-label="面板切换">
-      <button class="btn" type="button">舰队</button>
-      <button class="btn" type="button">会话</button>
-      <button class="btn primary" type="button">检查器：diff 与合并</button>
-    </nav>
-
-    <section class="cold-start" aria-label="冷启动空态">
-      <strong>尚未启动 run 时的第一屏</strong>
-      <p class="stream-body">下达一个目标，启动舰队。空 cockpit 保留三栏轮廓，先引导用户选择 Roster 中的 CLI x 模型并派发一次 Hermes 编排。</p>
-    </section>
-
-    <section class="cockpit" aria-label="Helm 三栏驾驶舱">
-      <aside class="pane fleet-pane" aria-label="舰队看板">
+    <!-- 三栏区域 -->
+    <section class="cockpit" aria-label="Helm 驾驶舱">
+      
+      <!-- 左栏：舰队看板（冷启动时置灰） -->
+      <aside class="pane fleet-pane pane-disabled" id="pane-fleet" aria-label="舰队看板">
         <div class="pane-header">
           <div class="pane-title">
-            <strong>舰队看板</strong>
-            <span>4 个 agent，覆盖 Codex、Claude、Gemini</span>
+            <strong>舰队看板 / Fleet Kanban</strong>
+            <span id="fleet-desc">0 个 AI 代理正在执行任务</span>
           </div>
-          <button class="btn" type="button" aria-label="收起舰队面板">面板</button>
         </div>
         <div class="lane-grid">
+          
+          <!-- 就绪泳道 -->
           <section class="lane" aria-label="就绪泳道">
-            <div class="lane-head"><span class="lane-title">就绪</span><span class="count mono">1</span></div>
-            <article class="worker" tabindex="0" aria-label="已就绪但尚未分配的任务">
-              <div class="worker-top">
-                <span class="tool">T</span>
-                <span class="model mono">未分配</span>
-                <span class="diff mono"><span class="plus">+0</span> <span class="minus">-0</span></span>
-              </div>
-              <div class="task">为 provider 配置重载草拟迁移说明。</div>
-              <div class="worker-bottom meta mono">task_04 status: ready / 尚未分配 agent</div>
-              <div class="worker-actions">
-                <button class="detail-link" type="button">查看详情</button>
-              </div>
-            </article>
+            <div class="lane-head">
+              <span class="lane-title">就绪 / Ready</span>
+              <span class="count" id="count-ready">0</span>
+            </div>
+            <div style="font-size: 0.75rem; color: var(--helm-muted); text-align: center; padding: 0.5rem 0;" id="empty-ready-tip">
+              无就绪任务
+            </div>
+            <div id="lane-ready-cards"></div>
           </section>
 
+          <!-- 执行中泳道 -->
           <section class="lane" aria-label="执行中泳道">
-            <div class="lane-head"><span class="lane-title">执行中</span><span class="count mono">2</span></div>
-            <article class="worker selected" tabindex="0" aria-label="agent codex-07 正在处理 reducer 任务">
-              <div class="worker-top">
-                <span class="dot working" aria-label="工作中"></span>
-                <span class="tool">C</span>
-                <span class="model mono">gpt-5.5</span>
-                <span class="diff mono"><span class="plus">+128</span> <span class="minus">-21</span></span>
-              </div>
-              <div class="task">修补 provider 切换状态，让活跃 tab 保持自己的模型。</div>
-              <div class="worker-bottom meta mono">task_02 -> helm/task_02</div>
-              <div class="worker-actions">
-                <button class="detail-link" type="button">聚焦会话</button>
-                <button class="detail-link" type="button">查看活动详情</button>
-              </div>
-            </article>
-            <article class="worker" tabindex="0" aria-label="agent claude-11 需要权限确认">
-              <div class="worker-top">
-                <span class="dot needs" aria-label="需要关注，等待权限"></span>
-                <span class="tool">A</span>
-                <span class="model mono">sonnet-4.5</span>
-                <span class="diff mono"><span class="plus">+44</span> <span class="minus">-8</span></span>
-              </div>
-              <div class="task">需要授权才能检查已保存的 provider 配置。</div>
-              <div class="worker-bottom meta mono">task_03 -> 等待工具授权</div>
-              <div class="worker-actions">
-                <button class="detail-link" type="button">打开权限详情</button>
-              </div>
-            </article>
+            <div class="lane-head">
+              <span class="lane-title">执行中 / Running</span>
+              <span class="count" id="count-running">0</span>
+            </div>
+            <div style="font-size: 0.75rem; color: var(--helm-muted); text-align: center; padding: 0.5rem 0;" id="empty-running-tip">
+              无执行中代理
+            </div>
+            <div id="lane-running-cards">
+              <!-- 卡片 1 (codex-07) -->
+              <article class="worker" id="card-codex-07" tabindex="0" onclick="selectWorker('codex-07')" aria-label="代理 codex-07 工作中">
+                <div class="worker-top">
+                  <span class="state-dot working" id="dot-codex-07" aria-hidden="true"></span>
+                  <strong class="mono">codex-07</strong>
+                  <span class="model-badge">gpt-5.5</span>
+                  <span class="diff-badge" style="margin-left: auto;">
+                    <span class="diff-add">+145</span>
+                    <span class="diff-del">-21</span>
+                  </span>
+                </div>
+                <div class="worker-task">修补 provider 切换投影，在活动 Tab 中维持 local 模型设置</div>
+                <div class="worker-bottom">
+                  <span class="worker-branch" id="branch-codex-07">branch: helm/task_02</span>
+                  <span class="mono">task_02</span>
+                </div>
+              </article>
+
+              <!-- 卡片 2 (claude-11) -->
+              <article class="worker" id="card-claude-11" tabindex="0" onclick="selectWorker('claude-11')" aria-label="代理 claude-11 等待干预">
+                <div class="worker-top">
+                  <span class="state-dot needs-attention" aria-hidden="true"></span>
+                  <strong class="mono">claude-11</strong>
+                  <span class="model-badge">sonnet-4.5</span>
+                  <span class="diff-badge" style="margin-left: auto;">
+                    <span class="diff-add">+42</span>
+                    <span class="diff-del">-4</span>
+                  </span>
+                </div>
+                <div class="worker-task">读取已保存的 providers 凭证及配置信息进行同步检查</div>
+                <div class="worker-bottom">
+                  <span class="worker-branch">waiting for permission</span>
+                  <span class="mono">task_03</span>
+                </div>
+              </article>
+            </div>
           </section>
 
+          <!-- 待评审泳道 ( await-merge ) -->
           <section class="lane" aria-label="待评审泳道">
-            <div class="lane-head"><span class="lane-title">待评审</span><span class="count mono">1</span></div>
-            <article class="worker" tabindex="0" aria-label="agent codex-03 已完成，等待合并">
-              <div class="worker-top">
-                <span class="dot done" aria-label="已完成"></span>
-                <span class="tool">C</span>
-                <span class="model mono">gpt-5.5-mini</span>
-                <span class="diff mono"><span class="plus">+67</span> <span class="minus">-13</span></span>
-              </div>
-              <div class="task">保留的 worktree：settings fallback 清理已可评审。</div>
-              <div class="worker-bottom meta mono">awaiting-merge -> helm/task_01</div>
-              <div class="worker-actions">
-                <button class="detail-link" type="button">打开 diff 详情</button>
-                <button class="detail-link" type="button">查看活动详情</button>
-              </div>
-            </article>
+            <div class="lane-head">
+              <span class="lane-title">待评审 / Review</span>
+              <span class="count" id="count-review">0</span>
+            </div>
+            <div style="font-size: 0.75rem; color: var(--helm-muted); text-align: center; padding: 0.5rem 0;" id="empty-review-tip">
+              无待评审分支
+            </div>
+            <div id="lane-review-cards">
+              <!-- 卡片 3 (codex-03) -->
+              <article class="worker" id="card-codex-03" tabindex="0" onclick="selectWorker('codex-03')" aria-label="代理 codex-03 等待合并">
+                <div class="worker-top">
+                  <span class="state-dot done" aria-hidden="true"></span>
+                  <strong class="mono">codex-03</strong>
+                  <span class="model-badge">gpt-5.5-mini</span>
+                  <span class="diff-badge" style="margin-left: auto;">
+                    <span class="diff-add">+68</span>
+                    <span class="diff-del">-12</span>
+                  </span>
+                </div>
+                <div class="worker-task">重构 settings fallback 模块，清理不必要的冗余配置</div>
+                <div class="worker-bottom">
+                  <span class="worker-branch" style="color: var(--success); font-weight: 600;">awaiting-merge</span>
+                  <span class="mono">task_01</span>
+                </div>
+              </article>
+            </div>
           </section>
 
-          <section class="lane" aria-label="已完成和失败任务泳道">
-            <div class="lane-head"><span class="lane-title">已完成 / 失败</span><span class="count mono">1</span></div>
-            <article class="worker" tabindex="0" aria-label="失败任务，上一个 agent 被 supervisor 中断">
-              <div class="worker-top">
-                <span class="dot interrupted" aria-label="上一个 agent 被 supervisor 中断"></span>
-                <span class="tool">T</span>
-                <span class="model mono">local-cli</span>
-                <span class="diff mono"><span class="plus">+0</span> <span class="minus">-0</span></span>
-              </div>
-              <div class="task">静默 worker 被回收后任务失败；建议用 SDK runtime 重试。</div>
-              <div class="worker-bottom meta mono">task_05 status: failed / liveness: interrupted</div>
-              <div class="worker-actions">
-                <button class="detail-link" type="button">打开失败日志</button>
-              </div>
-            </article>
+          <!-- 失败与中断泳道 -->
+          <section class="lane" aria-label="失败与中断泳道">
+            <div class="lane-head">
+              <span class="lane-title">中断/失败 / Failed</span>
+              <span class="count" id="count-failed">0</span>
+            </div>
+            <div style="font-size: 0.75rem; color: var(--helm-muted); text-align: center; padding: 0.5rem 0;" id="empty-failed-tip">
+              无失败任务
+            </div>
+            <div id="lane-failed-cards">
+              <!-- 卡片 4 (task-05) -->
+              <article class="worker" id="card-task-05" tabindex="0" onclick="selectWorker('task-05')" aria-label="任务 task_05 中断">
+                <div class="worker-top">
+                  <span class="state-dot interrupted" aria-hidden="true"></span>
+                  <strong class="mono">task_05</strong>
+                  <span class="model-badge">local-cli</span>
+                  <span class="diff-badge" style="margin-left: auto;">
+                    <span class="diff-add">+0</span>
+                    <span class="diff-del">-0</span>
+                  </span>
+                </div>
+                <div class="worker-task">自动同步本地 providers 遇到 git 锁定重试中断</div>
+                <div class="worker-bottom">
+                  <span class="worker-branch" style="color: var(--error);">interrupted</span>
+                  <span class="mono">task_05</span>
+                </div>
+              </article>
+            </div>
           </section>
+
         </div>
       </aside>
 
-      <section class="pane" aria-label="选中 agent 会话">
-        <div class="pane-header">
-          <div class="pane-title">
-            <strong>codex-07 活动流</strong>
-            <span class="mono">assignee: codex-07 / task_02 / failureCount: 0</span>
+      <!-- 中栏：动态工作区 -->
+      <section class="pane session-pane" id="pane-session" aria-label="工作区会话">
+        <div class="session-container">
+          
+          <!-- 会话类型 Tabs 导航 -->
+          <div class="session-header-tabs" id="session-tabs-nav" style="opacity: 0.3; pointer-events: none;">
+            <button class="session-tab active" id="tab-lead-planner" onclick="selectTab('planner')">
+              <span>规划聊 / Lead Planner Chat</span>
+            </button>
+            <button class="session-tab" id="tab-worker-transcript" onclick="selectTab('worker')">
+              <span>Worker 执行会话 / Worker Transcript</span>
+              <span id="active-worker-badge" style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.72rem; color: var(--primary);">[未选定]</span>
+              <span id="active-worker-breadcrumb" style="font-size: 0.72rem; color: var(--helm-muted); margin-left: 0.4rem; border-left: 1px solid var(--b3); padding-left: 0.4rem; display: none;">来自 plan · task_02</span>
+            </button>
           </div>
-          <div class="inspector-meta">
-            <span class="pill"><span class="dot working" aria-hidden="true"></span> working</span>
-            <span class="pill mono">tool_use</span>
-            <button class="btn primary" type="button">跳到 worktree</button>
-            <button class="btn" type="button" disabled title="依赖 Phase 3.5 单 agent abort">停止该 agent</button>
-            <button class="btn" type="button" disabled title="依赖 Phase 3.5 单 agent retry">重试</button>
+
+          <!-- 会话主体内容 -->
+          <div class="session-body" id="session-main-body">
+            
+            <!-- 冷启动空态说明 -->
+            <div class="cold-start-banner" id="cold-start-welcome-banner">
+              <strong>下达一个目标，启动舰队 / Dispatch Target</strong>
+              <p>
+                当前无活跃任务运行。请在底部输入目标以启动 Lead Planner 规划。
+              </p>
+              <div style="font-family: ui-monospace, monospace; font-size: 0.72rem; color: var(--primary); margin-top: 0.25rem;">
+                Helm status: idle (等待输入中)
+              </div>
+            </div>
+
+            <!-- ====== 规划聊面板 (Lead Planner Chat - 动态填充) ====== -->
+            <div class="planner-view" id="view-planner" style="display: none; height: 100%;">
+              <div class="planner-chat-history" id="planner-dynamic-history">
+                <!-- JS 动态追加对话和 DAG 树 -->
+              </div>
+            </div>
+
+            <!-- ====== Worker 执行日志面板 (Worker Transcript) ====== -->
+            <div class="planner-view" id="view-worker" style="display: none; height: 100%;">
+              
+              <!-- 顶部桥接提示小字 (严格同步中英) -->
+              <div class="bridge-banner">
+                <div><strong>完整会话由 Phase 3.5 worker-transcript 桥提供</strong></div>
+                <div style="opacity: 0.9;">实现阶段在桥接通前显示活动流回退态，不伪造 transcript。</div>
+                <div style="font-size: 0.7rem; opacity: 0.8; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;">
+                  Full transcripts are provided by Phase 3.5 worker-transcript bridge. Falling back to simple activity stream during implementation.
+                </div>
+              </div>
+
+              <!-- 单 Agent 动作控制栏 -->
+              <div class="agent-control-bar">
+                <div>
+                  当前 Agent: <strong id="lbl-active-agent-name" class="mono">未分配</strong>
+                  <span id="lbl-active-agent-state" style="margin-left: 0.5rem; font-weight: 600;">(idle)</span>
+                </div>
+                <div class="actions">
+                  <button class="btn primary" type="button">跳到 worktree / Jump</button>
+                  <button class="btn" type="button" disabled>停止该 Agent</button>
+                  <button class="btn" type="button" disabled>重试 / Retry</button>
+                </div>
+              </div>
+
+              <!-- Worker 干净会话流 -->
+              <div class="planner-chat-history" id="worker-history-stream">
+                
+                <!-- Turn 1: 派发详情 (折叠展示，防止首屏噪音) -->
+                <div class="msg-turn">
+                  <details style="width: 100%;">
+                    <summary class="msg-head" style="cursor: pointer; list-style: none; display: flex; justify-content: space-between; align-items: center; width: 100%;">
+                      <strong>🚀 Hermes 派发详情 / Dispatch Context</strong>
+                      <span class="msg-meta" style="color: var(--primary);">[点击展开 / Expand]</span>
+                    </summary>
+                    <div class="dispatch-details">
+                      <table class="dispatch-table">
+                        <tr>
+                          <td>dispatchId</td>
+                          <td id="det-disp-id">-</td>
+                        </tr>
+                        <tr>
+                          <td>taskId</td>
+                          <td id="det-task-id">-</td>
+                        </tr>
+                        <tr>
+                          <td>assignee</td>
+                          <td id="det-assignee">-</td>
+                        </tr>
+                        <tr>
+                          <td>failureCount</td>
+                          <td id="det-fail-count">-</td>
+                        </tr>
+                        <tr>
+                          <td>dispatchedAt</td>
+                          <td>2026-06-28 23:26:01 (ISO-8601)</td>
+                        </tr>
+                      </table>
+                    </div>
+                  </details>
+                </div>
+
+                <div id="worker-dynamic-turns-container">
+                  <!-- JS 将根据选中的 Worker 插入具体的会话步骤 -->
+                </div>
+
+              </div>
+
+            </div>
+
           </div>
-        </div>
-        <div class="session">
-          <section class="stream-card bridge-note" aria-label="Phase 3.5 worker transcript 说明">
-            <div class="stream-top">
-              <strong>完整会话由 Phase 3.5 worker-transcript 桥提供</strong>
-              <span class="meta mono">target mock</span>
-            </div>
-            <p class="stream-body">本静态稿展示桥接通后的目标体验，使用真实感假数据。实现阶段在桥接通前显示活动流回退态，不伪造 transcript。</p>
-          </section>
-
-          <article class="message-turn" aria-label="Hermes 派发消息">
-            <div class="message-head">
-              <strong>Hermes 派发</strong>
-              <span class="message-meta mono">09:42:18 / dispatchId: disp_task_02_a17 / 0.4s</span>
-            </div>
-            <p class="stream-body">已将任务派发给 <span class="mono">codex-07</span>：稳定 provider 切换，同时不破坏聊天历史。目标 worktree：<span class="mono">helm/task_02</span>。</p>
-          </article>
-
-          <article class="message-turn agent" aria-label="Agent 第一轮">
-            <div class="message-head">
-              <strong>codex-07</strong>
-              <span class="message-meta mono">thinking / 188 tokens / 2.1s</span>
-            </div>
-            <div class="thinking-block">
-              <strong>ThinkingBlock</strong>
-              <p class="stream-body">先定位 provider 状态投影和 tab 恢复路径，再确认是否有现成测试覆盖。</p>
-            </div>
-            <details class="tool-block" open>
-              <summary class="tool-head">
-                <span class="tool-title"><span class="tool-chip">ReadToolBlock</span> src/stores/useChatStore.ts</span>
-                <span class="message-meta mono">params/result</span>
-              </summary>
-              <div class="tool-body mono">读取 ChatSessionTab provider/model 字段、focusTab 投影、providerConfigDirty 处理路径。结果：发现 active tab model 与全局 selector 同步存在覆盖风险。</div>
-            </details>
-          </article>
-
-          <article class="message-turn agent" aria-label="Agent 第二轮">
-            <div class="message-head">
-              <strong>codex-07</strong>
-              <span class="message-meta mono">thinking + edit / 426 tokens / 6.8s</span>
-            </div>
-            <div class="thinking-block">
-              <strong>ThinkingBlock</strong>
-              <p class="stream-body">修复点应保持 tab-local model 优先，不改动 provider 管理入口。补丁需要最小化，避免破坏现有 ChatPage。</p>
-            </div>
-            <details class="tool-block" open>
-              <summary class="tool-head">
-                <span class="tool-title"><span class="tool-chip">EditToolBlock</span> useChatStore provider projection</span>
-                <span class="message-meta mono">EditDiffPreview</span>
-              </summary>
-              <div class="diff-preview mono">
-                <div class="diff-line line-del"><span>-2144</span><span>set({ provider: nextProvider, model: defaultModel })</span></div>
-                <div class="diff-line line-add"><span>+2144</span><span>set(projectActiveTabModel(activeTab, nextProvider))</span></div>
-                <div class="diff-line line-add"><span>+2145</span><span>preserveVisibleModelControl(activeTab.model)</span></div>
-              </div>
-            </details>
-            <p class="stream-body">已将可见模型控制改为优先反映当前 tab，provider 变更仍会在新会话中使用默认模型。</p>
-          </article>
-
-          <article class="message-turn" aria-label="Inline intervention">
-            <div class="intervention-card">
-              <div class="stream-top">
-                <strong>干预槽位：needs-attention</strong>
-                <span class="pill"><span class="dot needs" aria-hidden="true"></span> 等待授权</span>
-              </div>
-              <p class="stream-body">Bash 需要读取 git 状态以生成 diff 摘要。这里表示 permission / ask-user / gate 的目标交互；Phase 4f 接入真实处理。</p>
-              <div class="worker-actions">
-                <button class="detail-link" type="button">允许本次检查</button>
-                <button class="detail-link" type="button">查看请求详情</button>
-              </div>
-            </div>
-          </article>
-
-          <article class="message-turn agent" aria-label="Agent 第三轮">
-            <div class="message-head">
-              <strong>codex-07</strong>
-              <span class="message-meta mono">bash + search / 312 tokens / 4.5s</span>
-            </div>
-            <details class="tool-block" open>
-              <summary class="tool-head">
-                <span class="tool-title"><span class="tool-chip">BashToolBlock</span> npm test selector</span>
-                <span class="message-meta mono">exit 0</span>
-              </summary>
-              <pre class="bash-output mono">npm run test -- chatStore.providerProjection
-PASS src/stores/useChatStore.providerProjection.test.ts
-2 tests passed in 1.7s</pre>
-            </details>
-            <details class="tool-block">
-              <summary class="tool-head">
-                <span class="tool-title"><span class="tool-chip">SearchToolGroupBlock</span> provider model selector</span>
-                <span class="message-meta mono">4 matches</span>
-              </summary>
-              <div class="tool-body mono">ChatHeader.tsx: model selector props
-useChatStore.ts: setModel / focusTab
-FanoutComposer.tsx: model fanout plan
-ModelIcon.tsx: provider icon mapping</div>
-            </details>
-          </article>
-
-          <article class="message-turn" aria-label="Subagent sidechain">
-            <div class="subagent-card">
-              <div class="message-head">
-                <strong>SubagentHistoryPanel：reviewer sidechain</strong>
-                <span class="message-meta mono">2 files / 3 tools / 1.9k tokens</span>
-              </div>
-              <p class="stream-body">子代理检查了 selector 回退路径，确认未触碰 production Rust，也未改变 Hermes 契约状态 token。</p>
-              <details class="tool-block">
-                <summary class="tool-head">
-                  <span class="tool-title"><span class="tool-chip">ReadToolBlock</span> ChatHeader.tsx</span>
-                  <span class="message-meta mono">expand</span>
-                </summary>
-                <div class="tool-body">确认 UI selector 从 active tab 投影读取；没有新增未本地化文案。</div>
-              </details>
-            </div>
-          </article>
-
-          <article class="message-turn agent" aria-label="Agent 收尾">
-            <div class="message-head">
-              <strong>codex-07</strong>
-              <span class="message-meta mono">text + done / 244 tokens / 1.1s</span>
-            </div>
-            <p class="stream-body">完成：provider 切换不会覆盖当前 tab 的 model 展示；新增测试覆盖 active tab 与新会话默认模型两个路径。建议合并前查看右侧 retained diff。</p>
-            <div class="stream-top">
-              <span class="pill"><span class="dot done" aria-hidden="true"></span> done</span>
-              <span class="message-meta mono">duration 16.2s / context 8.4k / output 1.1k</span>
-            </div>
-          </article>
-          <section class="log-preview" aria-label="桥接前活动流回退态">
-            <strong>实现阶段的桥接前回退态</strong>
-            <p class="stream-body">在 Phase 3.5 `hermes_worker_transcript` 接通前，生产 UI 只能显示 `hermes://agent` 的 status/activity、任务规约、dispatch 信息和干预槽位。</p>
-          </section>
-          <article class="stream-card" aria-label="派发信息">
-            <div class="stream-top">
-              <strong>派发信息</strong>
-              <span class="meta mono">hermes_dispatch_show</span>
-            </div>
-            <p class="stream-body">assignee、failureCount、dispatchedAt、completedAt、lastFailure 等字段可在这里展开查看；桥接前生产实现使用这些真实字段作为回退态。</p>
-          </article>
         </div>
       </section>
 
-      <aside class="pane inspector-pane" aria-label="Worktree 检查器">
+      <!-- 右栏：检查器 (冷启动时置灰) -->
+      <aside class="pane inspector-pane pane-disabled" id="pane-inspector" aria-label="检查器">
         <div class="pane-header">
           <div class="pane-title">
-            <strong>检查器</strong>
-            <span>Diff、评判结果、合并与丢弃</span>
+            <strong>检查器 / Inspector</strong>
+            <span id="inspect-desc">审查 retained worktree 改动与合并</span>
           </div>
-          <button class="btn" type="button" aria-label="收起检查器面板">面板</button>
         </div>
-        <div class="inspector-body">
-          <section class="empty-card">
+        <div class="inspector-body" id="inspector-main-body">
+          <!-- 默认空态：严格隔离，不可与有数据的预览并存 -->
+          <div class="empty-state" id="inspect-empty-state">
+            <svg style="width: 2.5rem; height: 2.5rem; color: var(--helm-muted);" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+            </svg>
             <strong>尚未选择待评审 worker</strong>
-            <p>选择 Review 泳道中的 retained worktree 后，这里才显示完整 diff、评判结果、merge/discard 操作和相关详情。未选择时不展示假 diff。</p>
-          </section>
-          <div class="composer-row">
-            <button class="btn primary" type="button" disabled>合并保留结果</button>
-            <button class="btn" type="button" disabled>预检后丢弃</button>
+            <p style="font-size: 0.75rem; margin: 0;">请选择 Review 泳道中处于 awaiting-merge 状态的 retained worktree 以审查 diff 及合并产物。</p>
           </div>
+
+          <!-- 评审数据区 (默认隐藏) -->
+          <div id="inspect-content-area" style="display: none; flex-direction: column; gap: 0.75rem; height: 100%;">
+            <div style="font-size: 0.8rem; font-weight: 700;">代码改动审查 (Diff Review)</div>
+            <div class="model-badge" id="inspect-branch-badge" style="align-self: flex-start;">branch: helm/task_02</div>
+            
+            <div class="tool-block" style="margin: 0;">
+              <div class="tool-head">
+                <span class="tool-title">src/stores/useChatStore.ts</span>
+                <span class="msg-meta">2 edits</span>
+              </div>
+              <div class="tool-body" style="padding: 0;">
+                <div class="diff-preview" id="inspect-diff-lines">
+                  <!-- 动态加载 diff -->
+                </div>
+              </div>
+            </div>
+
+            <div style="border: 1px solid var(--b3); border-radius: var(--border-radius); padding: 0.5rem; background: var(--b2); font-size: 0.75rem;">
+              <strong>评判结论 (Judge Notes):</strong>
+              <p style="margin: 0.25rem 0 0; color: var(--helm-muted);" id="inspect-judge-notes">代码编译正常，单元测试已全部通过。修改范围已得到子代理的安全审查，符合主分支合并条件。</p>
+            </div>
+
+            <div class="inspector-actions">
+              <button class="btn" type="button" onclick="confirmAction('discard')" style="border-color: var(--error); color: var(--error);">
+                预检后丢弃 / Discard
+              </button>
+              <button class="btn primary" type="button" id="btn-merge-action" onclick="confirmAction('merge')">
+                合并保留结果 / Merge
+              </button>
+            </div>
+          </div>
+
         </div>
       </aside>
+
     </section>
 
-    <footer class="composer" aria-label="Composer 与 Roster 提示">
-      <div class="composer-box">
-        <span class="meta">一次性目标</span>
-        <input aria-label="Hermes 一次性目标" value="下达一个目标，启动舰队..." readonly>
-      </div>
-      <div class="roster" aria-label="Roster 提示">
-        <div class="selector-row" aria-label="Roster 选择">
-          <span class="pill mono">CLI: Codex</span>
-          <span class="pill mono">Model: gpt-5.5</span>
-          <span class="pill mono">Mode: fanout 可选</span>
+    <!-- 底部 Composer -->
+    <footer class="composer" aria-label="Composer 输入区">
+      
+      <!-- @ 联想菜单弹窗 -->
+      <div class="mention-popup" id="mention-menu">
+        <div class="mention-section-title">文件 / Files</div>
+        <div class="mention-item" onclick="insertMention('@src/stores/useChatStore.ts')">
+          <span>@src/stores/useChatStore.ts</span>
+          <span class="mention-item-shortcut">文件</span>
         </div>
-        <button class="btn primary" type="button">派发给 Hermes</button>
+        
+        <div class="mention-section-title">技能 / Skills</div>
+        <div class="mention-item" onclick="insertMention('/refactor')">
+          <span>/refactor (重构代码)</span>
+          <span class="mention-item-shortcut">技能</span>
+        </div>
+
+        <div class="mention-section-title" style="color: var(--helm-muted); opacity: 0.8;">能力占位 (Phase 5/6)</div>
+        <div class="mention-item disabled tooltip-container">
+          <span>@git_push (直接推送分支)</span>
+          <span class="mention-item-shortcut">插件</span>
+          <span class="tooltip-text">Phase 5 / 6 规划中</span>
+        </div>
       </div>
+
+      <div class="composer-input-container" id="composer-container">
+        <span class="eyebrow" style="color: var(--primary); font-size: 0.75rem; font-weight: 700;">下达目标 / Target</span>
+        <input type="text" id="composer-input" placeholder="输入目标或计划，Hermes 将拆分并派发给舰队并行执行..." onfocus="toggleMentionMenu(true)" onblur="setTimeout(() => toggleMentionMenu(false), 200)" onkeydown="if(event.key === 'Enter') submitGoal()">
+        
+        <label style="display: inline-flex; align-items: center; gap: 0.25rem; font-size: 0.72rem; cursor: pointer; user-select: none; color: var(--helm-muted); margin-left: 0.5rem;">
+          <input type="checkbox" id="chk-fanout">
+          <span>并行评判对比 (Fanout)</span>
+        </label>
+      </div>
+
+      <div class="composer-actions-right">
+        <div style="display: inline-flex; align-items: center; gap: 0.35rem; border: 1px solid var(--b3); border-radius: 0.375rem; padding: 0.15rem 0.4rem; background: var(--b2);">
+          <span style="font-size: 0.72rem; color: var(--helm-muted); font-weight: 600;">Roster:</span>
+          <select id="roster-cli" style="font-size: 0.72rem; background: transparent; border: 0; outline: none; font-weight: 700; color: var(--primary);">
+            <option value="codex">Codex Roster</option>
+            <option value="claude">Claude Fleet</option>
+          </select>
+        </div>
+
+        <div class="tooltip-container">
+          <button class="btn" type="button" disabled style="background: var(--b2); border-color: var(--b3); opacity: 0.5;">
+            演示运行 / Demo Run
+          </button>
+          <span class="tooltip-text">需引擎 Phase 3.5 支持 hermes_run_mock</span>
+        </div>
+
+        <button class="btn primary" id="btn-submit-goal" type="button" onclick="submitGoal()">派发给 Hermes (⌘⏎)</button>
+      </div>
+
     </footer>
+
   </main>
+
+  <script>
+    // 步骤追踪器 (0: 冷启动空态, 1: 规划聊出 Plan DAG, 2: 派发舰队并行, 3: 授权干预 codex-07, 4: 移至待评审, 5: 检查 diff, 6: 合并完成)
+    let currentStep = 0;
+
+    // 模拟数据源
+    const workerTranscripts = {
+      'codex-07': {
+        running: `
+          <div class="thinking-block">
+            <div class="thinking-title">Thinking (2.1s) / 188 tokens</div>
+            <div style="color: var(--helm-muted);">正在定位 useChatStore 中的 Tab 投影切换位置。切换 tab 时 activeTabId 会更改，全局默认模型会将其覆盖。</div>
+          </div>
+          <div class="tool-block">
+            <div class="tool-head">
+              <span class="tool-title"><span class="tool-badge">Read</span> src/stores/useChatStore.ts</span>
+            </div>
+            <div class="tool-body">
+focusTab: (tabId) => {
+  const tab = get().tabs.find(t => t.id === tabId);
+  if (tab) {
+    set({ activeTabId: tabId, provider: tab.provider });
+  }
+}
+            </div>
+          </div>
+          <!-- Needs-Attention 授权请求 -->
+          <div class="intervention-card" id="codex-07-permission-card">
+            <div class="intervention-title">
+              <span class="state-dot needs-attention" aria-hidden="true"></span>
+              <strong>干预响应槽位：等待测试回归授权 / Permission Required</strong>
+            </div>
+            <p style="margin: 0; font-size: 0.8rem;">
+              <strong class="mono">codex-07</strong> 请求运行单元测试进行安全性回归校验：<code style="font-family: monospace; background: var(--b1); padding: 0.1rem 0.25rem; border-radius: 0.2rem;">npm run test</code>
+            </p>
+            <div style="display: flex; gap: 0.5rem; margin-top: 0.25rem;">
+              <button class="btn primary" id="btn-allow-test" type="button" onclick="resolveIntervention('codex-07', 'approved')" style="padding: 0.2rem 0.5rem; min-height: 1.5rem; font-size: 0.75rem;">允许运行测试</button>
+              <button class="btn" type="button" onclick="resolveIntervention('codex-07', 'denied')" style="padding: 0.2rem 0.5rem; min-height: 1.5rem; font-size: 0.75rem;">拒绝请求</button>
+            </div>
+          </div>
+        `,
+        done: `
+          <div class="thinking-block">
+            <div class="thinking-title">Thinking (2.1s) / 188 tokens</div>
+            <div style="color: var(--helm-muted);">正在定位 useChatStore 中的 Tab 投影切换位置。</div>
+          </div>
+          <div class="tool-block">
+            <div class="tool-head">
+              <span class="tool-title"><span class="tool-badge">Read</span> src/stores/useChatStore.ts</span>
+            </div>
+            <div class="tool-body">
+focusTab: (tabId) => { ... }
+            </div>
+          </div>
+          <div class="msg-turn">
+            <div class="msg-head">
+              <strong>🔒 权限决策已提交 (Resolved)</strong>
+              <span class="msg-meta">23:28 / Approved</span>
+            </div>
+            <div class="msg-body" style="color: var(--success); font-weight: 600;">
+              ✓ 用户已通过测试执行权限请求。任务继续运行。
+            </div>
+          </div>
+          <div class="tool-block">
+            <div class="tool-head">
+              <span class="tool-title"><span class="tool-badge">Bash</span> npm run test</span>
+              <span class="msg-meta">exit 0</span>
+            </div>
+            <div class="tool-body">
+PASS src/stores/useChatStore.test.ts (2 tests passed)
+            </div>
+          </div>
+          <div class="tool-block">
+            <div class="tool-head">
+              <span class="tool-title"><span class="tool-badge">Edit</span> useChatStore.ts</span>
+            </div>
+            <div class="tool-body" style="padding:0;">
+              <div class="diff-preview">
+                <div class="diff-line del">
+                  <span>- 2144: </span><span>set({ activeTabId: tabId, provider: tab.provider, model: defaultModel });</span>
+                </div>
+                <div class="diff-line add">
+                  <span>+ 2144: </span><span>const resolvedModel = tab.model || getModelForProvider(tab.provider);</span>
+                </div>
+                <div class="diff-line add">
+                  <span>+ 2145: </span><span>set({ activeTabId: tabId, provider: tab.provider, model: resolvedModel });</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div style="padding: 0.75rem; border-top: 1px solid var(--b3); background: color-mix(in srgb, var(--success), transparent 96%); display: flex; justify-content: space-between; align-items: center;">
+            <span style="color: var(--success); font-weight: 600; display: inline-flex; align-items: center; gap: 0.25rem;">
+              <span class="state-dot done" aria-hidden="true"></span>
+              done (运行完毕，待合并)
+            </span>
+            <span class="msg-meta">424 tokens / 16.5s</span>
+          </div>
+        `
+      },
+      'claude-11': {
+        running: `
+          <div class="thinking-block">
+            <div class="thinking-title">Thinking (1.5s)</div>
+            <div style="color: var(--helm-muted);">需要读取并核对 credentials 目录下的本地配置文件，以便进行多源同步测试。</div>
+          </div>
+          <div class="intervention-card">
+            <div class="intervention-title">
+              <span class="state-dot needs-attention" aria-hidden="true"></span>
+              <strong>干预响应槽位：凭证目录读取请求 / Read Permission Request</strong>
+            </div>
+            <p style="margin: 0; font-size: 0.8rem;">
+              <strong class="mono">claude-11</strong> 正在尝试访问敏感路径 <code style="font-family: monospace; background: var(--b1); padding: 0.1rem 0.25rem; border-radius: 0.2rem;">~/.gemini/config/credentials.json</code>
+            </p>
+          </div>
+        `
+      },
+      'codex-03': {
+        running: `
+          <div class="thinking-block">
+            <div class="thinking-title">Thinking (3.2s)</div>
+            <div style="color: var(--helm-muted);">代码 fallback 逻辑已审查完毕，开始清扫冗余变量。</div>
+          </div>
+          <div class="subagent-card">
+            <div class="tool-head">
+              <strong>SubagentHistoryPanel: review 侧链</strong>
+            </div>
+            <div style="padding: 0.5rem; font-size: 0.75rem; color: var(--success);">
+              ✓ 没有发现死循环引用<br>
+              ✓ 未污染全局 exports
+            </div>
+          </div>
+          <div style="padding: 0.75rem; border-top: 1px solid var(--b3); background: color-mix(in srgb, var(--success), transparent 96%); display: flex; justify-content: space-between; align-items: center;">
+            <span style="color: var(--success); font-weight: 600; display: inline-flex; align-items: center; gap: 0.25rem;">
+              <span class="state-dot done" aria-hidden="true"></span>
+              done (待合并)
+            </span>
+          </div>
+        `
+      },
+      'task-05': {
+        running: `
+          <div class="tool-block" style="border-color: var(--error);">
+            <div class="tool-head" style="background: color-mix(in srgb, var(--error), transparent 94%);">
+              <span class="tool-title" style="color: var(--error);"><span class="tool-badge" style="color:var(--error); border-color:var(--error);">Bash</span> git checkout -b helm/task_05</span>
+            </div>
+            <div class="tool-body" style="color: var(--error);">
+fatal: Unable to create '.git/index.lock': File exists.
+            </div>
+          </div>
+        `
+      }
+    };
+
+    const diffData = {
+      'codex-03': `
+        <div class="diff-line del">
+          <span>- </span><span>  fallbackProvider: 'gpt-4',</span>
+        </div>
+        <div class="diff-line add">
+          <span>+ </span><span>  fallbackProvider: DEFAULT_CHAT_PROVIDER,</span>
+        </div>
+      `,
+      'codex-07': `
+        <div class="diff-line del">
+          <span>- 2144: </span><span>set({ activeTabId: tabId, provider: tab.provider, model: defaultModel });</span>
+        </div>
+        <div class="diff-line add">
+          <span>+ 2144: </span><span>const resolvedModel = tab.model || getModelForProvider(tab.provider);</span>
+        </div>
+        <div class="diff-line add">
+          <span>+ 2145: </span><span>set({ activeTabId: tabId, provider: tab.provider, model: resolvedModel });</span>
+        </div>
+      `
+    };
+
+    // 填入示例目标
+    function quickFillTarget() {
+      if (currentStep !== 0) return;
+      const input = document.getElementById('composer-input');
+      input.value = "稳定 provider 切换，同时不破坏聊天历史";
+      document.getElementById('btn-quick-fill').classList.remove('guide-highlight');
+      document.getElementById('btn-submit-goal').classList.add('guide-highlight');
+      updateGuide("👉 已经填入示例。请点击右下角的 **「派发给 Hermes」** 或者直接按回车，让 Planner 开始规划。", "Step 1 / 6");
+    }
+
+    // 提交目标 -> 生成 Plan
+    function submitGoal() {
+      const input = document.getElementById('composer-input');
+      if (!input.value.trim() || input.value === '下达一个目标，启动舰队...') {
+        alert('请输入具体的重构目标或任务计划！');
+        return;
+      }
+
+      currentStep = 1;
+      document.getElementById('btn-submit-goal').classList.remove('guide-highlight');
+      
+      // 显示规划聊视图
+      document.getElementById('cold-start-welcome-banner').style.display = 'none';
+      document.getElementById('view-planner').style.display = 'flex';
+      document.getElementById('session-tabs-nav').style.opacity = '1';
+      document.getElementById('session-tabs-nav').style.pointerEvents = 'auto';
+
+      // 填充对话历史
+      const history = document.getElementById('planner-dynamic-history');
+      history.innerHTML = `
+        <div class="msg-turn">
+          <div class="msg-head">
+            <strong>你 (USER)</strong>
+            <span class="msg-meta">刚刚</span>
+          </div>
+          <div class="msg-body">${input.value}</div>
+        </div>
+        <div class="msg-turn agent" id="planner-response-turn">
+          <div class="msg-head">
+            <strong style="display: inline-flex; align-items: center; gap: 0.4rem;">
+              <span>LLM Planner (Lead)</span>
+              <span class="model-badge" style="color: var(--primary); border-color: var(--primary); background: var(--b1); font-size: 0.68rem; padding: 0 0.3rem;">claude-opus</span>
+              <span style="font-size: 0.68rem; font-weight: 500; color: var(--helm-pulse); background: color-mix(in srgb, var(--helm-pulse), transparent 90%); border: 1px solid var(--helm-pulse); padding: 0 0.3rem; border-radius: 0.25rem;">⚡ 已用 superpowers 头脑风暴</span>
+            </strong>
+            <span class="msg-meta">思考中...</span>
+          </div>
+          <div class="msg-body" id="planner-thinking-body">
+            正在对目标进行拆解...
+          </div>
+        </div>
+      `;
+
+      input.value = '';
+
+      // 模拟思考 1 秒后出 Plan
+      setTimeout(() => {
+        document.getElementById('planner-response-turn').querySelector('.msg-meta').innerText = '思考 2.4s / 产出任务 Plan DAG';
+        document.getElementById('planner-thinking-body').innerHTML = `
+          我已经为你生成了以下编排计划。将任务拆分为 3 个子任务：
+          
+          <div class="plan-dag-box">
+            <div class="plan-dag-title">生成的任务依赖 (Plan Plan DAG)</div>
+            <div class="dag-node-list">
+              <div class="dag-node">
+                <span class="state-dot done" aria-hidden="true"></span>
+                <strong>task_01 (就绪):</strong> 重构 settings fallback 模块，清理多余配置 (由 <span class="mono">codex-03</span> 处理)
+              </div>
+              <div class="dag-arrow">│ (依赖)</div>
+              <div class="dag-node">
+                <span class="state-dot working" aria-hidden="true"></span>
+                <strong>task_02 (就绪):</strong> 修改 <span class="mono">useChatStore.ts</span> 投影以锁定 local tab 模型 (由 <span class="mono">codex-07</span> 执行)
+              </div>
+              <div class="dag-arrow">│ (并行)</div>
+              <div class="dag-node">
+                <span class="state-dot needs-attention" aria-hidden="true"></span>
+                <strong>task_03 (就绪):</strong> 读取已保存的 credentials 进行同步验证 (由 <span class="mono">claude-11</span> 验证)
+              </div>
+            </div>
+            
+            <div style="margin-top: 0.75rem; display: flex; justify-content: flex-end;">
+              <button class="btn primary guide-highlight" id="btn-dispatch-plan" type="button" onclick="submitPlan()" style="min-height: 1.8rem; font-size: 0.78rem; border-radius: 0.25rem;">
+                🚀 派发此 plan / Dispatch this plan
+              </button>
+            </div>
+          </div>
+        `;
+        
+        updateGuide("👉 计划生成成功！请在中栏下方点击红框标注的 **「派发此 plan / Dispatch this plan」** 按钮，启动 AI 舰队进行并行开发。", "Step 2 / 6");
+      }, 1000);
+    }
+
+    // 派发 Plan -> 启动舰队运行
+    function submitPlan() {
+      currentStep = 2;
+      
+      // 解锁左侧和右侧面板
+      document.getElementById('pane-fleet').classList.remove('pane-disabled');
+      document.getElementById('pane-inspector').classList.remove('pane-disabled');
+
+      // 更新顶部 Bar 状态为运行中
+      document.getElementById('run-title').innerHTML = '<span style="font-size: 0.8rem; font-weight: 500; color: var(--helm-muted); background: var(--b2); border: 1px solid var(--b3); padding: 0.1rem 0.35rem; border-radius: 0.25rem; margin-right: 0.4rem; vertical-align: middle;">目标 / Goal:</span>稳定 provider 切换，同时不破坏聊天历史';
+      document.getElementById('run-eyebrow').innerHTML = 'Helm · Hermes run <span class="mono">run_9f42c</span>';
+      document.getElementById('run-pulse').style.display = 'block';
+      document.getElementById('run-pulse').querySelector('::before'); // 伪类不直接改，用 css width
+      
+      // 用简单的 style 改脉冲进度条宽度
+      document.styleSheets[0].addRule('.pulse-rail::before', 'width: 35% !important;');
+      document.styleSheets[0].addRule('.pulse-rail::after', 'left: 33% !important;');
+
+      document.getElementById('run-header-actions').style.opacity = '1';
+      document.getElementById('run-header-actions').style.pointerEvents = 'auto';
+
+      // 泳道卡片统计更新
+      document.getElementById('count-running').innerText = '2';
+      document.getElementById('count-review').innerText = '1';
+      document.getElementById('count-failed').innerText = '1';
+      document.getElementById('empty-running-tip').style.display = 'none';
+      document.getElementById('empty-review-tip').style.display = 'none';
+      document.getElementById('empty-failed-tip').style.display = 'none';
+
+      // 显示舰队卡片
+      document.getElementById('card-codex-07').style.display = 'grid';
+      document.getElementById('card-claude-11').style.display = 'grid';
+      document.getElementById('card-codex-03').style.display = 'grid';
+      document.getElementById('card-task-05').style.display = 'grid';
+
+      // 切换中栏到 Worker Transcript Tab，但先提示未选中
+      selectTab('worker');
+      document.getElementById('lbl-active-agent-name').innerText = '未选定';
+      document.getElementById('lbl-active-agent-state').innerText = '(waiting)';
+      document.getElementById('worker-dynamic-turns-container').innerHTML = `
+        <div style="text-align: center; color: var(--helm-muted); padding: 2rem 0;">
+          <p>请在左侧点击 AI 卡片以载入该 Agent 的执行会话与干预槽。</p>
+        </div>
+      `;
+
+      // 引导用户去点击左边卡片
+      document.getElementById('card-codex-07').classList.add('guide-highlight');
+      updateGuide("👉 舰队已派发！左侧看板已经亮起。请点击红框标注的 **`codex-07`** 卡片，查看其当前在工作区内的详细日志。", "Step 3 / 6");
+    }
+
+    // 选中某个卡片
+    function selectWorker(workerId) {
+      if (currentStep < 2) return;
+
+      document.querySelectorAll('.worker').forEach(c => c.classList.remove('selected', 'guide-highlight'));
+      const card = document.getElementById(`card-${workerId}`);
+      if (card) card.classList.add('selected');
+
+      document.getElementById('active-worker-badge').innerText = `[${workerId}]`;
+      document.getElementById('active-worker-badge').style.display = 'inline';
+      document.getElementById('active-worker-breadcrumb').style.display = 'inline';
+      
+      let taskId = workerId === 'task-05' ? 'task_05' : (workerId === 'codex-03' ? 'task_01' : (workerId === 'claude-11' ? 'task_03' : 'task_02'));
+      document.getElementById('active-worker-breadcrumb').innerText = `来自 plan · ${taskId}`;
+      document.getElementById('lbl-active-agent-name').innerText = workerId;
+
+      // 日志状态描述
+      let statusText = '(working)';
+      if (workerId === 'claude-11') statusText = '(needs-attention)';
+      if (workerId === 'codex-03') statusText = '(done / awaiting-merge)';
+      if (workerId === 'task-05') statusText = '(interrupted)';
+      
+      // 如果 codex-07 在第四步之后被点击，它应该是 done
+      if (workerId === 'codex-07' && currentStep >= 4) {
+        statusText = '(done / awaiting-merge)';
+      }
+      document.getElementById('lbl-active-agent-state').innerText = statusText;
+
+      // 派发上下文 DTO 绑定
+      document.getElementById('det-assignee').innerText = workerId;
+      document.getElementById('det-task-id').innerText = taskId;
+      document.getElementById('det-disp-id').innerText = `disp_${workerId}_a8192`;
+      document.getElementById('det-fail-count').innerText = workerId === 'task-05' ? '3 (已熔断)' : '0';
+
+      // 渲染会话流
+      const container = document.getElementById('worker-dynamic-turns-container');
+      if (workerId === 'codex-07') {
+        if (currentStep === 2) {
+          // 当前处于等待授权阶段
+          currentStep = 3;
+          container.innerHTML = workerTranscripts['codex-07'].running;
+          
+          // 给按钮加红圈指示
+          setTimeout(() => {
+            const btn = document.getElementById('btn-allow-test');
+            if (btn) btn.classList.add('guide-highlight');
+          }, 100);
+
+          updateGuide("👉 正在阅读 `codex-07` 日志。会话显示它因为要执行测试而被拦截挂起。点击中栏底部的红框 **「允许运行测试」** 为其授权。", "Step 4 / 6");
+        } else {
+          // 授权已通过阶段
+          container.innerHTML = workerTranscripts['codex-07'].done;
+        }
+      } else {
+        container.innerHTML = workerTranscripts[workerId] ? (workerTranscripts[workerId].running || workerTranscripts[workerId]) : '<p>无活跃日志</p>';
+      }
+
+      // 右侧检查器联动
+      const inspectEmpty = document.getElementById('inspect-empty-state');
+      const inspectContent = document.getElementById('inspect-content-area');
+      const diffContainer = document.getElementById('inspect-diff-lines');
+
+      // 只有在已完成/待评审状态下，才展示 Diff (codex-03 或 授权已过后的 codex-07)
+      if (workerId === 'codex-03' || (workerId === 'codex-07' && currentStep >= 4)) {
+        inspectEmpty.style.display = 'none';
+        inspectContent.style.display = 'flex';
+        document.getElementById('inspect-branch-badge').innerText = `branch: helm/${taskId}`;
+        diffContainer.innerHTML = diffData[workerId] || '';
+
+        if (currentStep === 4 && workerId === 'codex-07') {
+          currentStep = 5;
+          document.getElementById('btn-merge-action').classList.add('guide-highlight');
+          updateGuide("👉 检查器已亮起！右栏展示了 `codex-07` 的代码 diff 变更。确认逻辑正确后，点击红框的 **「合并保留结果 / Merge」** 进行收敛。", "Step 6 / 6");
+        }
+      } else {
+        inspectEmpty.style.display = 'flex';
+        inspectContent.style.display = 'none';
+      }
+    }
+
+    // 允许/拒绝干预
+    function resolveIntervention(agentId, result) {
+      if (agentId === 'codex-07' && currentStep === 3) {
+        currentStep = 4;
+        
+        // 更新卡片状态：从 running 移动到 review，点变成 done
+        const card = document.getElementById('card-codex-07');
+        const dot = document.getElementById('dot-codex-07');
+        
+        // 修改 dot 的样式类
+        dot.classList.remove('working');
+        dot.classList.add('done');
+        
+        // 移至 Review 泳道
+        document.getElementById('lane-review-cards').appendChild(card);
+        
+        // 更新泳道计数
+        document.getElementById('count-running').innerText = '1';
+        document.getElementById('count-review').innerText = '2';
+
+        // 更新中栏日志
+        selectWorker('codex-07');
+
+        // 提示用户点击该 Review 卡片
+        card.classList.add('guide-highlight');
+        updateGuide("👉 授权完毕！`codex-07` 自动移入了 **`待评审 / Review`** 泳道。请再次点击看板中被红框圈出的 **`codex-07`** 卡片进行 Diff 评审。", "Step 5 / 6");
+      }
+    }
+
+    // 检查器确认合并
+    function confirmAction(action) {
+      if (action === 'merge' && currentStep === 5) {
+        if (confirm("确认执行合并？\n这将会将 retained worktree 代码合并入 feat/helm 并安全移除任务临时分支。")) {
+          currentStep = 6;
+
+          // 将 codex-07 移到已完成/失败，dot 保持 done，但分支标为 merged
+          const card = document.getElementById('card-codex-07');
+          card.querySelector('.worker-branch').innerText = 'merged -> feat/helm';
+          card.querySelector('.worker-branch').style.color = 'var(--success)';
+          document.getElementById('lane-failed-cards').appendChild(card);
+
+          // 更新计数
+          document.getElementById('count-review').innerText = '1';
+          document.getElementById('count-failed').innerText = '2'; // failed 和已完成合并泳道
+
+          // 更新进度条
+          document.styleSheets[0].addRule('.pulse-rail::before', 'width: 100% !important;');
+          document.styleSheets[0].addRule('.pulse-rail::after', 'left: 98% !important;');
+          document.getElementById('run-state-badge').style.borderColor = 'var(--success)';
+          document.getElementById('run-state-badge').style.color = 'var(--success)';
+          document.getElementById('run-state-dot').className = 'state-dot done';
+
+          // 重归空态
+          document.getElementById('inspect-empty-state').style.display = 'flex';
+          document.getElementById('inspect-content-area').style.display = 'none';
+
+          // 提示完成
+          alert("🎉 合并成功！任务已顺利并入主干。本次编排已全部安全收敛。");
+          updateGuide("🎉 Walkthrough Happy-Path 已经圆满走通！点击上方右侧「重置 Walkthrough」可以重新从冷启动体验。", "Complete");
+        }
+      }
+    }
+
+    // 切换 Tab
+    function selectTab(type) {
+      const tabPlanner = document.getElementById('tab-lead-planner');
+      const tabWorker = document.getElementById('tab-worker-transcript');
+      const viewPlanner = document.getElementById('view-planner');
+      const viewWorker = document.getElementById('view-worker');
+
+      tabPlanner.classList.remove('active');
+      tabWorker.classList.remove('active');
+      viewPlanner.style.display = 'none';
+      viewWorker.style.display = 'none';
+
+      if (type === 'planner') {
+        tabPlanner.classList.add('active');
+        viewPlanner.style.display = 'flex';
+      } else {
+        tabWorker.classList.add('active');
+        viewWorker.style.display = 'flex';
+      }
+    }
+
+    // 更新引导信息
+    function updateGuide(text, stepTag) {
+      document.getElementById('guide-step-tag').innerText = stepTag;
+      document.getElementById('guide-text').innerHTML = text;
+    }
+
+    // 重置 walkthrough
+    function resetWalkthrough() {
+      currentStep = 0;
+      
+      // 重新置灰面板
+      document.getElementById('pane-fleet').classList.add('pane-disabled');
+      document.getElementById('pane-inspector').classList.add('pane-disabled');
+      document.getElementById('session-tabs-nav').style.opacity = '0.3';
+      document.getElementById('session-tabs-nav').style.pointerEvents = 'none';
+
+      // 还原顶部状态条
+      document.getElementById('run-title').innerText = '未启动编排任务 / Waiting for target';
+      document.getElementById('run-eyebrow').innerHTML = 'Helm · Roster 空闲';
+      document.getElementById('run-pulse').style.display = 'none';
+      document.getElementById('run-header-actions').style.opacity = '0.3';
+      document.getElementById('run-header-actions').style.pointerEvents = 'none';
+
+      // 还原泳道
+      document.getElementById('count-running').innerText = '0';
+      document.getElementById('count-review').innerText = '0';
+      document.getElementById('count-failed').innerText = '0';
+      document.getElementById('empty-running-tip').style.display = 'block';
+      document.getElementById('empty-review-tip').style.display = 'block';
+      document.getElementById('empty-failed-tip').style.display = 'block';
+
+      // 隐藏卡片
+      document.getElementById('card-codex-07').style.display = 'none';
+      document.getElementById('card-claude-11').style.display = 'none';
+      document.getElementById('card-codex-03').style.display = 'none';
+      document.getElementById('card-task-05').style.display = 'none';
+
+      // 将 card-codex-07 放回运行中泳道
+      document.getElementById('lane-running-cards').appendChild(document.getElementById('card-codex-07'));
+      document.getElementById('dot-codex-07').className = 'state-dot working';
+      document.getElementById('branch-codex-07').innerText = 'branch: helm/task_02';
+
+      // 还原中栏
+      document.getElementById('cold-start-welcome-banner').style.display = 'flex';
+      document.getElementById('view-planner').style.display = 'none';
+      document.getElementById('view-worker').style.display = 'none';
+      document.getElementById('active-worker-badge').style.display = 'none';
+      document.getElementById('active-worker-breadcrumb').style.display = 'none';
+
+      // 还原右栏
+      document.getElementById('inspect-empty-state').style.display = 'flex';
+      document.getElementById('inspect-content-area').style.display = 'none';
+
+      // 引导
+      document.getElementById('btn-quick-fill').classList.add('guide-highlight');
+      document.getElementById('composer-input').value = '';
+      updateGuide("第一步：在底部 Composer 中输入重构目标并回车，或直接点击下方“填入示例目标”。", "Step 1 / 6");
+    }
+
+    // 输入联想
+    function toggleMentionMenu(show) {
+      const menu = document.getElementById('mention-menu');
+      menu.style.display = show ? 'block' : 'none';
+    }
+
+    function insertMention(text) {
+      const input = document.getElementById('composer-input');
+      input.value = text + ' ';
+      input.focus();
+      toggleMentionMenu(false);
+    }
+
+    // 初始化 walkthrough
+    resetWalkthrough();
+  </script>
 </body>
 </html>
