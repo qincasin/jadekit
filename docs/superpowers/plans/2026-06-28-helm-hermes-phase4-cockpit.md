@@ -234,18 +234,27 @@ git checkout feat/helm && git merge --no-ff feat/helm-phase4b-fleet -m "merge: P
 - [ ] **Step 4: 确认通过** → vitest PASS
 - [ ] **Step 5: 提交** `feat(helm): cmd-k jump palette for active agents`
 
-## Task 9: 中栏 agent 会话 + 子代理内联展开（复用）
+## Task 9: 中栏 agent 会话（务实 grounded：先活动流 + 干预，富 transcript 待 Phase 3.5 桥点亮）
+
+> **后端事实（务实约束，不画后端给不出的数据）**：Hermes worker 走 `SdkRuntime.send_raw_stream`，流被引擎内部消费，**前端当前只能拿到 `hermes://agent` 粗粒度事件**（status + activity：tool_use/text/thinking），**拿不到 worker 完整 transcript / 富工具块**。因此本 task **按当前后端能给的画**：活动流时间线 + 任务 spec/result + dispatch 信息 + 干预，并把容器做成 **transcript-ready** 形状。worker 完整 transcript（复用 `MessageList`/`toolBlocks`/`ThinkingBlock`/`MessageMeta`）**依赖 Phase 3.5 的 worker-transcript 桥**（`hermes_worker_transcript` 命令，复用 `session_manager::load_messages`）落地后再点亮——届时只换数据源、UI 容器不重做。
 
 **Files:**
-- Create: `src/components/helm/SessionPanel.tsx`（选中 agent → 渲染其会话，复用现有 `MessageList`/`SubagentHistoryPanel`/`subagentRuns`）
-- Test: `src/components/helm/sessionSelect.test.ts`（选中态纯逻辑）
+- Create: `src/components/helm/SessionPanel.tsx`、`src/components/helm/sessionHeaderActions.ts`（单-agent 动作纯逻辑）
+- Test: `src/components/helm/sessionSelect.test.ts`、`src/components/helm/sessionHeaderActions.test.ts`
 
-**Interfaces:** Consumes：现有会话渲染 + `subagentRuns`（按 parentToolUseId）。Produces：`SessionPanel`（点 WorkerCard → store 设 `selectedAgentId` → 渲染该 agent 会话；Task 块内联展开 sidechain）。
-- [ ] **Step 1: 写失败测试** —— `selectAgent(id)` 设选中；切换清理上一个的临时态。
+**Interfaces:**
+- **当前 grounded 数据**：`hermes://agent` 活动流（store 里维护的 `AgentView`：status + activity 时间线）、`TaskDto`（spec/result/status）、`DispatchDto`（assignee/failure_count/时间）。
+- **transcript-ready 容器**：SessionPanel 预留一个 transcript 区，数据源抽象成 `loadWorkerTranscript(agentId): Promise<Message[]|null>`——当前返回 null（走活动流 + 空态「完整执行记录将在引擎接通后显示」）；Phase 3.5 提供 `hermes_worker_transcript` 后此函数接真数据，**届时复用** `MessageList`/`ContentBlockRenderer`/`toolBlocks`/`ThinkingBlock`/`MessageMeta` 渲染，UI 不重写。
+- **可立即复用（grounded）**：`SubagentHistoryPanel` + `subagentRuns`（若 sidechain 数据可得则内联）、`ScrollControl`、流式指示。
+- Produces：
+  - `SessionPanel`（点 WorkerCard → `selectedAgentId` → 渲染该 agent 活动流 + 任务/派发信息 + transcript-ready 区）。
+  - **会话头单-agent 动作**：`sessionHeaderActions(agent)` → 跳到其 worktree（grounded：worktree 路径已知）/ 重试·停止（**单-agent abort 当前后端只有 run 级 cancel**，故标注：单-agent stop 依赖 Phase 3.5/后续，UI 先给入口或禁用态 + tooltip 说明）。
+  - **内联干预槽**：`needs-attention` 时权限/ask-user/gate 回答 UI 内联浮现（实现归 4f，本 task 预留挂载点）。
+- [ ] **Step 1: 写失败测试** —— `selectAgent(id)` 设选中 + 切换清理临时态；`sessionHeaderActions(runningAgent)` 含「跳 worktree」；`loadWorkerTranscript` 返回 null 时 SessionPanel 走活动流 + 空态（不报错）。
 - [ ] **Step 2: 确认失败** → FAIL
-- [ ] **Step 3: 实现**（复用，不重写会话渲染；空态「选择左侧一个 agent 查看其会话」）
+- [ ] **Step 3: 实现**（活动流 + transcript-ready 容器 + 干预槽；空态文案；不画假 transcript）
 - [ ] **Step 4: 确认通过 + build** → 全绿
-- [ ] **Step 5: 提交** `feat(helm): center session panel with inline sub-agent expansion`
+- [ ] **Step 5: 提交** `feat(helm): center session with activity stream and transcript-ready container`
 
 ### ✅ GATE 4c
 ```bash
@@ -317,12 +326,20 @@ git checkout feat/helm && git merge --no-ff feat/helm-phase4d-inspector -m "merg
 ## Task 13: Composer（下达目标起 run + 选兵 + 扇出）
 
 **Files:**
-- Create: `src/components/helm/HelmComposer.tsx`（复用 `FanoutComposer` + `useComposerState` 思路）、`src/components/helm/launchPlan.ts`（goal+roster → 启动参数纯逻辑）
+- Create: `src/components/helm/HelmComposer.tsx`、`src/components/helm/launchPlan.ts`（goal+roster → 启动参数纯逻辑）
 - Test: `src/components/helm/launchPlan.test.ts`
 
-**Interfaces:** Produces：`buildLaunch(goal, opts, roster): { goal, opts }`（校验 goal 非空、maxConcurrent>0）；提交 → `hermesService.run`；异构扇出复用 Phase 1b `FanoutComposer`。键盘优先（⌘Enter 提交）。
+**Interfaces:**
+- **复用（grounded，对齐 Hermes「下达目标 / 选兵」语境，不照搬单聊）**：
+  - **模型/provider 选择 = Roster**：`SelectorDropdown`（model/mode/reasoning）+ `ModelIcon` + `roster.ts` + provider 管理——选「派哪些 CLI×模型」。这是 grounded 的核心。
+  - 异构扇出：复用 Phase 1b `FanoutComposer`。
+  - 安全：SDK 缺失拦截（复用 `ChatComposer` 守卫逻辑）。
+  - **可选（合适才用，不强求）**：`PromptEnhancerDialog`（增强 goal 文本）、`@` 文件引用（goal 里引文件）。
+  - **不适用（务实剔除）**：`/` 斜杠命令、逐条对话补全、"跟 worker 单聊"——Hermes 是**一次性下达 goal 给编排器**（Planner 选兵自动驱动 worker），不存在逐条 chat 回合，别硬塞单聊件。
+- Produces：`buildLaunch(goal, opts, roster): { goal, opts }`（校验 goal 非空、maxConcurrent>0）；提交 → `hermesService.run`。键盘优先（⌘Enter 提交）。
+- **「演示运行」入口（测试用）**：composer 旁加一个「演示运行」按钮 → 调 `hermesService.runMock()`（Phase 3.5 `hermes_run_mock`，脚本化 LLM、不烧 token）；命令未就绪时禁用态 + tooltip「需引擎 Phase 3.5」。让你在 UI 里点一下就能驱动整条编排看效果，不用 devtools。
 - [ ] **Step 1: 写失败测试** —— 空 goal 拒绝；opts 归一化；扇出计划构造。
-- [ ] **Step 2: FAIL** → **Step 3: 实现**（空/错态文案）→ **Step 4: vitest+build+lint** → **Step 5: 提交** `feat(helm): composer to launch orchestration runs`
+- [ ] **Step 2: FAIL** → **Step 3: 实现**（Roster 选兵 + 扇出 + SDK 守卫；空/错态文案；不塞不适用的单聊件）→ **Step 4: vitest+build+lint** → **Step 5: 提交** `feat(helm): composer with roster selection and run launch`
 
 ### ✅ GATE 4e
 ```bash
@@ -394,7 +411,7 @@ git checkout feat/helm && git merge --no-ff feat/helm-phase4f-intervention -m "m
 - Create: `docs/helm-phase4-verification.md`（§10 质量基线逐条核对 + 真 LLM e2e 步骤）
 
 **审计清单（§10 硬标准逐条）：**
-- [ ] **Step 1: 真事件端到端** —— 起一个真 run（或 mock 事件注入），三栏全联动：舰队板状态点实时刷、点卡进会话、diff/合并可用、干预浮现可应答、⌘K 可跳。
+- [ ] **Step 1: UI 驱动的端到端（首选 mock 运行，不靠 devtools）** —— cockpit 提供「演示运行」入口（composer 旁，调 Phase 3.5 的 `hermes_run_mock`；命令未就绪时禁用态 + tooltip）。点它即在 **UI 里**驱动整条编排，三栏全联动：舰队板状态点实时刷、点卡进会话、diff/合并可用、干预浮现可应答、⌘K 可跳。**这是日常验收主通路**（不用敲 devtools 命令行）；真 LLM run 作为补充手测。
 - [ ] **Step 2: 键盘优先审计** —— 切 agent/扇出/合并/丢弃/应答 gate 全有快捷键且可见焦点。
 - [ ] **Step 3: 实时性 + 可访问性** —— 流式/状态点近实时无卡顿、长列表虚拟化；reduced-motion 尊重；明暗主题 + 移动窄屏过。
 - [ ] **Step 4: 视觉自审（frontend-design）** —— 出截图对照「orca 级、零模板感」，不达标返工。

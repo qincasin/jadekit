@@ -21,6 +21,7 @@ import type {ChatWorkspaceProjectOption} from '../components/chat/composer/Conte
 import {ChatComposer} from '../components/chat/composer/ChatComposer';
 import {FanoutCompareView} from '../components/chat/fanout/FanoutCompareView';
 import ModalDialog from '../components/common/ModalDialog';
+import HelmCockpit from '../components/helm/HelmCockpit';
 import {
     CONVERSATION_PANE_MAX_WIDTH,
     CONVERSATION_PANE_MIN_WIDTH,
@@ -159,6 +160,7 @@ export default function ChatPage() {
     } = useChatStore();
 
     const [sdkModalOpen, setSdkModalOpen] = useState(false);
+    const [showCockpit, setShowCockpit] = useState(false);
     const [isNearBottom, setIsNearBottom] = useState(true);
     const [searchQuery, setSearchQuery] = useState('');
     const [collapsedAnchorCount, setCollapsedAnchorCount] = useState<number | null>(null);
@@ -948,6 +950,12 @@ export default function ChatPage() {
                 </div>
                 <div className="flex items-center gap-2">
                     <button
+                        className={`btn btn-sm ${showCockpit ? 'btn-primary' : 'btn-ghost'}`}
+                        onClick={() => setShowCockpit(prev => !prev)}
+                    >
+                        Helm Cockpit
+                    </button>
+                    <button
                         className={`btn btn-ghost btn-sm ${sdkMissing ? 'text-warning' : ''}`}
                         onClick={() => setSdkModalOpen(true)}
                     >
@@ -981,7 +989,10 @@ export default function ChatPage() {
             )}
 
             {/* 消息区：预留 cc-gui 风格的搜索、锚点和状态扩展槽 */}
-            <div className="chat-workspace-surface relative flex min-h-0 flex-1 overflow-hidden">
+            {showCockpit ? (
+                <HelmCockpit />
+            ) : (
+                <div className="chat-workspace-surface relative flex min-h-0 flex-1 overflow-hidden">
                 {sessionSidebarCollapsed ? (
                     <div className="chat-session-sidebar-collapsed-rail hidden lg:flex">
                         <button
@@ -1196,6 +1207,7 @@ export default function ChatPage() {
                     )}
                 </div>
             </div>
+        )}
 
             {/* 错误提示 */}
             {error && (
