@@ -3,6 +3,7 @@ import { useCockpitLayout } from './useCockpitLayout';
 import FleetKanban from './FleetKanban';
 import { JumpPalette } from './JumpPalette';
 import SessionPanel from './SessionPanel';
+import { InspectorPanel } from './InspectorPanel';
 
 export default function HelmCockpit() {
   const {
@@ -113,23 +114,7 @@ export default function HelmCockpit() {
           }`}
           aria-label="检查器 (Right Panel)"
         >
-          <div className="p-4 border-b border-base-300 flex justify-between items-center bg-base-200">
-            <button
-              onClick={toggleRight}
-              className="btn btn-ghost btn-xs h-6 min-h-0 focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none"
-              aria-label="收起右栏"
-            >
-              ▶
-            </button>
-            <span className="font-bold text-sm tracking-wider uppercase text-base-content/80">Right Panel</span>
-          </div>
-          <div className="p-4 overflow-y-auto flex-1">
-            <p className="text-xs text-base-content/60 mb-2">检查器 / Inspector</p>
-            <div className="text-xs text-base-content/40">审查 retained worktree 改动与合并</div>
-            <div className="mt-8 border border-dashed border-base-300 rounded p-6 text-center text-xs text-base-content/40">
-              尚未选择待评审 worker
-            </div>
-          </div>
+          <InspectorPanel onClose={toggleRight} />
         </aside>
       </div>
       <JumpPalette isOpen={isPaletteOpen} onClose={() => setIsPaletteOpen(false)} />

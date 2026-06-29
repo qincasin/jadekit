@@ -106,6 +106,9 @@ export const FleetKanban: React.FC = () => {
   const agents = useHermesStore((state) => state.agents);
   const [virtualized, setVirtualized] = useState(false);
 
+  const selectedAgentId = useHermesStore((state) => state.selectedAgentId);
+  const setSelectedAgentId = useHermesStore((state) => state.setSelectedAgentId);
+
   const currentCwd = useChatStore((state) => state.currentCwd);
   const [draggedTask, setDraggedTask] = useState<TaskState | null>(null);
   const [draggedFromLane, setDraggedFromLane] = useState<Lane | null>(null);
@@ -309,16 +312,23 @@ export const FleetKanban: React.FC = () => {
               items={lanes.pending}
               itemHeight={118}
               virtualized={virtualized}
-              renderItem={(task) => (
-                <WorkerCard
-                  key={task.id}
-                  task={task}
-                  agent={getAgentForTask(task.id)}
-                  draggable
-                  onDragStart={() => handleDragStart(task, 'pending')}
-                  onAction={(action) => handleAction(action, task)}
-                />
-              )}
+              renderItem={(task) => {
+                const cardAgent = getAgentForTask(task.id);
+                return (
+                  <WorkerCard
+                    key={task.id}
+                    task={task}
+                    agent={cardAgent}
+                    onClick={() => {
+                      if (cardAgent) setSelectedAgentId(cardAgent.id);
+                    }}
+                    isSelected={cardAgent !== undefined && selectedAgentId === cardAgent.id}
+                    draggable
+                    onDragStart={() => handleDragStart(task, 'pending')}
+                    onAction={(action) => handleAction(action, task)}
+                  />
+                );
+              }}
             />
           </div>
         </div>
@@ -342,16 +352,23 @@ export const FleetKanban: React.FC = () => {
               items={lanes.running}
               itemHeight={118}
               virtualized={virtualized}
-              renderItem={(task) => (
-                <WorkerCard
-                  key={task.id}
-                  task={task}
-                  agent={getAgentForTask(task.id)}
-                  draggable
-                  onDragStart={() => handleDragStart(task, 'running')}
-                  onAction={(action) => handleAction(action, task)}
-                />
-              )}
+              renderItem={(task) => {
+                const cardAgent = getAgentForTask(task.id);
+                return (
+                  <WorkerCard
+                    key={task.id}
+                    task={task}
+                    agent={cardAgent}
+                    onClick={() => {
+                      if (cardAgent) setSelectedAgentId(cardAgent.id);
+                    }}
+                    isSelected={cardAgent !== undefined && selectedAgentId === cardAgent.id}
+                    draggable
+                    onDragStart={() => handleDragStart(task, 'running')}
+                    onAction={(action) => handleAction(action, task)}
+                  />
+                );
+              }}
             />
           </div>
         </div>
@@ -375,16 +392,23 @@ export const FleetKanban: React.FC = () => {
               items={lanes.review}
               itemHeight={118}
               virtualized={virtualized}
-              renderItem={(task) => (
-                <WorkerCard
-                  key={task.id}
-                  task={task}
-                  agent={getAgentForTask(task.id)}
-                  draggable
-                  onDragStart={() => handleDragStart(task, 'review')}
-                  onAction={(action) => handleAction(action, task)}
-                />
-              )}
+              renderItem={(task) => {
+                const cardAgent = getAgentForTask(task.id);
+                return (
+                  <WorkerCard
+                    key={task.id}
+                    task={task}
+                    agent={cardAgent}
+                    onClick={() => {
+                      if (cardAgent) setSelectedAgentId(cardAgent.id);
+                    }}
+                    isSelected={cardAgent !== undefined && selectedAgentId === cardAgent.id}
+                    draggable
+                    onDragStart={() => handleDragStart(task, 'review')}
+                    onAction={(action) => handleAction(action, task)}
+                  />
+                );
+              }}
             />
           </div>
         </div>
@@ -408,16 +432,23 @@ export const FleetKanban: React.FC = () => {
               items={lanes.done}
               itemHeight={118}
               virtualized={virtualized}
-              renderItem={(task) => (
-                <WorkerCard
-                  key={task.id}
-                  task={task}
-                  agent={getAgentForTask(task.id)}
-                  draggable
-                  onDragStart={() => handleDragStart(task, 'done')}
-                  onAction={(action) => handleAction(action, task)}
-                />
-              )}
+              renderItem={(task) => {
+                const cardAgent = getAgentForTask(task.id);
+                return (
+                  <WorkerCard
+                    key={task.id}
+                    task={task}
+                    agent={cardAgent}
+                    onClick={() => {
+                      if (cardAgent) setSelectedAgentId(cardAgent.id);
+                    }}
+                    isSelected={cardAgent !== undefined && selectedAgentId === cardAgent.id}
+                    draggable
+                    onDragStart={() => handleDragStart(task, 'done')}
+                    onAction={(action) => handleAction(action, task)}
+                  />
+                );
+              }}
             />
           </div>
         </div>
