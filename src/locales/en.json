@@ -1717,7 +1717,13 @@
     "attentionGate": {
       "title": "Attention Required",
       "description": "This agent has paused and requires your review or intervention to proceed.",
-      "actionRequired": "Action Required"
+      "actionRequired": "Action Required",
+      "approve": "Approve",
+      "reject": "Reject",
+      "guidanceInput": "Manual Guidance / Comment",
+      "guidancePlaceholder": "Enter manual guidance or comment...",
+      "interventionDetails": "Intervention Details",
+      "submitting": "Submitting..."
     },
     "composer": {
       "rosterTitle": "Fleet Roster",
