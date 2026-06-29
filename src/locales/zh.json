@@ -1192,7 +1192,13 @@
     "attentionGate": {
       "title": "需要人工介入",
       "description": "该 Agent 已暂停，需要您进行评审或提供输入以继续执行。",
-      "actionRequired": "需采取行动"
+      "actionRequired": "需采取行动",
+      "approve": "批准",
+      "reject": "拒绝",
+      "guidanceInput": "手动输入指导意见/备注",
+      "guidancePlaceholder": "请输入指导意见或备注...",
+      "interventionDetails": "介入决策详情",
+      "submitting": "提交中..."
     },
     "composer": {
       "rosterTitle": "舰队成员",
