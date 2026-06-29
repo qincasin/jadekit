@@ -1,6 +1,8 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useCockpitLayout } from './useCockpitLayout';
 import FleetKanban from './FleetKanban';
+import { JumpPalette } from './JumpPalette';
+import SessionPanel from './SessionPanel';
 
 export default function HelmCockpit() {
   const {
@@ -9,6 +11,8 @@ export default function HelmCockpit() {
     toggleLeft,
     toggleRight,
   } = useCockpitLayout();
+
+  const [isPaletteOpen, setIsPaletteOpen] = useState(false);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -21,6 +25,11 @@ export default function HelmCockpit() {
       if (e.altKey && e.key === ']') {
         e.preventDefault();
         toggleRight();
+      }
+      // Meta+K or Ctrl+K
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setIsPaletteOpen(true);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -89,22 +98,11 @@ export default function HelmCockpit() {
               )}
             </div>
           </div>
-          <div className="p-6 overflow-y-auto flex-1 flex flex-col justify-between">
-            <div>
-              <h2 className="text-lg font-bold mb-2">主工作区会话 (Worker Transcript)</h2>
-              <div className="bg-base-200 border border-base-300 rounded p-4 text-xs font-mono leading-relaxed max-w-2xl text-base-content/70">
-                <div className="text-base-content/40 mb-2">
-                  // 顶部桥接提示小字 (严格同步中英)
-                </div>
-                <div>完整会话由 Phase 3.5 worker-transcript 桥提供；实现阶段桥未接通前显示活动流回退态，不伪造 transcript。</div>
-                <div className="mt-2 text-base-content/40">
-                  Full transcripts are provided by Phase 3.5 worker-transcript bridge. Falling back to simple activity stream during early implementation.
-                </div>
-              </div>
-            </div>
-            <div className="border-t border-base-300 pt-4 bg-base-100">
-              <p className="text-xs text-base-content/50">这里是 Composer / 派发输入框占位区域</p>
-            </div>
+          <div className="flex-1 min-h-0 flex flex-col">
+            <SessionPanel />
+          </div>
+          <div className="p-4 border-t border-base-300 bg-base-100 flex-shrink-0">
+            <p className="text-xs text-base-content/50">这里是 Composer / 派发输入框占位区域</p>
           </div>
         </section>
 
@@ -134,6 +132,7 @@ export default function HelmCockpit() {
           </div>
         </aside>
       </div>
+      <JumpPalette isOpen={isPaletteOpen} onClose={() => setIsPaletteOpen(false)} />
     </div>
   );
 }

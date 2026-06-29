@@ -1679,5 +1679,44 @@
     "resultFile": "{{count}} files",
     "find": "Find",
     "glob": "Glob"
+  },
+  "helm": {
+    "emptyState": "Select an agent from the kanban",
+    "agentId": "Agent ID",
+    "taskId": "Task ID",
+    "actions": {
+      "jumpToWorktree": "Jump to Worktree",
+      "stop": "Stop / Abort",
+      "cancel": "Cancel"
+    },
+    "tooltips": {
+      "jumpToWorktreeDisabled": "No active task or worktree associated with this agent",
+      "stopDisabled": "Requires Phase 3.5 engine updates to stop or abort sessions",
+      "cancelDisabled": "Requires Phase 3.5 engine updates to cancel sessions"
+    },
+    "timeline": {
+      "initialized": "Agent Session Initialized",
+      "initializedDesc": "Agent workspace environment setup complete.",
+      "thinking": "Agent is thinking",
+      "thinkingDesc": "Analyzing instructions, exploring codebase, and planning actions.",
+      "text": "Streaming Text Response",
+      "textDesc": "Formulating explanation and compiling feedback.",
+      "toolUse": "Executing Tools",
+      "toolUseDesc": "Invoking system or workspace tools to complete tasks.",
+      "working": "Running Task",
+      "workingDesc": "Executing automated routine.",
+      "needsAttention": "Attention Required",
+      "needsAttentionDesc": "Agent paused waiting for manual confirmation or user input.",
+      "done": "Task Completed",
+      "doneDesc": "All actions finished successfully.",
+      "interrupted": "Session Interrupted",
+      "interruptedDesc": "Execution stopped before completion."
+    },
+    "placeholderBanner": "Full transcript will be shown after engine bridge is lit.",
+    "attentionGate": {
+      "title": "Attention Required",
+      "description": "This agent has paused and requires your review or intervention to proceed.",
+      "actionRequired": "Action Required"
+    }
   }
 }

@@ -4,6 +4,8 @@ import { TaskDto, DispatchDto, OrchestrationEvent } from '../types/hermes';
 import { reduceHermesEvent, HermesState } from './hermesReducer';
 
 export interface HermesStoreState extends HermesState {
+  selectedAgentId: string | null;
+  setSelectedAgentId: (id: string | null) => void;
   initRun: (runId: string, goal: string) => void;
   setTasks: (tasks: TaskDto[]) => void;
   setAgents: (agents: DispatchDto[]) => void;
@@ -17,6 +19,11 @@ export const useHermesStore = create<HermesStoreState>((set) => ({
   runs: {},
   tasks: {},
   agents: {},
+  selectedAgentId: null,
+
+  setSelectedAgentId: (id: string | null) => {
+    set({ selectedAgentId: id });
+  },
 
   initRun: (runId: string, goal: string) => {
     set((state) => ({
@@ -82,6 +89,7 @@ export const useHermesStore = create<HermesStoreState>((set) => ({
       runs: {},
       tasks: {},
       agents: {},
+      selectedAgentId: null,
     });
   },
 
