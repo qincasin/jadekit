@@ -1,6 +1,7 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useCockpitLayout } from './useCockpitLayout';
 import FleetKanban from './FleetKanban';
+import { JumpPalette } from './JumpPalette';
 
 export default function HelmCockpit() {
   const {
@@ -9,6 +10,8 @@ export default function HelmCockpit() {
     toggleLeft,
     toggleRight,
   } = useCockpitLayout();
+
+  const [isPaletteOpen, setIsPaletteOpen] = useState(false);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -21,6 +24,11 @@ export default function HelmCockpit() {
       if (e.altKey && e.key === ']') {
         e.preventDefault();
         toggleRight();
+      }
+      // Meta+K or Ctrl+K
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setIsPaletteOpen(true);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -134,6 +142,7 @@ export default function HelmCockpit() {
           </div>
         </aside>
       </div>
+      <JumpPalette isOpen={isPaletteOpen} onClose={() => setIsPaletteOpen(false)} />
     </div>
   );
 }
