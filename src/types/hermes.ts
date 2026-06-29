@@ -136,3 +136,14 @@ export function getEventChannel(event: OrchestrationEvent): string {
       return HERMES_EVENT_CHANNELS.AGENT;
   }
 }
+
+export interface JudgeVerdictDto {
+  winnerIndex: number;
+  scores: number[];
+  reason: string;
+  candidates: {
+    index: number;
+    agentId: string;
+  }[];
+}
+
