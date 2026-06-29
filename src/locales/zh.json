@@ -1154,5 +1154,44 @@
     "resultFile": "{{count}} 个文件",
     "find": "查找",
     "glob": "Glob"
+  },
+  "helm": {
+    "emptyState": "请从左侧舰队看板选择一个 Agent",
+    "agentId": "Agent ID",
+    "taskId": "任务 ID",
+    "actions": {
+      "jumpToWorktree": "跳转到工作树",
+      "stop": "停止 / 中断",
+      "cancel": "取消"
+    },
+    "tooltips": {
+      "jumpToWorktreeDisabled": "没有与该 Agent 关联的活动任务或工作树",
+      "stopDisabled": "需要 Phase 3.5 引擎更新以停止或中断会话",
+      "cancelDisabled": "需要 Phase 3.5 引擎更新以取消会话"
+    },
+    "timeline": {
+      "initialized": "代理会话初始化",
+      "initializedDesc": "代理工作区环境搭建完毕。",
+      "thinking": "代理正在思考中",
+      "thinkingDesc": "正在分析指令、探索代码库并规划后续步骤。",
+      "text": "输出文本流",
+      "textDesc": "正在构思说明并整理反馈内容。",
+      "toolUse": "执行工具中",
+      "toolUseDesc": "正在调用系统或工作区工具以完成任务。",
+      "working": "任务执行中",
+      "workingDesc": "正在执行自动化处理程序。",
+      "needsAttention": "需要人工介入",
+      "needsAttentionDesc": "代理已暂停，等待手动确认或用户输入。",
+      "done": "任务已完成",
+      "doneDesc": "所有操作已成功结束。",
+      "interrupted": "会话已被中断",
+      "interruptedDesc": "在执行完成前被强行终止。"
+    },
+    "placeholderBanner": "完整执行记录将在引擎接通后显示",
+    "attentionGate": {
+      "title": "需要人工介入",
+      "description": "该 Agent 已暂停，需要您进行评审或提供输入以继续执行。",
+      "actionRequired": "需采取行动"
+    }
   }
 }
