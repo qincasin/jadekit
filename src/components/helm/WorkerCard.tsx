@@ -12,6 +12,7 @@ export interface WorkerCardProps {
   draggable?: boolean;
   onDragStart?: (e: React.DragEvent) => void;
   onAction?: (action: 'cancel' | 'confirm-discard' | 'confirm-merge') => void;
+  isSelected?: boolean;
 }
 
 export const WorkerCard: React.FC<WorkerCardProps> = ({
@@ -21,6 +22,7 @@ export const WorkerCard: React.FC<WorkerCardProps> = ({
   draggable,
   onDragStart,
   onAction,
+  isSelected,
 }) => {
   const isFailed = task.status === 'failed';
   const assignee = agent?.assignee || 'Planner';
@@ -45,9 +47,11 @@ export const WorkerCard: React.FC<WorkerCardProps> = ({
       onDragStart={onDragStart}
       className={cn(
         "group relative flex flex-col p-4 rounded-xl border bg-base-100 transition-all duration-200 select-none cursor-pointer text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2",
-        isFailed
-          ? "border-red-300 dark:border-red-900 bg-red-50/30 dark:bg-red-950/10 shadow-[0_0_8px_rgba(239,68,68,0.1)]"
-          : "border-base-300 hover:border-base-400 hover:shadow-md dark:hover:border-base-content/20"
+        isSelected
+          ? "border-primary ring-2 ring-primary/20 bg-primary/5 shadow-md"
+          : isFailed
+            ? "border-red-300 dark:border-red-900 bg-red-50/30 dark:bg-red-950/10 shadow-[0_0_8px_rgba(239,68,68,0.1)]"
+            : "border-base-300 hover:border-base-400 hover:shadow-md dark:hover:border-base-content/20"
       )}
       aria-label={`Task ${task.id}: ${task.spec}`}
     >
