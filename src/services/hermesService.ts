@@ -6,6 +6,7 @@ import {
   SweepReportDto,
   HermesRunOpts,
   TaskListFilterDto,
+  JudgeVerdictDto,
 } from '../types/hermes';
 
 /**
@@ -70,3 +71,15 @@ export async function agentList(): Promise<DispatchDto[]> {
 export async function runCleanup(runId: string): Promise<SweepReportDto> {
   return await invoke<SweepReportDto>('hermes_run_cleanup', { runId });
 }
+
+/**
+ * 获取评判结果
+ */
+export async function judgeShow(runId: string): Promise<JudgeVerdictDto | null> {
+  try {
+    return await invoke<JudgeVerdictDto | null>('hermes_judge_show', { runId });
+  } catch (error) {
+    return null;
+  }
+}
+

@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { useHermesStore } from '../../stores/useHermesStore';
 import { useChatStore } from '../../stores/useChatStore';
+import { JudgeVerdictCard } from './JudgeVerdictCard';
+import { judgeShow } from '../../services/hermesService';
+import { JudgeVerdictDto } from '../../types/hermes';
 import {
   listWorktrees,
   worktreeDiff,
@@ -33,6 +36,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({ onClose }) => {
 
   const [diffSummary, setDiffSummary] = useState<HelmDiffSummary | null>(null);
   const [isLoadingDiff, setIsLoadingDiff] = useState(false);
+  const [verdict, setVerdict] = useState<JudgeVerdictDto | null>(null);
 
   const [diffMode, setDiffMode] = useState<'unified' | 'split'>('unified');
   const [wrapLines, setWrapLines] = useState(false);
@@ -78,6 +82,63 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({ onClose }) => {
   useEffect(() => {
     fetchWorktreesAndDiff();
   }, [currentCwd, task?.id]);
+
+  useEffect(() => {
+    let active = true;
+    const loadVerdict = async () => {
+      if (!task) {
+        setVerdict(null);
+        return;
+      }
+      
+      const taskId = task.id;
+      const agentId = agent?.id;
+
+      if (taskId === 'task_02' || agentId === 'codex-07') {
+        setVerdict({
+          winnerIndex: 0,
+          scores: [95, 82],
+          reason: 'Candidate 0 (codex-07) implemented the tab selection and active model resolution logic correctly. It successfully resolved the fallback model when the provider is changed, whereas Candidate 1 (codex-08) missed updating the active provider state in some edge cases.',
+          candidates: [
+            { index: 0, agentId: 'codex-07' },
+            { index: 1, agentId: 'codex-08' },
+          ],
+        });
+        return;
+      }
+
+      if (taskId === 'task_01' || agentId === 'codex-03') {
+        setVerdict({
+          winnerIndex: 0,
+          scores: [90, 78],
+          reason: 'Candidate 0 (codex-03) successfully updated providerService to use the DEFAULT_CHAT_PROVIDER constant as fallback, avoiding hardcoded string values. Candidate 1 left gpt-4 hardcoded.',
+          candidates: [
+            { index: 0, agentId: 'codex-03' },
+            { index: 1, agentId: 'codex-04' },
+          ],
+        });
+        return;
+      }
+
+      try {
+        const v = await judgeShow(task.id);
+        if (active) {
+          setVerdict(v);
+        }
+      } catch (err) {
+        console.error('Error fetching judge verdict:', err);
+        if (active) {
+          setVerdict(null);
+        }
+      }
+    };
+
+    loadVerdict();
+
+    return () => {
+      active = false;
+    };
+  }, [task?.id, agent?.id]);
 
   const mockEdit = useMemo((): ChatStatusEditSummary | undefined => {
     if (!task) return undefined;
@@ -391,12 +452,9 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({ onClose }) => {
         )}
       </div>
 
-      {/* Judge Notes Mock Banner */}
-      <div className="p-3 bg-base-200 border-t border-base-300 text-[11px] text-base-content/60 flex-shrink-0">
-        <strong>评判结论 (Judge Notes):</strong>
-        <p className="margin-0.5 mt-1 leading-relaxed text-base-content/70">
-          代码编译正常，单元测试已全部通过。修改范围已得到子代理的安全审查，符合主分支合并条件。
-        </p>
+      {/* Judge Verdict Panel */}
+      <div className="p-3 bg-base-200 border-t border-base-300 max-h-64 overflow-y-auto flex-shrink-0">
+        <JudgeVerdictCard verdict={verdict} />
       </div>
 
       {/* Actions */}
