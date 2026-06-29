@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { useCockpitLayout } from './useCockpitLayout';
+import FleetKanban from './FleetKanban';
 
 export default function HelmCockpit() {
   const {
@@ -42,8 +43,8 @@ export default function HelmCockpit() {
           }`}
           aria-label="舰队看板 (Left Panel)"
         >
-          <div className="p-4 border-b border-base-300 flex justify-between items-center bg-base-200">
-            <span className="font-bold text-sm tracking-wider uppercase text-base-content/80">Left Panel</span>
+          <div className="p-4 border-b border-base-300 flex justify-between items-center bg-base-200 flex-shrink-0">
+            <span className="font-bold text-sm tracking-wider uppercase text-base-content/80">舰队看板 / Fleet Kanban</span>
             <button
               onClick={toggleLeft}
               className="btn btn-ghost btn-xs h-6 min-h-0 focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none"
@@ -52,30 +53,8 @@ export default function HelmCockpit() {
               ◀
             </button>
           </div>
-          <div className="p-4 overflow-y-auto flex-1">
-            <p className="text-xs text-base-content/60 mb-4">舰队看板 / Fleet Kanban</p>
-            {/* Displaying state token indicators to conform to Task 1 token designs */}
-            <div className="space-y-4">
-              <div className="flex items-center gap-2">
-                <span className="relative flex h-3 w-3">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-500 opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-3 w-3 bg-amber-500 border border-amber-700"></span>
-                </span>
-                <span className="text-xs font-mono">working (黄/转圈)</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="inline-flex items-center justify-center h-4 w-4 rounded-full bg-amber-600 border border-amber-800 text-[10px] text-white font-bold font-mono">!</span>
-                <span className="text-xs font-mono">needs-attention (琥珀色 solid)</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="inline-flex items-center justify-center h-4 w-4 rounded-full bg-emerald-500 border border-emerald-700 text-[10px] text-white font-bold font-mono">✓</span>
-                <span className="text-xs font-mono">done (翠绿勾)</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="inline-flex items-center justify-center h-4 w-4 rounded-sm bg-red-500 border border-red-700 text-[8px] text-white font-bold font-mono">▢</span>
-                <span className="text-xs font-mono">interrupted (红方框)</span>
-              </div>
-            </div>
+          <div className="flex-1 overflow-hidden flex flex-col min-h-0">
+            <FleetKanban />
           </div>
         </aside>
 
