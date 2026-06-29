@@ -1,4 +1,5 @@
 import {type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {useTranslation} from 'react-i18next';
 import {invoke} from '@tauri-apps/api/core';
 import {Package, PanelLeftOpen, PanelRightOpen, RefreshCw, Trash2} from 'lucide-react';
@@ -122,6 +123,8 @@ interface FullHistorySearchState {
  */
 export default function ChatPage() {
     const {t} = useTranslation();
+    const [searchParams] = useSearchParams();
+    const helmQuery = searchParams.get('helm') === 'true';
     const sdkDependencyLabels = useMemo(() => getSdkDependencyPanelLabels(t), [t]);
     const {
         messages,
@@ -161,6 +164,11 @@ export default function ChatPage() {
 
     const [sdkModalOpen, setSdkModalOpen] = useState(false);
     const [showCockpit, setShowCockpit] = useState(false);
+
+    useEffect(() => {
+        setShowCockpit(helmQuery);
+    }, [helmQuery]);
+
     const [isNearBottom, setIsNearBottom] = useState(true);
     const [searchQuery, setSearchQuery] = useState('');
     const [collapsedAnchorCount, setCollapsedAnchorCount] = useState<number | null>(null);

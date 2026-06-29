@@ -40,7 +40,8 @@
     "workspaces": "Workspaces",
     "settings": "Settings",
     "token_usage": "Token Usage",
-    "chat": "Chat"
+    "chat": "Chat",
+    "helm": "Helm Cockpit"
   },
   "mcp": {
     "title": "MCP Server Management",

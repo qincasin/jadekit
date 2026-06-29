@@ -29,7 +29,8 @@
     "workspaces": "工作区",
     "settings": "设置",
     "token_usage": "Token 用量",
-    "chat": "对话"
+    "chat": "对话",
+    "helm": "Helm 驾驶舱"
   },
   "mcp": {
     "title": "MCP 服务器管理",

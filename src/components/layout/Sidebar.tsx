@@ -5,7 +5,7 @@ import { useConfigStore } from '../../stores/useConfigStore';
 import Logo from './Logo';
 import {
     LayoutDashboard, Key, Globe, FileText, Zap,
-    Bot, FolderOpen, Settings, Server, Rocket, MessageSquare
+    Bot, FolderOpen, Settings, Server, Rocket, MessageSquare, Compass
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -15,6 +15,7 @@ interface SidebarProps {
 const mainNavItems = [
     { path: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard' },
     { path: '/chat', icon: MessageSquare, labelKey: 'nav.chat' },
+    { path: '/chat?helm=true', icon: Compass, labelKey: 'nav.helm' },
     { path: '/providers', icon: Key, labelKey: 'nav.providers' },
     { path: '/antigravity', icon: Rocket, labelKey: 'nav.antigravity' },
     { path: '/proxy', icon: Server, labelKey: 'nav.proxy' },
@@ -58,6 +59,12 @@ export default function Sidebar({ position }: SidebarProps) {
 
     const isActive = (path: string) => {
         if (path === '/') return location.pathname === '/';
+        if (path.includes('?helm=true')) {
+            return location.pathname.startsWith('/chat') && location.search.includes('helm=true');
+        }
+        if (path === '/chat') {
+            return location.pathname.startsWith('/chat') && !location.search.includes('helm=true');
+        }
         return location.pathname.startsWith(path);
     };
 
