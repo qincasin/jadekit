@@ -83,3 +83,10 @@ export async function judgeShow(runId: string): Promise<JudgeVerdictDto | null> 
   }
 }
 
+/**
+ * 演示运行 (mock run)
+ */
+export async function runMock(goal: string, opts?: HermesRunOpts): Promise<string> {
+  return await invoke<string>('hermes_run_mock', { goal, opts });
+}
+
