@@ -1692,7 +1692,8 @@
     "tooltips": {
       "jumpToWorktreeDisabled": "No active task or worktree associated with this agent",
       "stopDisabled": "Requires Phase 3.5 engine updates to stop or abort sessions",
-      "cancelDisabled": "Requires Phase 3.5 engine updates to cancel sessions"
+      "cancelDisabled": "Requires Phase 3.5 engine updates to cancel sessions",
+      "requiresPhase35": "Requires Phase 3.5 Engine"
     },
     "timeline": {
       "initialized": "Agent Session Initialized",
@@ -1717,6 +1718,20 @@
       "title": "Attention Required",
       "description": "This agent has paused and requires your review or intervention to proceed.",
       "actionRequired": "Action Required"
+    },
+    "composer": {
+      "rosterTitle": "Fleet Roster",
+      "deselectAll": "Deselect All",
+      "selectAll": "Select All",
+      "noProviders": "No available chat providers configured",
+      "goalPlaceholder": "Enter goal for Hermes...",
+      "metadataHelper": "Press Ctrl+Enter to submit",
+      "maxConcurrent": "Max Concurrent Tasks",
+      "walkthrough": "Start Walkthrough Demo",
+      "walkthroughStop": "Stop Walkthrough",
+      "runMock": "Run Mock",
+      "dispatch": "Dispatch to Hermes",
+      "launching": "Launching..."
     }
   }
 }

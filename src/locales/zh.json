@@ -1167,7 +1167,8 @@
     "tooltips": {
       "jumpToWorktreeDisabled": "没有与该 Agent 关联的活动任务或工作树",
       "stopDisabled": "需要 Phase 3.5 引擎更新以停止或中断会话",
-      "cancelDisabled": "需要 Phase 3.5 引擎更新以取消会话"
+      "cancelDisabled": "需要 Phase 3.5 引擎更新以取消会话",
+      "requiresPhase35": "需引擎 Phase 3.5"
     },
     "timeline": {
       "initialized": "代理会话初始化",
@@ -1192,6 +1193,20 @@
       "title": "需要人工介入",
       "description": "该 Agent 已暂停，需要您进行评审或提供输入以继续执行。",
       "actionRequired": "需采取行动"
+    },
+    "composer": {
+      "rosterTitle": "舰队成员",
+      "deselectAll": "全不选",
+      "selectAll": "全选",
+      "noProviders": "无可用大模型提供商",
+      "goalPlaceholder": "输入 Hermes 运行目标...",
+      "metadataHelper": "按 Ctrl+Enter 快速提交",
+      "maxConcurrent": "最大并发任务数",
+      "walkthrough": "启动 Walkthrough 演示",
+      "walkthroughStop": "停止 Walkthrough",
+      "runMock": "演示运行",
+      "dispatch": "派发给 Hermes",
+      "launching": "启动中..."
     }
   }
 }

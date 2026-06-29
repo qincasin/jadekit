@@ -3,6 +3,7 @@ import { useCockpitLayout } from './useCockpitLayout';
 import FleetKanban from './FleetKanban';
 import { JumpPalette } from './JumpPalette';
 import SessionPanel from './SessionPanel';
+import HelmComposer from './HelmComposer';
 import { InspectorPanel } from './InspectorPanel';
 
 export default function HelmCockpit() {
@@ -103,7 +104,7 @@ export default function HelmCockpit() {
             <SessionPanel />
           </div>
           <div className="p-4 border-t border-base-300 bg-base-100 flex-shrink-0">
-            <p className="text-xs text-base-content/50">这里是 Composer / 派发输入框占位区域</p>
+            <HelmComposer />
           </div>
         </section>
 
