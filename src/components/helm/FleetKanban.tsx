@@ -1,10 +1,18 @@
 import React, { useState, useMemo } from 'react';
 import { useHermesStore } from '../../stores/useHermesStore';
+import { useChatStore } from '../../stores/useChatStore';
 import { laneFor } from './kanbanLanes';
 import { WorkerCard } from './WorkerCard';
 import { TaskState, AgentState } from '../../stores/hermesReducer';
 import { Terminal, Cpu } from 'lucide-react';
 import { cn } from '../../utils/cn';
+import { dropActionFor, Lane } from './kanbanDrag';
+import {
+  closeAgent,
+  removeWorktree,
+  listWorktrees,
+  mergeWorktree,
+} from '../../services/worktreeService';
 
 // Custom lightweight VirtualList implementation
 interface VirtualListProps<T> {
@@ -98,6 +106,22 @@ export const FleetKanban: React.FC = () => {
   const agents = useHermesStore((state) => state.agents);
   const [virtualized, setVirtualized] = useState(false);
 
+  const currentCwd = useChatStore((state) => state.currentCwd);
+  const [draggedTask, setDraggedTask] = useState<TaskState | null>(null);
+  const [draggedFromLane, setDraggedFromLane] = useState<Lane | null>(null);
+
+  const [modalConfig, setModalConfig] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    onConfirm: () => Promise<void> | void;
+  }>({
+    isOpen: false,
+    title: '',
+    message: '',
+    onConfirm: () => {},
+  });
+
   const taskList = useMemo(() => Object.values(tasks), [tasks]);
   const agentList = useMemo(() => Object.values(agents), [agents]);
 
@@ -141,6 +165,110 @@ export const FleetKanban: React.FC = () => {
     return agentList.find((a) => a.taskId === taskId);
   };
 
+  const handleDragStart = (task: TaskState, fromLane: Lane) => {
+    setDraggedTask(task);
+    setDraggedFromLane(fromLane);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+  };
+
+  const handleDrop = (e: React.DragEvent, toLane: Lane) => {
+    e.preventDefault();
+    if (!draggedTask || !draggedFromLane) return;
+    const task = draggedTask;
+    const fromLane = draggedFromLane;
+
+    setDraggedTask(null);
+    setDraggedFromLane(null);
+
+    const action = dropActionFor(fromLane, toLane, task);
+    if (action === 'none') return;
+
+    handleAction(action, task);
+  };
+
+  const handleAction = (
+    action: 'cancel' | 'confirm-discard' | 'confirm-merge',
+    task: TaskState
+  ) => {
+    const agent = getAgentForTask(task.id);
+
+    if (action === 'cancel') {
+      if (!agent) return;
+      setModalConfig({
+        isOpen: true,
+        title: '取消任务 / Cancel Task',
+        message: `确定要取消正在执行的任务吗？(ID: ${task.id})\nAre you sure you want to cancel the running task?`,
+        onConfirm: async () => {
+          try {
+            await closeAgent({ agentId: agent.id, removeWorktree: false });
+          } catch (err) {
+            console.error('Failed to cancel agent:', err);
+          }
+        },
+      });
+    } else if (action === 'confirm-discard') {
+      setModalConfig({
+        isOpen: true,
+        title: '丢弃任务 / Discard Task',
+        message: `确定要丢弃此任务并删除其工作树吗？此操作无法撤销。(ID: ${task.id})\nAre you sure you want to discard this task and delete its worktree? This action cannot be undone.`,
+        onConfirm: async () => {
+          try {
+            if (!currentCwd) return;
+            const worktrees = await listWorktrees(currentCwd).catch(() => []);
+            const targetwt = worktrees.find(
+              (wt) => wt.branch === `helm/${task.id}` || wt.branch.endsWith(`helm/${task.id}`)
+            );
+            const worktreePath = targetwt?.path || null;
+
+            if (agent) {
+              await closeAgent({
+                agentId: agent.id,
+                removeWorktree: true,
+                repoRoot: currentCwd,
+                worktreePath,
+                force: true,
+              });
+            } else if (worktreePath) {
+              await removeWorktree(currentCwd, worktreePath, true);
+            }
+          } catch (err) {
+            console.error('Failed to discard worktree:', err);
+          }
+        },
+      });
+    } else if (action === 'confirm-merge') {
+      setModalConfig({
+        isOpen: true,
+        title: '合并任务 / Merge Task',
+        message: `确定要合并分支 helm/${task.id} 的修改到主分支吗？(ID: ${task.id})\nAre you sure you want to merge modifications from branch helm/${task.id}?`,
+        onConfirm: async () => {
+          try {
+            if (!currentCwd) return;
+            const outcomeDto = await mergeWorktree(currentCwd, `helm/${task.id}`);
+            if (outcomeDto.outcome === 'conflict') {
+              window.alert(
+                '合并冲突，已自动回滚，请手动查看差异\nMerge conflict detected. The merge was aborted.'
+              );
+            } else {
+              const worktrees = await listWorktrees(currentCwd).catch(() => []);
+              const targetwt = worktrees.find(
+                (wt) => wt.branch === `helm/${task.id}` || wt.branch.endsWith(`helm/${task.id}`)
+              );
+              if (targetwt?.path) {
+                await removeWorktree(currentCwd, targetwt.path, true);
+              }
+            }
+          } catch (err) {
+            console.error('Failed to merge worktree:', err);
+          }
+        },
+      });
+    }
+  };
+
   return (
     <div className="flex flex-col h-full overflow-hidden">
       {/* Kanban Header with Virtualization Toggle */}
@@ -163,7 +291,11 @@ export const FleetKanban: React.FC = () => {
       {/* Columns Container */}
       <div className="flex flex-row gap-3.5 overflow-x-auto p-4 flex-1 select-none snap-x scrollbar-thin">
         {/* Pending Lane */}
-        <div className="w-[280px] flex-shrink-0 flex flex-col bg-base-200/35 rounded-xl p-3 border border-base-300/40 snap-align-start h-full overflow-hidden">
+        <div
+          onDragOver={handleDragOver}
+          onDrop={(e) => handleDrop(e, 'pending')}
+          className="w-[280px] flex-shrink-0 flex flex-col bg-base-200/35 rounded-xl p-3 border border-base-300/40 snap-align-start h-full overflow-hidden"
+        >
           <div className="flex items-center justify-between mb-3 px-1">
             <span className="text-xs font-bold tracking-wide text-base-content/75">
               待派 / Pending
@@ -182,6 +314,9 @@ export const FleetKanban: React.FC = () => {
                   key={task.id}
                   task={task}
                   agent={getAgentForTask(task.id)}
+                  draggable
+                  onDragStart={() => handleDragStart(task, 'pending')}
+                  onAction={(action) => handleAction(action, task)}
                 />
               )}
             />
@@ -189,7 +324,11 @@ export const FleetKanban: React.FC = () => {
         </div>
 
         {/* Running Lane */}
-        <div className="w-[280px] flex-shrink-0 flex flex-col bg-base-200/35 rounded-xl p-3 border border-base-300/40 snap-align-start h-full overflow-hidden">
+        <div
+          onDragOver={handleDragOver}
+          onDrop={(e) => handleDrop(e, 'running')}
+          className="w-[280px] flex-shrink-0 flex flex-col bg-base-200/35 rounded-xl p-3 border border-base-300/40 snap-align-start h-full overflow-hidden"
+        >
           <div className="flex items-center justify-between mb-3 px-1">
             <span className="text-xs font-bold tracking-wide text-base-content/75">
               执行中 / Running
@@ -208,6 +347,9 @@ export const FleetKanban: React.FC = () => {
                   key={task.id}
                   task={task}
                   agent={getAgentForTask(task.id)}
+                  draggable
+                  onDragStart={() => handleDragStart(task, 'running')}
+                  onAction={(action) => handleAction(action, task)}
                 />
               )}
             />
@@ -215,7 +357,11 @@ export const FleetKanban: React.FC = () => {
         </div>
 
         {/* Review Lane */}
-        <div className="w-[280px] flex-shrink-0 flex flex-col bg-base-200/35 rounded-xl p-3 border border-base-300/40 snap-align-start h-full overflow-hidden">
+        <div
+          onDragOver={handleDragOver}
+          onDrop={(e) => handleDrop(e, 'review')}
+          className="w-[280px] flex-shrink-0 flex flex-col bg-base-200/35 rounded-xl p-3 border border-base-300/40 snap-align-start h-full overflow-hidden"
+        >
           <div className="flex items-center justify-between mb-3 px-1">
             <span className="text-xs font-bold tracking-wide text-base-content/75">
               待评审 / Review
@@ -234,6 +380,9 @@ export const FleetKanban: React.FC = () => {
                   key={task.id}
                   task={task}
                   agent={getAgentForTask(task.id)}
+                  draggable
+                  onDragStart={() => handleDragStart(task, 'review')}
+                  onAction={(action) => handleAction(action, task)}
                 />
               )}
             />
@@ -241,7 +390,11 @@ export const FleetKanban: React.FC = () => {
         </div>
 
         {/* Completed Lane */}
-        <div className="w-[280px] flex-shrink-0 flex flex-col bg-base-200/35 rounded-xl p-3 border border-base-300/40 snap-align-start h-full overflow-hidden">
+        <div
+          onDragOver={handleDragOver}
+          onDrop={(e) => handleDrop(e, 'done')}
+          className="w-[280px] flex-shrink-0 flex flex-col bg-base-200/35 rounded-xl p-3 border border-base-300/40 snap-align-start h-full overflow-hidden"
+        >
           <div className="flex items-center justify-between mb-3 px-1">
             <span className="text-xs font-bold tracking-wide text-base-content/75">
               已完成 / Completed
@@ -260,14 +413,51 @@ export const FleetKanban: React.FC = () => {
                   key={task.id}
                   task={task}
                   agent={getAgentForTask(task.id)}
+                  draggable
+                  onDragStart={() => handleDragStart(task, 'done')}
+                  onAction={(action) => handleAction(action, task)}
                 />
               )}
             />
           </div>
         </div>
       </div>
+
+      {/* Confirmation Modal */}
+      {modalConfig.isOpen && (
+        <div className="modal modal-open z-50">
+          <div className="modal-box bg-base-100 border border-base-300 shadow-xl max-w-sm rounded-xl">
+            <h3 className="font-bold text-sm text-base-content/90 tracking-wide uppercase mb-2">
+              {modalConfig.title}
+            </h3>
+            <p className="text-xs text-base-content/70 whitespace-pre-line leading-relaxed mb-6">
+              {modalConfig.message}
+            </p>
+            <div className="modal-action gap-2 animate-none">
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm text-xs font-semibold focus:outline-none rounded-lg"
+                onClick={() => setModalConfig((prev) => ({ ...prev, isOpen: false }))}
+              >
+                取消 / Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary btn-sm text-xs font-semibold focus:outline-none rounded-lg"
+                onClick={async () => {
+                  setModalConfig((prev) => ({ ...prev, isOpen: false }));
+                  await modalConfig.onConfirm();
+                }}
+              >
+                确认 / Confirm
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
 
 export default FleetKanban;
+
