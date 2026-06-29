@@ -7,6 +7,7 @@ import {
   HermesRunOpts,
   TaskListFilterDto,
   JudgeVerdictDto,
+  InterventionGateDto,
 } from '../types/hermes';
 
 /**
@@ -33,9 +34,44 @@ export async function dispatchShow(dispatchId: string): Promise<DispatchDto> {
 /**
  * 解决一个决策门（resolution 写入 Store，status → Resolved）
  */
-export async function gateResolve(gateId: string, resolution: string): Promise<void> {
-  await invoke<void>('hermes_gate_resolve', { gateId, resolution });
+export async function gateResolve(gateId: string, resolution: string, comment?: string): Promise<void> {
+  try {
+    await invoke<void>('hermes_gate_resolve', { gateId, resolution, comment });
+  } catch (error) {
+    console.error('gateResolve failed:', error);
+  }
 }
+
+/**
+ * 列出决策门
+ */
+export async function gateList(filter?: { taskId?: string; status?: string }): Promise<InterventionGateDto[]> {
+  try {
+    return await invoke<InterventionGateDto[]>('hermes_gate_list', { filter });
+  } catch (error) {
+    console.error('gateList failed:', error);
+    return [];
+  }
+}
+
+/**
+ * 获取决策门详情
+ */
+export async function gateShow(gateId: string): Promise<InterventionGateDto> {
+  try {
+    return await invoke<InterventionGateDto>('hermes_gate_show', { gateId });
+  } catch (error) {
+    console.error('gateShow failed:', error);
+    return {
+      id: gateId,
+      taskId: 'task-fallback',
+      question: 'Fallback Gate',
+      options: ['approve', 'reject'],
+      status: 'pending',
+    };
+  }
+}
+
 
 /**
  * 取消指定 run（置 cancel 标志）。run() 启动前置位 → pre-loop 命中标 Failed；循环中置位 → tick-top 命中标 Cancelled。

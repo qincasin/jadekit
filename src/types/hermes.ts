@@ -147,3 +147,15 @@ export interface JudgeVerdictDto {
   }[];
 }
 
+export interface InterventionGateDto {
+  id: string;
+  taskId: string;
+  question: string;
+  options: string[];
+  status: 'pending' | 'resolved' | 'timeout';
+  resolution?: string | null;
+  createdAt?: string;
+  resolvedAt?: string | null;
+}
+
+
