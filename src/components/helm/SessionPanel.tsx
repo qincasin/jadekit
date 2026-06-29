@@ -8,6 +8,11 @@ import { showToast } from '../common/ToastContainer';
 import { selectActiveAgent } from './sessionSelect';
 import { sessionHeaderActions } from './sessionHeaderActions';
 import { cn } from '../../utils/cn';
+import { InterventionGateCard } from './InterventionGateCard';
+import { InterventionGateDto } from '../../types/hermes';
+import { reduceHermesEvent } from '../../stores/hermesReducer';
+import * as hermesService from '../../services/hermesService';
+
 import {
   Activity,
   Play,
@@ -55,6 +60,77 @@ export const SessionPanel: React.FC = () => {
       setTranscript(null);
     }
   }, [selectedAgentId]);
+
+  const [gate, setGate] = useState<InterventionGateDto | null>(null);
+
+  useEffect(() => {
+    if (agent && agent.status === 'needs-attention') {
+      if (agent.id === 'codex-07') {
+        setGate({
+          id: 'gate-task-02',
+          taskId: 'task-02',
+          question: 'Review implementation of router wildcard matching and resolve conflict.',
+          options: ['approve', 'reject'],
+          status: 'pending',
+        });
+      } else {
+        const fetchGate = async () => {
+          try {
+            const list = await hermesService.gateList({ taskId: agent.taskId || undefined });
+            if (list && list.length > 0) {
+              setGate(list[0]);
+            } else {
+              setGate({
+                id: `gate-${agent.taskId || 'unknown'}`,
+                taskId: agent.taskId || 'unknown',
+                question: 'Requires manual review of the generated files and logic.',
+                options: ['approve', 'reject'],
+                status: 'pending',
+              });
+            }
+          } catch (e) {
+            setGate({
+              id: `gate-${agent.taskId || 'unknown'}`,
+              taskId: agent.taskId || 'unknown',
+              question: 'Requires manual review of the generated files and logic.',
+              options: ['approve', 'reject'],
+              status: 'pending',
+            });
+          }
+        };
+        void fetchGate();
+      }
+    } else {
+      setGate(null);
+    }
+  }, [agent?.id, agent?.status, agent?.taskId]);
+
+  const handleResolveGate = (resolution: 'approve' | 'reject', _comment: string) => {
+    if (agent?.id === 'codex-07') {
+      // Transition codex-07 back to working/tool_use and task-02 back to dispatched
+      useHermesStore.setState((state) => {
+        const s1 = reduceHermesEvent(state, {
+          kind: 'task',
+          runId: 'walkthrough-run',
+          taskId: 'task-02',
+          status: 'dispatched',
+          dispatchId: 'codex-07',
+        });
+        return reduceHermesEvent(s1, {
+          kind: 'agent',
+          runId: 'walkthrough-run',
+          agentId: 'codex-07',
+          taskId: 'task-02',
+          status: 'working',
+          activity: 'tool_use',
+        });
+      });
+      showToast(t('common.success', 'Success') + `: Walkthrough simulation gate resolved (${resolution})`, 'success');
+    } else {
+      showToast(t('common.success', 'Success') + `: Gate resolved successfully with ${resolution}`, 'success');
+    }
+  };
+
 
   const handleJumpToWorktree = async () => {
     if (!agent || !agent.taskId) return;
@@ -339,36 +415,9 @@ export const SessionPanel: React.FC = () => {
         </div>
 
         {/* Needs-Attention Gate Card */}
-        {agent.status === 'needs-attention' && (
-          <div className="mt-8 border border-amber-300 dark:border-amber-900 bg-amber-50/50 dark:bg-amber-950/15 rounded-xl p-5 shadow-sm flex flex-col gap-4 max-w-2xl mx-auto w-full transition-all duration-300">
-            <div className="flex items-start gap-3">
-              <AlertTriangle className="h-5 w-5 text-amber-500 flex-shrink-0 mt-0.5" />
-              <div>
-                <h4 className="text-sm font-semibold text-amber-800 dark:text-amber-300">
-                  {t('helm.attentionGate.title', '需要人工介入 / Attention Required')}
-                </h4>
-                <p className="text-xs text-amber-700 dark:text-amber-400/90 mt-1 leading-relaxed">
-                  {t(
-                    'helm.attentionGate.description',
-                    '该 Agent 已暂停，需要您进行评审或提供输入以继续执行。 / This agent has paused and requires your review or intervention to proceed.'
-                  )}
-                </p>
-              </div>
-            </div>
-            
-            <div className="flex items-center justify-between border-t border-amber-200 dark:border-amber-900/40 pt-4 mt-2">
-              <span className="text-[10px] font-semibold text-amber-800/60 dark:text-amber-400/60 uppercase tracking-wider">
-                {t('helm.attentionGate.actionRequired', '需采取行动 / Action Required')}
-              </span>
-              <div className="flex gap-2">
-                <button 
-                  className="btn btn-warning btn-xs rounded-lg font-semibold"
-                  disabled
-                >
-                  Resume Agent (Phase 4.5)
-                </button>
-              </div>
-            </div>
+        {agent.status === 'needs-attention' && gate && (
+          <div className="mt-8">
+            <InterventionGateCard gate={gate} onResolve={handleResolveGate} />
           </div>
         )}
       </div>
