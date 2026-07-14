@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.2.0] - 2026-07-14
+
+### Added
+- Release 1.2.0 - Helm Cockpit Phase 4 Complete
+
 ## [1.1.0] - 2026-06-27
 
 ### Added
