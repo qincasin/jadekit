@@ -5,7 +5,7 @@ import { useConfigStore } from '../../stores/useConfigStore';
 import Logo from './Logo';
 import {
     LayoutDashboard, Key, Globe, FileText, Zap,
-    Bot, FolderOpen, Settings, Server, Rocket, MessageSquare, Compass
+    Bot, FolderOpen, Settings, Server, Rocket, MessageSquare, // Compass - Helm 图标暂时不使用
 } from 'lucide-react';
 
 interface SidebarProps {
