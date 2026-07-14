@@ -2,14 +2,28 @@
 use crate::database::Database;
 use crate::models::app_type::AppType;
 use crate::models::provider::Provider;
+use crate::proxy::takeover;
 use crate::services::app_paths;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// 1M 上下文模型后缀（Claude Code 官方机制，匹配前会被剥离）。
 pub const ONE_M_CONTEXT_SUFFIX: &str = "[1M]";
+
+static GLOBAL_DB: OnceLock<Arc<Database>> = OnceLock::new();
+
+/// 注册生产数据库句柄，供没有 Tauri `State` 的代理请求链读取 Provider。
+pub fn set_global_db(db: Arc<Database>) {
+    let _ = GLOBAL_DB.set(db);
+}
+
+fn global_db() -> Result<&'static Arc<Database>, String> {
+    GLOBAL_DB
+        .get()
+        .ok_or_else(|| "Database is not initialized".to_string())
+}
 
 // ── 官方订阅特殊 Provider ────────────────────────────────────
 //
@@ -101,7 +115,7 @@ fn get_data_dir() -> Result<PathBuf, io::Error> {
     app_paths::data_dir()
 }
 
-fn get_claude_settings_path() -> Result<PathBuf, io::Error> {
+pub(crate) fn get_claude_settings_path() -> Result<PathBuf, io::Error> {
     let home = dirs::home_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Home directory not found"))?;
     Ok(home.join(".claude").join("settings.json"))
@@ -139,7 +153,29 @@ pub fn get_provider_config_files(app: AppType) -> Result<Vec<(String, String)>, 
 /// 列出指定应用的 providers（从数据库读取）
 pub fn list_providers_from_db(db: &Arc<Database>, app: AppType) -> Result<Vec<Provider>, String> {
     let all = db.list_providers()?;
-    Ok(all.into_iter().filter(|p| p.app_type == app).collect())
+    let providers: Vec<Provider> = all.into_iter().filter(|p| p.app_type == app).collect();
+    Ok(providers)
+}
+
+fn add_official_fallback_if_needed(providers: &mut Vec<Provider>, app: AppType) {
+    if matches!(app, AppType::Claude | AppType::Codex) && !providers.iter().any(|p| p.is_active) {
+        let official_id = match app {
+            AppType::Claude => CLAUDE_OFFICIAL_PROVIDER_ID,
+            AppType::Codex => CODEX_OFFICIAL_PROVIDER_ID,
+            _ => unreachable!(),
+        };
+        // 官方订阅不入库；DB 中没有活跃自定义 Provider 时，合成 active 官方项供代理路由识别。
+        providers.push(build_official_provider(official_id, app));
+    }
+}
+
+fn list_providers_for_proxy_from_db(
+    db: &Arc<Database>,
+    app: AppType,
+) -> Result<Vec<Provider>, String> {
+    let mut providers = list_providers_from_db(db, app)?;
+    add_official_fallback_if_needed(&mut providers, app);
+    Ok(providers)
 }
 
 /// 列出所有应用的 providers（从数据库读取）
@@ -224,7 +260,10 @@ pub fn switch_provider_in_db(
         db.get_provider(provider_id)?
             .ok_or_else(|| format!("Provider {} not found", provider_id))?
     };
-    sync_provider_to_app_config(&active).map_err(|e| e.to_string())?;
+    let takeover_active = takeover::load_backup().is_some();
+    if should_sync_provider_to_app_config(app, takeover_active) {
+        sync_provider_to_app_config(&active).map_err(|e| e.to_string())?;
+    }
 
     Ok(())
 }
@@ -256,10 +295,10 @@ pub fn move_provider_in_db(
 }
 
 /// 列出指定应用的 providers（兼容旧版，使用 DB）
-pub fn list_providers(_app: AppType) -> Result<Vec<Provider>, String> {
-    // 从全局状态获取 DB（需要调用方通过 State 注入）
-    // TODO: 此函数保留兼容，新代码请使用 list_providers_from_db
-    Ok(vec![])
+pub fn list_providers(app: AppType) -> Result<Vec<Provider>, String> {
+    // 代理转发运行在 axum handler 内，没有 Tauri State 注入；这里通过启动时注册的
+    // 全局 DB 句柄读取最新 Provider，确保每个请求都能看到前端刚切换的配置。
+    list_providers_for_proxy_from_db(global_db()?, app)
 }
 
 /// 列出所有应用的 providers（兼容旧版，使用 DB）
@@ -1188,6 +1227,12 @@ fn sync_provider_to_app_config(provider: &Provider) -> Result<(), io::Error> {
     }
 }
 
+fn should_sync_provider_to_app_config(app: AppType, takeover_active: bool) -> bool {
+    // 代理接管 Claude 时，settings.json 必须保持指向本地代理；Provider 热更新由
+    // proxy handler 每请求读取 DB 生效，不能再让切换 Provider 覆盖 BASE_URL。
+    !(app == AppType::Claude && takeover_active)
+}
+
 /// 同步到 Claude ~/.claude/settings.json
 fn sync_to_claude_settings(provider: &Provider) -> Result<(), io::Error> {
     let settings_path = get_claude_settings_path()?;
@@ -1426,6 +1471,79 @@ mod tests {
         }
     }
 
+    fn provider_for_app(id: &str, app_type: AppType) -> Provider {
+        Provider {
+            id: id.to_string(),
+            name: id.to_string(),
+            app_type,
+            api_key: format!("sk-{id}"),
+            url: Some("https://api.example.com".to_string()),
+            default_sonnet_model: Some("claude-sonnet-test".to_string()),
+            default_opus_model: None,
+            default_haiku_model: None,
+            default_reasoning_model: None,
+            custom_params: None,
+            settings_config: None,
+            meta: None,
+            icon: None,
+            in_failover_queue: false,
+            description: None,
+            tags: None,
+            is_active: app_type == AppType::Claude,
+            created_at: Utc::now(),
+            last_used: None,
+            proxy_config: None,
+            one_m_context: None,
+        }
+    }
+
+    #[test]
+    fn test_list_providers_returns_app_filtered() {
+        let db = Arc::new(Database::in_memory().expect("init in-memory db"));
+        db.upsert_provider(&provider_for_app("claude-a", AppType::Claude))
+            .expect("insert claude-a");
+        db.upsert_provider(&provider_for_app("claude-b", AppType::Claude))
+            .expect("insert claude-b");
+        db.upsert_provider(&provider_for_app("codex-a", AppType::Codex))
+            .expect("insert codex-a");
+
+        set_global_db(db);
+
+        let providers = list_providers(AppType::Claude).expect("list claude providers");
+
+        assert_eq!(providers.len(), 2);
+        assert!(providers.iter().all(|p| p.app_type == AppType::Claude));
+    }
+
+    #[test]
+    fn test_list_providers_from_db_excludes_synthetic_official() {
+        let db = Arc::new(Database::in_memory().expect("init in-memory db"));
+        let mut provider = provider_for_app("claude-a", AppType::Claude);
+        provider.is_active = false;
+        db.upsert_provider(&provider)
+            .expect("insert claude-a");
+
+        let providers = list_providers_from_db(&db, AppType::Claude).expect("list providers");
+
+        assert!(!providers.iter().any(|p| p.id == CLAUDE_OFFICIAL_PROVIDER_ID));
+    }
+
+    #[test]
+    fn test_proxy_provider_list_includes_official_when_no_custom_active() {
+        let db = Arc::new(Database::in_memory().expect("init in-memory db"));
+        let mut provider = provider_for_app("claude-a", AppType::Claude);
+        provider.is_active = false;
+        db.upsert_provider(&provider)
+            .expect("insert claude-a");
+
+        let providers =
+            list_providers_for_proxy_from_db(&db, AppType::Claude).expect("list providers");
+
+        assert!(providers
+            .iter()
+            .any(|p| p.id == CLAUDE_OFFICIAL_PROVIDER_ID && p.is_active));
+    }
+
     #[test]
     fn test_official_provider_clears_claude_env() {
         use serde_json::json;
@@ -1478,6 +1596,13 @@ mod tests {
             model_with_1m(&Some("glm-4.6".to_string()), false),
             Some("glm-4.6".to_string())
         );
+    }
+
+    #[test]
+    fn takeover_active_skips_claude_settings_sync() {
+        assert!(!should_sync_provider_to_app_config(AppType::Claude, true));
+        assert!(should_sync_provider_to_app_config(AppType::Claude, false));
+        assert!(should_sync_provider_to_app_config(AppType::Codex, true));
     }
 
     #[test]

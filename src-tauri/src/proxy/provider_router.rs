@@ -1,4 +1,5 @@
 use crate::models::app_type::AppType;
+use crate::models::provider::Provider;
 use crate::proxy::error::ProxyError;
 use crate::services::provider_service;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
@@ -7,6 +8,46 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 pub struct RouteResult {
     pub target_url: String,
     pub headers: HeaderMap,
+}
+
+/// 基于已选中的 provider 构建上游目标和认证头。
+pub fn build_route(provider: &Provider, request_path: &str) -> Result<RouteResult, ProxyError> {
+    let base_url = provider
+        .url
+        .as_deref()
+        .unwrap_or("https://api.anthropic.com");
+    let base_url = base_url.trim_end_matches('/');
+    let target_url = format!("{}{}", base_url, request_path);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+    if provider_service::is_official_provider(&provider.id) {
+        // 官方订阅依赖 Claude CLI 原始 OAuth 认证头；代理只改写目标地址，不注入空 key。
+        return Ok(RouteResult {
+            target_url,
+            headers,
+        });
+    }
+
+    if base_url.contains("anthropic.com") {
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_str(&provider.api_key)
+                .map_err(|e| ProxyError::ConfigError(e.to_string()))?,
+        );
+    } else {
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", provider.api_key))
+                .map_err(|e| ProxyError::ConfigError(e.to_string()))?,
+        );
+    }
+
+    Ok(RouteResult {
+        target_url,
+        headers,
+    })
 }
 
 /// 根据当前活跃 provider 解析上游目标
@@ -20,34 +61,67 @@ pub fn resolve_upstream(request_path: &str) -> Result<RouteResult, ProxyError> {
         .find(|p| p.is_active)
         .ok_or(ProxyError::NoAvailableProvider)?;
 
-    // 构建目标 URL
-    let base_url = active.url.as_deref().unwrap_or("https://api.anthropic.com");
-    let base_url = base_url.trim_end_matches('/');
-    let target_url = format!("{}{}", base_url, request_path);
+    build_route(&active, request_path)
+}
 
-    // 构建请求头
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::provider::Provider;
+    use crate::services::provider_service::CLAUDE_OFFICIAL_PROVIDER_ID;
+    use chrono::Utc;
 
-    // 根据 URL 判断认证方式
-    if base_url.contains("anthropic.com") {
-        // Anthropic 原生 API 使用 x-api-key
-        headers.insert(
-            "x-api-key",
-            HeaderValue::from_str(&active.api_key)
-                .map_err(|e| ProxyError::ConfigError(e.to_string()))?,
-        );
-    } else {
-        // 第三方反代通常使用 Bearer token
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", active.api_key))
-                .map_err(|e| ProxyError::ConfigError(e.to_string()))?,
+    fn provider(url: Option<String>) -> Provider {
+        Provider {
+            id: "provider-a".to_string(),
+            name: "Provider A".to_string(),
+            app_type: AppType::Claude,
+            api_key: "sk-test".to_string(),
+            url,
+            default_sonnet_model: None,
+            default_opus_model: None,
+            default_haiku_model: None,
+            default_reasoning_model: None,
+            custom_params: None,
+            settings_config: None,
+            meta: None,
+            icon: None,
+            in_failover_queue: false,
+            description: None,
+            tags: None,
+            is_active: true,
+            created_at: Utc::now(),
+            last_used: None,
+            proxy_config: None,
+            one_m_context: None,
+        }
+    }
+
+    #[test]
+    fn build_route_uses_passed_provider() {
+        let route = build_route(
+            &provider(Some("https://proxy.example.com/".to_string())),
+            "/v1/messages?x=1",
+        )
+        .expect("route");
+
+        assert_eq!(route.target_url, "https://proxy.example.com/v1/messages?x=1");
+        assert_eq!(
+            route.headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()),
+            Some("Bearer sk-test")
         );
     }
 
-    Ok(RouteResult {
-        target_url,
-        headers,
-    })
+    #[test]
+    fn build_route_for_official_provider_does_not_set_proxy_auth() {
+        let mut official = provider(None);
+        official.id = CLAUDE_OFFICIAL_PROVIDER_ID.to_string();
+        official.api_key = String::new();
+
+        let route = build_route(&official, "/v1/messages").expect("route");
+
+        assert_eq!(route.target_url, "https://api.anthropic.com/v1/messages");
+        assert!(route.headers.get("x-api-key").is_none());
+        assert!(route.headers.get(AUTHORIZATION).is_none());
+    }
 }

@@ -1,15 +1,15 @@
 import { Link } from 'react-router-dom';
-import { Download, Github, ArrowRight, Zap, Shield, Server, Globe, Activity, Cpu, Terminal } from 'lucide-react';
+import { Download, Github, ArrowRight, Zap, Shield, Server, Activity, MessageSquare, FileText, Bot, FolderOpen, BarChart3, Terminal } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { REPO_URL, RELEASES_URL, LICENSE_URL } from '../config/site';
 import appIcon from '../assets/app-icon.png';
 
-// Feature data with icons
+// Feature data with icons — 与 src/ 应用功能模块保持同步（Sidebar 导航 + Token 用量）
 const features = [
   {
     icon: Zap,
-    title: '零配置切换',
-    description: '一键在 Anthropic、Azure、自定义代理之间切换，无需手动修改环境变量',
+    title: '多 Agent 统一路由',
+    description: '在 Claude、Codex、Gemini、Antigravity 之间一键切换，无需手动修改环境变量',
     gradient: 'from-amber-500 to-orange-500'
   },
   {
@@ -19,28 +19,46 @@ const features = [
     gradient: 'from-orange-500 to-red-500'
   },
   {
+    icon: Activity,
+    title: '服务商健康检测',
+    description: '实时探测各 Provider 的可用性与响应延迟，帮助选择最稳定、最快的接入链路',
+    gradient: 'from-emerald-500 to-teal-500'
+  },
+  {
     icon: Server,
     title: 'MCP 服务器管理',
     description: '图形化配置 Model Context Protocol 插件，可视化管理 AI 上下文能力',
     gradient: 'from-pink-500 to-rose-500'
   },
   {
-    icon: Globe,
+    icon: MessageSquare,
+    title: 'Agent 对话',
+    description: '内置多 Agent 对话窗口，直接调用已配置的 Provider 进行交互与联调',
+    gradient: 'from-rose-500 to-pink-500'
+  },
+  {
+    icon: FileText,
     title: 'Prompt 预设池',
     description: '预置多种角色 Prompt 模板，支持工作区级快速分发与应用',
-    gradient: 'from-rose-500 to-red-500'
+    gradient: 'from-purple-500 to-indigo-500'
   },
   {
-    icon: Activity,
-    title: '可视化数据面板',
-    description: '统一监控 Tokens 消耗、工具调用次数与接口响应延迟',
-    gradient: 'from-red-500 to-orange-500'
+    icon: Bot,
+    title: '技能与子代理',
+    description: '集中管理自定义技能（Skills）与子代理（Subagents），沉淀可复用的 AI 工作流',
+    gradient: 'from-indigo-500 to-blue-500'
   },
   {
-    icon: Cpu,
-    title: '沙箱环境隔离',
-    description: '为不同项目创建独立的配置环境，避免冲突与干扰',
+    icon: FolderOpen,
+    title: '工作区隔离',
+    description: '为不同项目创建独立的配置环境，互不冲突与干扰',
     gradient: 'from-cyan-500 to-blue-500'
+  },
+  {
+    icon: BarChart3,
+    title: '可视化数据面板',
+    description: '统一监控 Token 用量、会话活跃度与项目概览，全局尽在掌握',
+    gradient: 'from-red-500 to-orange-500'
   }
 ];
 

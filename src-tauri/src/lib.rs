@@ -3,6 +3,7 @@ mod commands;
 mod database;
 mod deeplink;
 mod error;
+mod hermes;
 mod mcp;
 mod models;
 mod proxy;
@@ -18,6 +19,7 @@ use commands::backup_commands;
 use commands::chat_commands;
 use commands::deeplink_commands;
 use commands::editor_commands;
+use commands::hermes_commands;
 use commands::mcp_commands;
 use commands::prompt_commands;
 use commands::provider_commands;
@@ -923,6 +925,12 @@ pub fn run() {
             chat_commands::chat_open_path_in_explorer,
             chat_commands::chat_git_list_branches,
             chat_commands::chat_git_create_and_checkout_branch,
+            chat_commands::helm_worktree_create,
+            chat_commands::helm_worktree_remove,
+            chat_commands::helm_worktree_list,
+            chat_commands::helm_worktree_diff,
+            chat_commands::helm_worktree_merge,
+            chat_commands::helm_close_agent,
             chat_commands::permission_respond_ask_user_question,
             chat_commands::permission_respond_tool,
             chat_commands::permission_respond_plan_approval,
@@ -1046,12 +1054,31 @@ pub fn run() {
             antigravity_commands::ag_get_operation_logs,
             antigravity_commands::ag_get_all_operation_logs,
             antigravity_commands::ag_get_token_status,
+            // Hermes 编排引擎命令（Phase 2g / Task 17；Task 4 新增 run_show / agent_list；
+            //   Task 14 新增 run_cleanup）
+            hermes_commands::hermes_run,
+            hermes_commands::hermes_task_list,
+            hermes_commands::hermes_dispatch_show,
+            hermes_commands::hermes_gate_resolve,
+            hermes_commands::hermes_gate_list,
+            hermes_commands::hermes_gate_show,
+            hermes_commands::hermes_judge_show,
+            hermes_commands::hermes_worker_transcript,
+            hermes_commands::hermes_worker_session_list,
+            hermes_commands::hermes_run_stop,
+            hermes_commands::hermes_run_cancel,
+            hermes_commands::hermes_agent_abort,
+            hermes_commands::hermes_run_show,
+            hermes_commands::hermes_agent_list,
+            hermes_commands::hermes_run_cleanup,
+            hermes_commands::hermes_run_mock,
         ])
         .setup(|app| {
             // 初始化数据库
             let db = database::Database::init().expect("Failed to initialize database");
             let db_arc = std::sync::Arc::new(db);
             let db_for_backup = db_arc.clone();
+            crate::services::provider_service::set_global_db(db_arc.clone());
 
             // 执行 JadeKit 内部数据 schema 迁移
             if let Err(e) = migration_service::check_and_run_migration() {
@@ -1066,12 +1093,73 @@ pub fn run() {
             let state = store::AppState::new(db_arc);
             app.manage(state);
 
+            // 崩溃恢复：若上次退出时代理没来得及 stop，Claude settings 可能仍指向本地死代理。
+            if let Err(e) = crate::services::proxy_service::restore_claude_takeover_if_needed() {
+                eprintln!("Proxy takeover restore warning: {e}");
+            }
+
             // 交互式 Chat：注册 ChatState（懒启动 ai-bridge daemon）
             {
                 let chat_manager = chat::ChatManager::new(app.handle().clone());
                 app.manage(chat_commands::ChatState {
                     manager: chat_manager,
                 });
+            }
+
+            // Hermes 编排引擎（Phase 2g / Task 17）：
+            //   - Store 落在 ~/.jadekit/hermes.db（WAL，崩溃可前滚）；
+            //   - runtime = SdkRuntime（注入一份独立 ChatManager——Hermes 自己的 daemon
+            //     生命周期与交互式 Chat 解耦，互不影响）；
+            //   - repo_root 缺省取 cwd（前端可在 hermes_run 的 opts 里覆盖）；
+            //   - worktrees_dir 复用 chat 侧的 helm-worktrees 子目录约定。
+            {
+                let store_path =
+                    crate::services::app_paths::data_file("hermes.db").map_err(|e| {
+                        format!("Failed to resolve hermes.db path: {e}")
+                    })?;
+                // 确保父目录存在（首次启动时 .jadekit 可能尚未创建）。
+                if let Some(parent) = store_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let store = hermes::Store::open(&store_path).map_err(|e| {
+                    format!("Failed to open hermes store: {e}")
+                })?;
+                // 崩溃恢复：把上次中断留下的孤儿 dispatched 任务收敛回 Ready/Completed。
+                if let Err(e) = store.reconcile_on_startup() {
+                    eprintln!("Hermes reconcile_on_startup warning: {e}");
+                }
+
+                let hermes_chat_manager =
+                    std::sync::Arc::new(chat::ChatManager::new(app.handle().clone()));
+                let sdk_runtime: std::sync::Arc<dyn hermes::AgentRuntime> =
+                    std::sync::Arc::new(hermes::SdkRuntime::new(hermes_chat_manager));
+                // 生产侧 Cli 介质命令：默认走 PATH 上的 `claude` CLI（与 cli_runtime.rs
+                // 文档注释约定一致——生产用 ["claude"]，测试用 ["bash","-c",...]）。
+                // 本运行时不内置 provider 名，命令由调用方注入；Task 17 的手动真实 LLM
+                // e2e 会验证/调整此命令，Task 9 的 DoD 是 mock e2e，不依赖此命令真能跑。
+                let cli_runtime: std::sync::Arc<dyn hermes::AgentRuntime> =
+                    std::sync::Arc::new(hermes::CliRuntime::new(vec!["claude".to_string()]));
+                // Task 9：构造介质注册表——Sdk + Cli 双介质并登（Phase 3b 异构 in-run
+                // 调度）。assignment.runtime=Sdk 的 task 走 SdkRuntime（ai-bridge daemon
+                // 结构化流）；assignment.runtime=Cli 的 task 走 CliRuntime（裸 PTY 进程，
+                // 降级 liveness 档）。production 用显式 .with（不用 single）。
+                let registry = hermes::RuntimeRegistry::new()
+                    .with(hermes::RuntimeKind::Sdk, sdk_runtime)
+                    .with(hermes::RuntimeKind::Cli, cli_runtime);
+
+                let repo_root = std::env::current_dir().unwrap_or_else(|_| {
+                    dirs::home_dir().unwrap_or_default()
+                });
+                let worktrees_dir = crate::services::app_paths::data_subdir("helm-worktrees")
+                    .unwrap_or_else(|_| std::env::temp_dir().join("helm-worktrees"));
+
+                let engine = hermes_commands::HermesEngine::new(
+                    store,
+                    registry,
+                    repo_root,
+                    worktrees_dir,
+                );
+                app.manage(engine);
             }
 
             // 自动备份：启动时检查 + 后台定时任务
@@ -1156,7 +1244,7 @@ pub fn run() {
             // daemon 自身也有父进程监控兜底）。
             if let tauri::RunEvent::Exit = _event {
                 if let Some(chat_state) = _app_handle.try_state::<chat_commands::ChatState>() {
-                    tauri::async_runtime::block_on(chat_state.manager.shutdown());
+                    tauri::async_runtime::block_on(chat_state.manager.shutdown_all());
                 }
             }
 

@@ -1,4 +1,5 @@
 import {type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {useTranslation} from 'react-i18next';
 import {invoke} from '@tauri-apps/api/core';
 import {Package, PanelLeftOpen, PanelRightOpen, RefreshCw, Trash2} from 'lucide-react';
@@ -19,7 +20,9 @@ import ChatSessionTabs from '../components/chat/ChatSessionTabs';
 import ChatDiffReviewPane from '../components/chat/ChatDiffReviewPane';
 import type {ChatWorkspaceProjectOption} from '../components/chat/composer/ContextBar';
 import {ChatComposer} from '../components/chat/composer/ChatComposer';
+import {FanoutCompareView} from '../components/chat/fanout/FanoutCompareView';
 import ModalDialog from '../components/common/ModalDialog';
+import HelmCockpit from '../components/helm/HelmCockpit';
 import {
     CONVERSATION_PANE_MAX_WIDTH,
     CONVERSATION_PANE_MIN_WIDTH,
@@ -88,6 +91,7 @@ import {
 } from '../utils/chatSidebarLayout';
 import {getSessionSelectionKey, type SessionMeta} from '../types/session';
 import type {ChatMessage} from '../types/chat';
+import {fanoutTabsOf} from '../stores/fanoutGroup';
 import type {EditDiffPreviewMode} from '../components/toolBlocks/EditDiffPreview';
 import '../styles/toolBlocks.css';
 
@@ -119,6 +123,8 @@ interface FullHistorySearchState {
  */
 export default function ChatPage() {
     const {t} = useTranslation();
+    const [searchParams] = useSearchParams();
+    const helmQuery = searchParams.get('helm') === 'true';
     const sdkDependencyLabels = useMemo(() => getSdkDependencyPanelLabels(t), [t]);
     const {
         messages,
@@ -157,6 +163,12 @@ export default function ChatPage() {
     } = useChatStore();
 
     const [sdkModalOpen, setSdkModalOpen] = useState(false);
+    const [showCockpit, setShowCockpit] = useState(false);
+
+    useEffect(() => {
+        setShowCockpit(helmQuery);
+    }, [helmQuery]);
+
     const [isNearBottom, setIsNearBottom] = useState(true);
     const [searchQuery, setSearchQuery] = useState('');
     const [collapsedAnchorCount, setCollapsedAnchorCount] = useState<number | null>(null);
@@ -376,6 +388,14 @@ export default function ChatPage() {
     const isStreaming = useMemo(
         () => messages.some((message) => Boolean(message.streaming)),
         [messages],
+    );
+    const activeTab = useMemo(
+        () => openTabs.find((tab) => tab.key === activeTabKey) ?? null,
+        [activeTabKey, openTabs],
+    );
+    const fanoutCompareTabs = useMemo(
+        () => fanoutTabsOf(openTabs, activeTab?.fanoutGroupId),
+        [activeTab?.fanoutGroupId, openTabs],
     );
     const statusMessages = useMemo(() => {
         if (isSearchingTranscript) {
@@ -938,6 +958,12 @@ export default function ChatPage() {
                 </div>
                 <div className="flex items-center gap-2">
                     <button
+                        className={`btn btn-sm ${showCockpit ? 'btn-primary' : 'btn-ghost'}`}
+                        onClick={() => setShowCockpit(prev => !prev)}
+                    >
+                        Helm Cockpit
+                    </button>
+                    <button
                         className={`btn btn-ghost btn-sm ${sdkMissing ? 'text-warning' : ''}`}
                         onClick={() => setSdkModalOpen(true)}
                     >
@@ -971,7 +997,10 @@ export default function ChatPage() {
             )}
 
             {/* 消息区：预留 cc-gui 风格的搜索、锚点和状态扩展槽 */}
-            <div className="chat-workspace-surface relative flex min-h-0 flex-1 overflow-hidden">
+            {showCockpit ? (
+                <HelmCockpit />
+            ) : (
+                <div className="chat-workspace-surface relative flex min-h-0 flex-1 overflow-hidden">
                 {sessionSidebarCollapsed ? (
                     <div className="chat-session-sidebar-collapsed-rail hidden lg:flex">
                         <button
@@ -1024,6 +1053,9 @@ export default function ChatPage() {
                                 <div className="flex h-full flex-col items-center justify-center text-base-content/40">
                                     <p className="text-sm">{t('chat.empty')}</p>
                                 </div>
+                            )}
+                            {fanoutCompareTabs.length > 1 && !searchQuery.trim() && (
+                                <FanoutCompareView tabs={fanoutCompareTabs} />
                             )}
                             <MessageList
                                 messages={searchSourceMessages}
@@ -1183,6 +1215,7 @@ export default function ChatPage() {
                     )}
                 </div>
             </div>
+        )}
 
             {/* 错误提示 */}
             {error && (

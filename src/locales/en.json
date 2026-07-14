@@ -40,7 +40,8 @@
     "workspaces": "Workspaces",
     "settings": "Settings",
     "token_usage": "Token Usage",
-    "chat": "Chat"
+    "chat": "Chat",
+    "helm": "Helm Cockpit"
   },
   "mcp": {
     "title": "MCP Server Management",
@@ -1150,6 +1151,23 @@
       "reconnecting": "Reconnecting…",
       "readyTimeoutError": "Daemon did not become ready in time"
     },
+    "worktree": {
+      "createForAgent": "Create isolated worktree for this agent"
+    },
+    "fanout": {
+      "enable": "Fan-out",
+      "roster": "Fan-out roster",
+      "launch": "Launch",
+      "launching": "Launching",
+      "compare": "Fan-out compare",
+      "agentCount": "{{count}} agents",
+      "waiting": "Waiting for output...",
+      "discard": "Discard",
+      "merge": "Merge",
+      "confirmDiscard": "Discard this fan-out agent and remove its worktree?",
+      "confirmMerge": "Merge this fan-out branch into the current repository?",
+      "mergeConflict": "Merge conflict detected. The merge was aborted."
+    },
     "clear": "Clear",
     "empty": "Start a conversation with AI",
     "message": {
@@ -1662,5 +1680,83 @@
     "resultFile": "{{count}} files",
     "find": "Find",
     "glob": "Glob"
+  },
+  "helm": {
+    "emptyState": "Select an agent from the kanban",
+    "agentAlreadyFinished": "This agent has already finished.",
+    "agentId": "Agent ID",
+    "taskId": "Task ID",
+    "actions": {
+      "jumpToWorktree": "Jump to Worktree",
+      "stop": "Stop / Abort",
+      "cancel": "Cancel"
+    },
+    "tooltips": {
+      "jumpToWorktreeDisabled": "No active task or worktree associated with this agent",
+      "stopDisabled": "Requires Phase 3.5 engine updates to stop or abort sessions",
+      "cancelDisabled": "Requires Phase 3.5 engine updates to cancel sessions",
+      "requiresPhase35": "Requires Phase 3.5 Engine"
+    },
+    "timeline": {
+      "initialized": "Agent Session Initialized",
+      "initializedDesc": "Agent workspace environment setup complete.",
+      "thinking": "Agent is thinking",
+      "thinkingDesc": "Analyzing instructions, exploring codebase, and planning actions.",
+      "text": "Streaming Text Response",
+      "textDesc": "Formulating explanation and compiling feedback.",
+      "toolUse": "Executing Tools",
+      "toolUseDesc": "Invoking system or workspace tools to complete tasks.",
+      "working": "Running Task",
+      "workingDesc": "Executing automated routine.",
+      "needsAttention": "Attention Required",
+      "needsAttentionDesc": "Agent paused waiting for manual confirmation or user input.",
+      "done": "Task Completed",
+      "doneDesc": "All actions finished successfully.",
+      "interrupted": "Session Interrupted",
+      "interruptedDesc": "Execution stopped before completion."
+    },
+    "placeholderBanner": "Full transcript will be shown after engine bridge is lit.",
+    "history": {
+      "title": "Completed worker history",
+      "select": "Select an archived worker",
+      "empty": "This worker did not produce a persistable transcript.",
+      "noFinal": "This worker has no final text to display.",
+      "failed": "Failed",
+      "completed": "Completed"
+    },
+    "attentionGate": {
+      "title": "Attention Required",
+      "description": "This agent has paused and requires your review or intervention to proceed.",
+      "actionRequired": "Action Required",
+      "approve": "Approve",
+      "reject": "Reject",
+      "guidanceInput": "Manual Guidance / Comment",
+      "guidancePlaceholder": "Enter manual guidance or comment...",
+      "interventionDetails": "Intervention Details",
+      "submitting": "Submitting..."
+    },
+    "composer": {
+      "rosterTitle": "Fleet Roster",
+      "deselectAll": "Deselect All",
+      "selectAll": "Select All",
+      "noProviders": "No available chat providers configured",
+      "goalPlaceholder": "Enter goal for Hermes...",
+      "metadataHelper": "Press Ctrl+Enter to submit",
+      "maxConcurrent": "Max Concurrent Tasks",
+      "walkthrough": "Start Walkthrough Demo",
+      "walkthroughStop": "Stop Walkthrough",
+    "runMock": "Run Mock",
+    "dispatch": "Dispatch to Hermes",
+    "launching": "Launching...",
+    "launchErrorActiveRun": "The current Hermes run has not finished. Wait for it to complete, stop it, or resolve it before dispatching another run.",
+    "launchErrorGeneric": "Hermes dispatch failed.",
+    "launchErrorUnknown": "Hermes dispatch failed: {{reason}}",
+    "selectProjectFolder": "Select project folder",
+    "projectFolderDialogTitle": "Select Git project folder",
+    "projectFolderPrompt": "Select Git project folder path",
+    "noProjectFolder": "No Git project selected",
+    "projectFolderInvalid": "Select a folder inside a Git repository",
+    "projectFolderLoadFailed": "Unable to load the project folder. Please try again."
   }
+}
 }
