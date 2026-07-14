@@ -19,7 +19,10 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use super::protocol::{DaemonEvent, DaemonRequest, RawLine, StreamLine};
 use super::resources;
 
-/// Session ID for permission file IPC. Hardcoded for now; can be randomized later.
+/// 默认 session id（= 默认 agent 的 CLAUDE_SESSION_ID）。
+/// 多 agent 池下每个 daemon 用各自 agent_id 作为 session；此常量仅为默认 agent 与
+/// 旧调用点保留（见 `agent_id::DEFAULT_AGENT_ID`）。
+#[allow(dead_code)]
 pub const SESSION_ID: &str = "default";
 
 /// Callback invoked for daemon lifecycle/broadcast events (ready, sdk_loaded…).
@@ -40,6 +43,8 @@ pub struct DaemonClient {
     bridge_dir: PathBuf,
     deps_dir: PathBuf,
     permission_dir: PathBuf,
+    /// 该 daemon 绑定的 session id（= agent_id），用于 permission IPC 文件名匹配。
+    session_id: String,
     provider_config: RwLock<ProviderRuntimeConfig>,
     /// When true, spawn the daemon with `CLAUDE_DEBUG=1` for verbose diagnostics.
     debug: bool,
@@ -58,6 +63,7 @@ struct ProviderRuntimeConfig {
 fn daemon_env_vars(
     permission_dir: &Path,
     deps_dir: &Path,
+    session_id: &str,
     provider_config: &ProviderRuntimeConfig,
 ) -> Vec<(&'static str, OsString)> {
     let mut vars = vec![
@@ -66,7 +72,7 @@ fn daemon_env_vars(
             "CLAUDE_PERMISSION_DIR",
             permission_dir.as_os_str().to_owned(),
         ),
-        ("CLAUDE_SESSION_ID", OsString::from(SESSION_ID)),
+        ("CLAUDE_SESSION_ID", OsString::from(session_id)),
     ];
 
     if let Some(ref key) = provider_config.api_key {
@@ -85,6 +91,7 @@ impl DaemonClient {
         bridge_dir: PathBuf,
         deps_dir: PathBuf,
         permission_dir: PathBuf,
+        session_id: String,
         api_key: Option<String>,
         base_url: Option<String>,
         debug: bool,
@@ -94,6 +101,7 @@ impl DaemonClient {
             bridge_dir,
             deps_dir,
             permission_dir,
+            session_id,
             provider_config: RwLock::new(ProviderRuntimeConfig { api_key, base_url }),
             debug,
             request_counter: AtomicU64::new(0),
@@ -105,6 +113,13 @@ impl DaemonClient {
             })),
             event_sink: Mutex::new(None),
         }
+    }
+
+    /// 该 daemon 绑定的 session id（= agent_id），用于 permission IPC 匹配。
+    /// 当前 Phase 0 未被直接读取（manager 持有 agent_id），保留供诊断/后续阶段使用。
+    #[allow(dead_code)]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     pub fn is_running(&self) -> bool {
@@ -166,7 +181,8 @@ impl DaemonClient {
             .stderr(Stdio::piped());
 
         let provider_config = self.provider_config.read().await.clone();
-        for (key, value) in daemon_env_vars(&self.permission_dir, &self.deps_dir, &provider_config)
+        for (key, value) in
+            daemon_env_vars(&self.permission_dir, &self.deps_dir, &self.session_id, &provider_config)
         {
             cmd.env(key, value);
         }
@@ -517,10 +533,11 @@ mod tests {
             base_url: Some("https://api.example.invalid".into()),
         };
 
-        let vars: HashMap<_, _> = daemon_env_vars(&permission_dir, &deps_dir, &provider_config)
-            .into_iter()
-            .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
-            .collect();
+        let vars: HashMap<_, _> =
+            daemon_env_vars(&permission_dir, &deps_dir, "default", &provider_config)
+                .into_iter()
+                .map(|(key, value)| (key, value.to_string_lossy().into_owned()))
+                .collect();
 
         assert_eq!(
             vars.get("AI_BRIDGE_DEPS_DIR").map(String::as_str),
@@ -542,6 +559,21 @@ mod tests {
             vars.get("ANTHROPIC_BASE_URL").map(String::as_str),
             Some("https://api.example.invalid")
         );
+    }
+
+    #[test]
+    fn daemon_env_vars_use_provided_session_id() {
+        let deps_dir = std::path::PathBuf::from("/tmp/deps");
+        let permission_dir = std::path::PathBuf::from("/tmp/perm");
+        let provider_config = ProviderRuntimeConfig { api_key: None, base_url: None };
+
+        let vars: HashMap<_, _> =
+            daemon_env_vars(&permission_dir, &deps_dir, "agent-42", &provider_config)
+                .into_iter()
+                .map(|(k, v)| (k, v.to_string_lossy().into_owned()))
+                .collect();
+
+        assert_eq!(vars.get("CLAUDE_SESSION_ID").map(String::as_str), Some("agent-42"));
     }
 
     #[tokio::test]

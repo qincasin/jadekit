@@ -1,0 +1,882 @@
+//! `CliRuntime` —— 把裸 CLI 进程（claude/gemini/codex CLI）包成 [`AgentRuntime`]。
+//!
+//! 与 [`crate::hermes::sdk_runtime::SdkRuntime`] 并列的第二个 [`AgentRuntime`]
+//! 实现，证明 Hermes 引擎的「介质可插拔」契约。`SdkRuntime` 走 ai-bridge daemon
+//! 的结构化 `StreamLine` 协议（`structured_events = true`）；本运行时直接驱动
+//! 一个裸 CLI 进程，只有 stdout 文本 + 退出码，因此 `structured_events = false`，
+//! 对应 [`crate::hermes::supervisor::WorkerSupervisor`] 的**降级 liveness 档**：
+//! 即使 agent 一直在吐文本，沉默超时也会被判为存活，但绝对硬超时仍会兜底。
+//!
+//! PTY spawn / read / kill 流程：
+//! 1. [`AgentRuntime::start`]：调用方给的命令（`command: Vec<String>`，第一段是
+//!    可执行文件名，其余为参数）+ `spec.cwd`，通过 `portable_pty` 打开 PTY pair，
+//!    在 slave 侧 spawn 子进程。slave 立即 drop（RFC 1857 drop order）。master
+//!    保留进 [`CliSession`]，后续每次 [`AgentRuntime::send`] 都 `try_clone_reader`
+//!    一份给读任务，`take_writer` 只在 start 调一次（API 约束：writer 只能取一次）。
+//! 2. [`AgentRuntime::send`]：把已取出的 writer 写 `prompt + "\n"`（PTY stdin），
+//!    spawn 一个 **`spawn_blocking`** 读任务阻塞读 master reader，按 `\n` 切行，
+//!    每行（去 `\r`、去尾换行）映射成 [`AgentEvent::TextDelta`]。reader EOF 后，
+//!    读任务再 spawn 一个 `tokio::spawn` 任务调 `child.wait()` 拿 exit status，
+//!    按 `exit.success()` 发 [`AgentEvent::Done`]（success=退出码==0）。
+//! 3. [`AgentRuntime::abort`] / [`AgentRuntime::stop`]：先对整个进程组发 SIGHUP
+//!    （PTY slave 子进程是 session leader，SIGHUP 通过 `kill(-pgid, SIGHUP)` 扩散
+//!    到同 session 全部子进程），轮询 `try_wait` 给一段 grace period；若仍存活则
+//!    对进程组发 **SIGKILL** 兜底（trap/ignore SIGHUP 的 CLI 也必死）。Windows 下
+//!    走 TerminateProcess。注意：**不**依赖 `clone_killer()` 派生的 ProcessSignaller
+//!    ——它只发 SIGHUP、无 SIGKILL 兜底（portable-pty lib.rs:313-322），不可靠。
+//! 4. [`AgentRuntime::liveness`]：`child.try_wait()` 返回 `None` → `Alive`；
+//!    返回 `Some(_)` → `Dead`；会话不存在或 wait 出错 → `Dead`（容错）。
+//!
+//! 设计取舍：PTY 的 master reader 是 `Box<dyn Read + Send>`（阻塞），不能在
+//! async 任务里 `await`；用 `spawn_blocking` 把它放回阻塞线程池，再用 channel
+//! 把行数据回流到 async 世界，是与 tokio 集成的标准做法。child 的 `wait()` 同样
+//! 阻塞（portable-pty 委托到 `std::process::Child::wait`），且**可能无限期阻塞**
+//! （子进程可能在关闭 stdout 后仍长期存活）——因此 `wait()` **绝对不能**在持有
+//! `sessions` mutex 时调用，否则会冻结所有 agent 的 send/abort/liveness/stop，
+//! 并让 Supervisor 的 reap（也走同一把锁）死锁。本运行时把 `wait` 放进
+//! `spawn_blocking`，**且**只 clone 必要句柄后在锁外执行；锁内只做 O(1) 查表。
+//!
+//! Echo 处理：PTY 默认 cooked 模式会把 `send` 写入的 `prompt + "\n"` 回显回 master
+//! reader，污染 `TextDelta`。`start` 时通过 `tcsetattr` 清掉 master 端的 `ECHO`
+//! （以及 `ICANON` 之外的本地输出回显），让 CLI 拿到干净 stdin、输出不掺杂回显。
+
+use async_trait::async_trait;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
+
+use super::runtime::{
+    AgentEvent, AgentHandle, AgentRuntime, Liveness, RuntimeCapabilities, RuntimeError,
+    RuntimeStartSpec,
+};
+
+/// 单个 CLI agent 的运行时会话：持有 PTY 子进程的全部句柄。
+///
+/// 所有字段都是 `Send`：`CliRuntime` 把每个会话放进 `Arc<Mutex<HashMap>>`，
+/// 跨 `AgentRuntime` 方法共享。
+struct CliSession {
+    /// PTY master：用于每次 send 时 `try_clone_reader` 一份给读任务，
+    /// 也用于 `abort`/`stop` 时通过 `process_group_leader()` 拿到 pgid 后
+    /// 对整个进程组发 SIGHUP/SIGKILL（kill 整组比 kill 单进程更可靠）。
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    /// PTY 的写端：`send` 写 `prompt + "\n"` 进去（→ 子进程 stdin）。
+    writer: Option<Box<dyn Write + Send>>,
+    /// 子进程句柄：`liveness` 用 `try_wait` 探活，`stop` 时 `wait` 收尸。
+    /// `abort`/`stop` 也用它做 SIGKILL 兜底（portable-pty 的 `Child::kill`
+    /// 实现 = SIGHUP + grace + `std::process::Child::kill` 即 SIGKILL）。
+    ///
+    /// 是 `Option`：reader EOF 后的 wait 任务会把 child **take** 出来在锁外 wait
+    /// （避免持锁阻塞——见 send 的 C1 修复），wait 完再还回。在 child 被 take
+    /// 的窗口期，liveness/abort 容错处理（见各自实现）。
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    /// 一旦子进程已退出（被 abort/stop 或自然退出），置为 true；
+    /// 防止 abort 后再次 kill 已死进程时报错；同时被 reader-EOF wait 任务
+    /// 读取，若为 true 则**跳过** Done 发送（abort/stop 已接管终止语义）。
+    killed: bool,
+    /// 当前活跃的 reader task。每次新 send 前会 await 上一次的（若有），
+    /// 防止多个并发读任务交错写同一 channel。CLI agent 一次只处理一条 prompt，
+    /// 串行 send 是合理约束。
+    reader_task: Option<JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+fn pty_raw_fd(master: &Box<dyn portable_pty::MasterPty + Send>) -> Option<i32> {
+    master.as_raw_fd()
+}
+
+/// 在 Unix 上对 PTY master 端关掉 `ECHO`（PTY 默认 cooked 模式会把 `send`
+/// 写入的内容回显回 reader，污染 `TextDelta`）。保留 `ICANON`（行缓冲），
+/// 这样 CLI 仍能逐行读 stdin；只关本地回显。失败时记录但**不**报错
+/// （关不掉 echo 仍可运行，只是 TextDelta 会掺杂回显——tests 会单独验证）。
+#[cfg(unix)]
+fn disable_pty_echo(master: &Box<dyn portable_pty::MasterPty + Send>) {
+    let Some(fd) = pty_raw_fd(master) else {
+        return;
+    };
+    // 安全：tcgetattr/tcsetattr 对有效 fd 是可重入的 POSIX 调用。
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut t) != 0 {
+            return;
+        }
+        t.c_lflag &= !(libc::ECHO | libc::ECHOCTL | libc::ECHOE | libc::ECHOK | libc::ECHONL);
+        // TCSANOW：立即生效。忽略失败（best-effort）。
+        let _ = libc::tcsetattr(fd, libc::TCSANOW, &t);
+    }
+}
+
+#[cfg(not(unix))]
+fn disable_pty_echo(_master: &Box<dyn portable_pty::MasterPty + Send>) {
+    // Windows ConPTY 无 termios echo 概念（ConPTY 自己管理渲染），no-op。
+}
+
+/// 对 PTY slave 的整个进程组发信号。返回 true 表示成功发出至少一个信号。
+///
+/// 通过 `master.process_group_leader()`（Unix 上 = `tcgetpgrp`）拿到前台
+/// 进程组 pgid，然后 `kill(-pgid, sig)` 对整组发信号。这样 CLI spawn 的
+/// tool server / build helper 等子进程也会一起被清理。发不出信号（拿不到
+/// pgid 或 kill 报错）时返回 false，调用方应回退到 `child.kill()`。
+#[cfg(unix)]
+fn signal_process_group(master: &Box<dyn portable_pty::MasterPty + Send>, sig: i32) -> bool {
+    let Some(pgid) = master.process_group_leader() else {
+        return false;
+    };
+    // 安全：libc::kill 是 POSIX 同步调用；负 pid 表示「进程组」语义。
+    let r = unsafe { libc::kill(-pgid, sig) };
+    r == 0
+}
+
+#[cfg(not(unix))]
+fn signal_process_group(
+    _master: &Box<dyn portable_pty::MasterPty + Send>,
+    _sig: i32,
+) -> bool {
+    false
+}
+
+// === 平台门控的「具体信号」helper ============================================
+//
+// 设计目的：把 `libc::SIGHUP` / `libc::SIGKILL` 字面量**封装进** `#[cfg(unix)]`
+// 的函数体里，使 call site（`abort`/`stop` 这些非平台门控的方法）永远不直接
+// 引用 `libc::` 常量——否则 Windows 上 `libc::SIGHUP` 是未定义符号，编译失败
+// （项目按 CLAUDE.md 发布 Windows .exe/.msi，必须可编译）。Windows 桩返回 false
+// （调用方据此回退到 `child.kill()` 走 TerminateProcess）。
+#[cfg(unix)]
+fn signal_group_hup(master: &Box<dyn portable_pty::MasterPty + Send>) -> bool {
+    signal_process_group(master, libc::SIGHUP)
+}
+
+#[cfg(unix)]
+fn signal_group_kill(master: &Box<dyn portable_pty::MasterPty + Send>) -> bool {
+    signal_process_group(master, libc::SIGKILL)
+}
+
+#[cfg(not(unix))]
+fn signal_group_hup(_master: &Box<dyn portable_pty::MasterPty + Send>) -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+fn signal_group_kill(_master: &Box<dyn portable_pty::MasterPty + Send>) -> bool {
+    false
+}
+
+/// 同步轮询 `child.try_wait` 直到 deadline；返回 true 表示子进程已退出。
+fn wait_grace_deadline(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    deadline: std::time::Instant,
+) -> bool {
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(_) => return true, // wait 出错视同已死，避免无限轮询。
+        }
+    }
+    false
+}
+
+/// 裸 CLI 进程适配器：Hermes 引擎通过 [`AgentRuntime`] 驱动它。
+///
+/// `command` 由调用方注入（生产侧用 `["claude"].to_vec()`，测试侧用
+/// `["bash", "-c", "echo hi; exit 0"]`）——本运行时不内置任何 provider 名，
+/// 避免魔法字符串。
+pub struct CliRuntime {
+    command: Vec<String>,
+    sessions: Arc<Mutex<HashMap<String, CliSession>>>,
+}
+
+impl CliRuntime {
+    /// 用给定命令构造运行时。每次 [`AgentRuntime::start`] 都会 spawn 一份该命令
+    /// 的副本（一个 agent 一个进程）。
+    pub fn new(command: Vec<String>) -> Self {
+        Self {
+            command,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for CliRuntime {
+    fn capabilities(&self) -> RuntimeCapabilities {
+        // 裸 CLI 只有文本 + 进程存活，没有结构化 tool_use/tool_result 事件 →
+        // structured_events=false（WorkerSupervisor 降级 liveness 档）。
+        // supports_resume=false：CLI 进程无 resume 协议。
+        // supports_permission_prompt=false：无结构化权限事件（兼容未来扩展）。
+        RuntimeCapabilities {
+            structured_events: false,
+            supports_resume: false,
+            supports_permission_prompt: false,
+        }
+    }
+
+    async fn start(&self, spec: RuntimeStartSpec) -> Result<AgentHandle, RuntimeError> {
+        if self.command.is_empty() {
+            return Err(RuntimeError("CliRuntime::command 为空".to_string()));
+        }
+
+        // 1. 构造命令：第一段是可执行文件，其余为参数。
+        let mut cmd_builder = CommandBuilder::new(&self.command[0]);
+        for arg in &self.command[1..] {
+            cmd_builder.arg(arg);
+        }
+        cmd_builder.cwd(&spec.cwd);
+
+        // 2. 打开 PTY pair。尺寸用合理默认（24x80），与终端差异由后续 resize 处理。
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| RuntimeError(format!("openpty 失败: {e}")))?;
+
+        // 3. 在 PTY slave 端 spawn 子进程。slave 释放后子进程仍是 session leader。
+        let child = pair
+            .slave
+            .spawn_command(cmd_builder)
+            .map_err(|e| RuntimeError(format!("spawn_command 失败: {e}")))?;
+        // slave 端 spawn 完即 drop：RFC 1857 要求 slave 先于 master drop。
+        drop(pair.slave);
+
+        // 4. 取出 master 的写端（API 约束：只能调一次，故存进 session）。
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| RuntimeError(format!("take_writer 失败: {e}")))?;
+
+        // 5. 关闭 PTY echo：cooked 模式会把 send 写入的 prompt 回显回 reader，
+        //    污染 TextDelta。best-effort（关不掉仍可运行，只是输出掺杂回显）。
+        disable_pty_echo(&pair.master);
+
+        let session = CliSession {
+            master: pair.master,
+            writer: Some(writer),
+            child: Some(child),
+            killed: false,
+            reader_task: None,
+        };
+
+        self.sessions
+            .lock()
+            .await
+            .insert(spec.agent_id.clone(), session);
+
+        Ok(AgentHandle {
+            agent_id: spec.agent_id,
+        })
+    }
+
+    async fn send(
+        &self,
+        handle: &AgentHandle,
+        prompt: String,
+    ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, RuntimeError> {
+        let (tx, rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get_mut(&handle.agent_id) else {
+            return Err(RuntimeError(format!(
+                "agent_id={} 的会话不存在",
+                handle.agent_id
+            )));
+        };
+
+        // 串行约束：若上一轮 reader 还在跑，等它结束（CLI 一次处理一条 prompt）。
+        if let Some(prev) = session.reader_task.take() {
+            let _ = prev.await; // 容忍 panic：prev 已退出。
+        }
+
+        // 1. 写 prompt + 换行到 PTY stdin（"\n" 即可，PTY 会自动转 CR/LF）。
+        let writer = session
+            .writer
+            .as_mut()
+            .ok_or_else(|| RuntimeError("writer 已被消费（send 不能重入）".to_string()))?;
+        writer
+            .write_all(format!("{prompt}\n").as_bytes())
+            .map_err(|e| RuntimeError(format!("写 PTY 失败: {e}")))?;
+        writer
+            .flush()
+            .map_err(|e| RuntimeError(format!("flush PTY 失败: {e}")))?;
+
+        // 2. clone 出一份 reader 给读任务。master 在 session 里保留，下次 send 还能再 clone。
+        let reader = session
+            .master
+            .try_clone_reader()
+            .map_err(|e| RuntimeError(format!("try_clone_reader 失败: {e}")))?;
+
+        // 3. spawn 阻塞读任务：按行读、按行映射成 TextDelta；EOF 后 spawn wait 任务发 Done。
+        let sessions_clone = Arc::clone(&self.sessions);
+        let agent_id = handle.agent_id.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            // BufReader 按行切分：PTY 输出未必按 `\n` 整齐到达，但 BufRead 会缓冲。
+            let mut lines = BufReader::new(reader).lines();
+            while let Some(Ok(line)) = lines.next() {
+                // 归一化：去尾 `\r`（PTY CRLF），trim_end 后作为 TextDelta。
+                let normalized = line.trim_end_matches('\r');
+                if tx.send(AgentEvent::TextDelta(normalized.to_string())).is_err() {
+                    // 调用方丢弃 receiver：停止转发。
+                    return;
+                }
+            }
+            // reader EOF：子进程关闭了 stdout，意味着**可能**即将退出（但不保证：
+            // 子进程可能 trap/ignore 信号后长期存活）。我们要拿到真实 exit status
+            // 才能发出准确的 `Done{success}`，但 `child.wait()` 是阻塞调用，
+            // **绝对不能**在持有 `sessions` mutex 时执行——否则一旦子进程不退出，
+            // 所有 agent 的 send/abort/liveness/stop 都会被冻结，Supervisor 的
+            // reap（也走同一把锁）也会死锁。
+            //
+            // 方案：再 `tokio::spawn` 一个 async 任务，内部用 `spawn_blocking`
+            // 执行 wait。锁内只做 O(1) 「take 出 child」+「wait 后还回 child」，
+            // 真正的阻塞 wait 在 spawn_blocking 线程、锁外完成。这样 liveness()
+            // 即使在 wait 期间也能立即拿到锁（child 暂时不在 session 里，但
+            // liveness 容错地返回 Dead——见 liveness 注释）。
+            tokio::spawn(async move {
+                // 第 1 步：取锁，take 出 child，立即释放锁。
+                let mut child_opt = {
+                    let mut sessions = sessions_clone.lock().await;
+                    let Some(session) = sessions.get_mut(&agent_id) else {
+                        return; // session 已被 stop 移除——无需发 Done。
+                    };
+                    session.child.take() // 暂借出 child；wait 后还回。
+                };
+                let Some(mut child) = child_opt else {
+                    return;
+                };
+
+                // 第 2 步：锁外 wait。spawn_blocking 把阻塞 wait 推到专用线程池，
+                // 不卡 async runtime（current_thread / multi_thread 都适用）。
+                // spawn_blocking 的闭包是 FnOnce，所以我们把 child move 进去，
+                // 先拿 &mut 调 wait，再把 child 原样返回出来还回 session。
+                let (child_back, success) =
+                    match tokio::task::spawn_blocking(
+                        move || {
+                            let status = (&mut *child).wait();
+                            (child, status)
+                        },
+                    )
+                    .await
+                    {
+                        Ok((c, Ok(status))) => (c, status.success()),
+                        // spawn_blocking panic 或 wait 失败：按失败处理，直接退出
+                        // （child 已被析构，session.child 保持 None；后续 liveness
+                        // 返回 Dead，abort 幂等返回 Ok）。
+                        Ok((_, Err(_))) => return,
+                        Err(_) => return,
+                    };
+
+                // 第 3 步：再取短锁还回 child，标记 killed，**条件**发 Done。
+                let already_killed;
+                {
+                    let mut sessions = sessions_clone.lock().await;
+                    if let Some(session) = sessions.get_mut(&agent_id) {
+                        // 读 killed：若 abort 已在 EOF 与此处之间先到并标 true，
+                        // 说明 abort 已经接管了终止语义——我们跳过 Done 发送
+                        // （M3：避免重复终止事件；abort 不发 Done，调用方应通过
+                        // abort 返回的 Ok 感知终止）。receiver 此时通常也已被
+                        // 调用方丢弃，send 必然失败——此检查只是把语义说清楚。
+                        already_killed = session.killed;
+                        // 还回 child（若 session 仍存在）。若 stop 已移除 session，
+                        // child 在此 drop —— wait 已完成，资源被回收。
+                        session.child = Some(child_back);
+                        session.killed = true; // 标记已退出，避免后续 abort 再 kill。
+                    } else {
+                        // session 已被 stop 移除：child 在此 drop；调用方已走 stop
+                        // 路径，不需要 Done（stop 自身不发 Done，调用方通过 Ok 感知）。
+                        already_killed = true;
+                    }
+                }
+                if !already_killed {
+                    // 仅当 abort/stop 未抢先标记 killed 时才发 Done：让自然退出的
+                    // 调用方拿到真实 exit status。
+                    let _ = tx.send(AgentEvent::Done {
+                        success,
+                        // files_modified：CLI 输出不携带文件变更信息，恒为空。
+                        // 文件级变更检测必须由 Coordinator 在 done 后做工作区 diff。
+                        files_modified: vec![],
+                    });
+                }
+            });
+        });
+
+        // 记录 reader task，下次 send 会先 await 它。
+        let session = sessions.get_mut(&handle.agent_id).expect("刚 insert/取过");
+        session.reader_task = Some(task);
+
+        Ok(rx)
+    }
+
+    async fn abort(&self, handle: &AgentHandle) -> Result<(), RuntimeError> {
+        // P2/M1 修复：`abort` 不能持锁跨越 grace 轮询——否则会阻塞其它 agent
+        // 的 send/liveness/abort 以及 Supervisor 的 reap（同一把 `sessions` 锁）。
+        // 模式：第 1 步短锁（发 SIGHUP + take 出 child + 标记 killed 占位）；
+        // 第 2 步完全锁外做 grace 轮询 + 必要的 SIGKILL；第 3 步短锁还回 child
+        // 并最终确认 killed=true。SIGHUP 的 `kill()` 系统调用本身是 O(1) 非阻
+        // 塞的，所以放在第 1 步的短锁里是安全的；只有 grace 轮询（最长 300ms）
+        // 必须挪出锁外。
+        //
+        // C2 修复（仍保留）：不再用 `clone_killer().kill()`——portable-pty 的
+        // `ProcessSignaller::kill` 只发 SIGHUP（lib.rs:313-322），trap/ignore
+        // SIGHUP 的 CLI 杀不死。改用 SIGHUP → grace → SIGKILL 的进程组阶梯。
+        //
+        // 注意：child 可能在 reader-EOF wait 窗口期被 take 走（child = None）。
+        // 此时 child 正在被 EOF wait 任务收尸；我们在第 3 步把 killed 标 true，
+        // EOF wait 任务在重新拿到锁还回 child 时会**检查** killed，若已 true
+        // 就跳过 Done 发送（避免重复终止事件）。
+        // 第 1 步：短锁。发 SIGHUP、take 出 child、占位标记 killed。
+        let (pgid_signal_ok, mut child_opt) = {
+            let mut sessions = self.sessions.lock().await;
+            let Some(session) = sessions.get_mut(&handle.agent_id) else {
+                return Ok(()); // 会话不存在视为已 abort，幂等。
+            };
+            if session.killed {
+                return Ok(());
+            }
+            let ok = signal_group_hup(&session.master);
+            // 占位标记 killed：即便 grace 还没跑完，也先告诉其它路径「已在终止」。
+            // EOF wait 任务在还回 child 时会读这个标志决定是否发 Done。
+            session.killed = true;
+            (ok, session.child.take())
+        };
+
+        // 第 2 步：完全锁外。grace 轮询 + 必要的 SIGKILL + 把 child 还回去
+        // 也放锁外（用 `Arc::clone` 拿到 sessions 句柄，重新短锁还 child）。
+        if let Some(child) = child_opt.as_mut() {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(300);
+            let exited = wait_grace_deadline(child, deadline);
+            if !exited {
+                // SIGHUP 没杀死（trap/ignore）→ SIGKILL 整组兜底。
+                // 注意：SIGKILL 需要 master 引用，但 master 仍在 session 里，
+                // 我们不能在锁外拿到它。改回退到 portable-pty `Child::kill`
+                // （其内部就是 SIGHUP + grace + std SIGKILL，单进程）——这是
+                // 锁外能拿到的唯一 kill 路径。grace 已耗尽，Child::kill 的内部
+                // grace 立即超时进入 SIGKILL。
+                //
+                // 为了仍能用进程组 SIGKILL（更强），我们尝试再取一次短锁发信号；
+                // 若拿锁失败/发不出，再回退 Child::kill。
+                let killed_via_pgid = {
+                    let sessions = self.sessions.lock().await;
+                    match sessions.get(&handle.agent_id) {
+                        Some(session) => signal_group_kill(&session.master),
+                        None => false,
+                    }
+                };
+                if !killed_via_pgid {
+                    let _ = child.kill();
+                }
+            }
+        } else if !pgid_signal_ok {
+            // child 被 EOF wait 任务 take 走且 pgid SIGHUP 也发不出——只能等
+            // EOF wait 任务自然完成。这种竞态只在 reader EOF 与 abort 同时发生
+            // 时出现，EOF wait 任务会处理。
+        }
+
+        // 第 3 步：短锁还回 child（若 session 仍存在）。killed 已在第 1 步置 true。
+        if let Some(child) = child_opt {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(&handle.agent_id) {
+                session.child = Some(child);
+            }
+            // 若 session 已被 stop 移除，child 在此 drop——资源回收。
+        }
+        Ok(())
+    }
+
+    async fn liveness(&self, handle: &AgentHandle) -> Liveness {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get_mut(&handle.agent_id) else {
+            return Liveness::Dead;
+        };
+        // child 可能在 reader-EOF wait 窗口期被 take 走（None）。此时 child
+        // 正在被 wait 收尸——EOF 意味着死亡已迫在眉睫，按 Dead 处理：
+        // Supervisor reap 看见 Dead 不会重复 abort（reap 只对 Alive 发 abort）。
+        let Some(child) = session.child.as_mut() else {
+            return Liveness::Dead;
+        };
+        // try_wait 不阻塞：返回 Some → 已退出 → Dead；None → 仍活 → Alive。
+        match child.try_wait() {
+            Ok(Some(_)) => Liveness::Dead,
+            Ok(None) => Liveness::Alive,
+            Err(_) => Liveness::Dead, // wait 出错通常意味着僵尸进程已不可达。
+        }
+    }
+
+    async fn stop(&self, handle: &AgentHandle) -> Result<(), RuntimeError> {
+        // P2/M1 修复：原实现 `remove` 后**仍持锁**跨 grace 轮询 + `child.wait()`
+        // ——虽然 session 已被移出 map（不影响其它 agent 查表），但 `sessions`
+        // 这把锁本身仍被持有，会阻塞其它 agent 的 send/abort/liveness/stop 和
+        // Supervisor 的 reap。修：`remove` 后**立即 drop 锁**，session 转为本地
+        // 所有权，所有后续工作（SIGHUP → grace → SIGKILL → wait）全在锁外。
+        let Some(mut session) = ({
+            let mut sessions = self.sessions.lock().await;
+            sessions.remove(&handle.agent_id)
+        }) else {
+            return Ok(()); // 幂等。
+        };
+        // 到这里锁已释放，session 是本地所有权。后续不再触碰 `self.sessions`。
+
+        if !session.killed {
+            // 复用 abort 的进程组 kill 逻辑：SIGHUP → grace → SIGKILL。
+            // signal_group_* 是平台门控 helper（Unix 走进程组，Windows 返回 false）。
+            let _ = signal_group_hup(&session.master);
+            if let Some(child) = session.child.as_mut() {
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(300);
+                if !wait_grace_deadline(child, deadline) {
+                    let kill_ok = signal_group_kill(&session.master);
+                    if !kill_ok {
+                        let _ = child.kill();
+                    }
+                }
+            }
+            session.killed = true;
+        }
+        // 阻塞 wait：相对 abort 多一步回收资源，避免僵尸。
+        // child 可能在 EOF wait 窗口被 take 走（None），此时 wait 由 EOF 任务做。
+        if let Some(child) = session.child.as_mut() {
+            let _ = child.wait();
+        }
+        // 显式 drop：释放 writer / master，PTY 句柄关掉。
+        drop(session);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    /// 辅助：构造一个 `RuntimeStartSpec`，cwd = 给定路径。
+    fn spec(agent_id: &str, cwd: PathBuf) -> RuntimeStartSpec {
+        RuntimeStartSpec {
+            agent_id: agent_id.to_string(),
+            cwd,
+            model: "claude-test".to_string(),
+            provider: "claude".to_string(),
+        }
+    }
+
+    /// 辅助：从 receiver 收集事件，直到收到 `Done`（或 channel 关闭）。
+    ///
+    /// 不在 assertion 里用 `time::sleep`（避免 nondeterminism）：PTY 子进程的输出
+    /// 在 send 后已发出，调度循环总能跑到。用 `yield_now` 让出调度，最多等 2000
+    /// 次以兜底（远大于任何实际所需）。
+    async fn collect_events(mut rx: mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
+        let mut out = Vec::new();
+        for _ in 0..2000 {
+            match rx.try_recv() {
+                Ok(ev) => {
+                    let is_done = matches!(ev, AgentEvent::Done { .. });
+                    out.push(ev);
+                    if is_done {
+                        // Done 是终止事件；channel 可能还有缓冲事件，drain 之。
+                        while let Ok(extra) = rx.try_recv() {
+                            out.push(extra);
+                        }
+                        return out;
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => return out,
+            }
+        }
+        out
+    }
+
+    // ===== Step 1: happy path —— echo hi; exit 0 → TextDelta("hi") + Done{success:true} =====
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn happy_path_echo_then_done_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = CliRuntime::new(vec![
+            "bash".into(),
+            "-c".into(),
+            "echo hi; exit 0".into(),
+        ]);
+        let handle = rt
+            .start(spec("a1", tmp.path().to_path_buf()))
+            .await
+            .expect("start ok");
+        let rx = rt.send(&handle, "".into()).await.expect("send ok");
+        let events = collect_events(rx).await;
+
+        // 期望：至少一个 TextDelta 含 "hi"；至少一个 Done{success:true}。
+        let has_hi = events.iter().any(|ev| {
+            matches!(ev, AgentEvent::TextDelta(t) if t.contains("hi"))
+        });
+        let has_done_ok = events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::Done { success: true, .. }));
+        assert!(has_hi, "应有 TextDelta 含 'hi'，实际: {events:?}");
+        assert!(has_done_ok, "应有 Done{{success:true}}，实际: {events:?}");
+
+        rt.stop(&handle).await.expect("stop ok");
+    }
+
+    // ===== Step 1b: 非零退出 → Done{success:false} =====
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_zero_exit_yields_done_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = CliRuntime::new(vec![
+            "bash".into(),
+            "-c".into(),
+            "echo oops 1>&2; exit 1".into(),
+        ]);
+        let handle = rt
+            .start(spec("a2", tmp.path().to_path_buf()))
+            .await
+            .expect("start ok");
+        let rx = rt.send(&handle, "".into()).await.expect("send ok");
+        let events = collect_events(rx).await;
+
+        let has_done_fail = events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::Done { success: false, .. }));
+        assert!(has_done_fail, "应有 Done{{success:false}}，实际: {events:?}");
+
+        rt.stop(&handle).await.expect("stop ok");
+    }
+
+    // ===== Step 3: 多行输出 → 两个 TextDelta + Done{success:true} =====
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_line_output_yields_two_text_deltas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = CliRuntime::new(vec![
+            "bash".into(),
+            "-c".into(),
+            "echo a; echo b; exit 0".into(),
+        ]);
+        let handle = rt
+            .start(spec("a3", tmp.path().to_path_buf()))
+            .await
+            .expect("start ok");
+        let rx = rt.send(&handle, "".into()).await.expect("send ok");
+        let events = collect_events(rx).await;
+
+        // 期望：至少两个 TextDelta（含 "a" 和 "b"），加一个 Done{success:true}。
+        let text_deltas: Vec<String> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                AgentEvent::TextDelta(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        let has_a = text_deltas.iter().any(|t| t.contains('a'));
+        let has_b = text_deltas.iter().any(|t| t.contains('b'));
+        let has_done_ok = events
+            .iter()
+            .any(|ev| matches!(ev, AgentEvent::Done { success: true, .. }));
+        assert!(
+            has_a,
+            "应有 TextDelta 含 'a'，实际 text_deltas: {text_deltas:?}"
+        );
+        assert!(
+            has_b,
+            "应有 TextDelta 含 'b'，实际 text_deltas: {text_deltas:?}"
+        );
+        assert!(has_done_ok, "应有 Done{{success:true}}，实际: {events:?}");
+
+        rt.stop(&handle).await.expect("stop ok");
+    }
+
+    // ===== Step 4: abort 长任务后 liveness == Dead =====
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abort_long_running_makes_liveness_dead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = CliRuntime::new(vec![
+            "bash".into(),
+            "-c".into(),
+            // sleep 30 是子进程自己的指令，不依赖 stdin 输入。
+            "sleep 30".into(),
+        ]);
+        let handle = rt
+            .start(spec("a4", tmp.path().to_path_buf()))
+            .await
+            .expect("start ok");
+        // 让 reader 启动（spawn_blocking 进入阻塞读）。send 一条空 prompt 即可。
+        let _rx = rt.send(&handle, "".into()).await.expect("send ok");
+
+        // 先确认进程是 alive（spawn 后立即 check）。
+        let liveness_before = rt.liveness(&handle).await;
+        assert_eq!(liveness_before, Liveness::Alive, "spawn 后应 Alive");
+
+        // abort：发 SIGHUP/SIGKILL。
+        rt.abort(&handle).await.expect("abort ok");
+
+        // 等子进程真的退出（kill 是异步的：SIGHUP 发出后内核调度子进程退出）。
+        // 用 bounded 轮询 + try_wait 探测，最多等 ~2s（远超 kill 传播延迟）。
+        // 这是必要的 exception —— kill 是异步内核信号，无法纯 yield 等待。
+        let mut dead = false;
+        for _ in 0..400 {
+            if rt.liveness(&handle).await == Liveness::Dead {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(dead, "abort 后 liveness 应为 Dead");
+
+        rt.stop(&handle).await.expect("stop ok");
+    }
+
+    // ===== 容错：未知 agent_id 的 abort/stop/liveness 幂等返回 =====
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unknown_agent_id_is_idempotent() {
+        let _tmp = tempfile::tempdir().unwrap();
+        let rt = CliRuntime::new(vec!["bash".into(), "-c".into(), "true".into()]);
+
+        let ghost = AgentHandle {
+            agent_id: "nope".to_string(),
+        };
+        rt.abort(&ghost).await.expect("abort 幂等");
+        rt.stop(&ghost).await.expect("stop 幂等");
+        assert_eq!(rt.liveness(&ghost).await, Liveness::Dead);
+
+        // capabilities 不依赖 session，应直接返回 degraded tier。
+        let caps = rt.capabilities();
+        assert!(!caps.structured_events);
+        assert!(!caps.supports_resume);
+        assert!(!caps.supports_permission_prompt);
+    }
+
+    // ===== capabilities 标记 degraded tier =====
+
+    #[test]
+    fn capabilities_is_degraded_tier() {
+        let rt = CliRuntime::new(vec!["bash".into()]);
+        let caps = rt.capabilities();
+        assert!(
+            !caps.structured_events,
+            "CliRuntime 必须 structured_events=false"
+        );
+        assert!(!caps.supports_resume);
+        assert!(!caps.supports_permission_prompt);
+    }
+
+    // ===== C2 验证：abort 一个忽略 SIGHUP 的命令 → 必须 SIGKILL 兜底 =====
+    //
+    // 旧的 `clone_killer().kill()` 只发 SIGHUP；trap "" HUP 后进程不死。
+    // 新实现先 SIGHUP 进程组，grace 内未退出再 SIGKILL 进程组兜底。
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abort_kills_process_that_ignores_sighup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = CliRuntime::new(vec![
+            "bash".into(),
+            "-c".into(),
+            // trap "" HUP 让 bash（及其 sleep 子进程）忽略 SIGHUP。
+            // 只有 SIGKILL 能终止。sleep 30 保证不自然退出。
+            "trap \"\" HUP; sleep 30".into(),
+        ]);
+        let handle = rt
+            .start(spec("a5", tmp.path().to_path_buf()))
+            .await
+            .expect("start ok");
+        // 让 reader 启动并进入阻塞读。
+        let _rx = rt.send(&handle, "".into()).await.expect("send ok");
+
+        // 确认进程 alive。
+        let liveness_before = rt.liveness(&handle).await;
+        assert_eq!(liveness_before, Liveness::Alive, "spawn 后应 Alive");
+
+        // abort：SIGHUP 被忽略 → 必须走 SIGKILL 兜底。
+        rt.abort(&handle).await.expect("abort ok");
+
+        // 轮询 liveness：SIGKILL 是异步内核信号，最多等 ~3s（覆盖 grace + 调度）。
+        let mut dead = false;
+        for _ in 0..600 {
+            if rt.liveness(&handle).await == Liveness::Dead {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            dead,
+            "abort 后 liveness 应为 Dead（SIGHUP 被忽略，SIGKILL 兜底必须生效）"
+        );
+
+        rt.stop(&handle).await.expect("stop ok");
+    }
+
+    // ===== I1 验证：PTY echo 关闭后，send 的 prompt 不会回显成 TextDelta =====
+    //
+    // 旧行为：cooked 模式 PTY 把 `prompt + "\n"` 回显回 reader → TextDelta 被污染。
+    // 新行为：start 时 tcsetattr 清 ECHO，send 的 prompt 不再出现在 TextDelta 里。
+    // 用 `cat` 作为子进程（cat 会把 stdin 行原样回显到 stdout —— 这是 cat 自己的
+    // 输出，不是 PTY 的 echo）。验证：
+    //   - 发送 "sentinel-prompt-xyz"；
+    //   - TextDelta 里**不应**出现 echo（PTY 关 ECHO 前会有两条：一条 PTY echo，
+    //     一条 cat 输出；关 ECHO 后只剩 cat 的真实输出）；
+    //   - 但 cat 的真实回显输出应出现（证明管道仍通）。
+    //
+    // 判定 echo 是否真的关掉：数 "sentinel-prompt-xyz" 在 TextDelta 里出现的次数。
+    // 关 ECHO：最多 1 次（cat 自己的回显）。
+    // 没关 ECHO：2 次（PTY echo + cat 回显）。
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pty_echo_disabled_send_prompt_not_echoed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // cat：读 stdin 一行，原样写回 stdout（cat 自己的输出，非 PTY echo）。
+        let rt = CliRuntime::new(vec!["cat".into()]);
+        let handle = rt
+            .start(spec("a6", tmp.path().to_path_buf()))
+            .await
+            .expect("start ok");
+
+        let sentinel = "sentinel-prompt-xyz";
+        let mut rx = rt.send(&handle, sentinel.into()).await.expect("send ok");
+
+        // cat 不会自己退出；collect_events 会一直等到 channel 关闭或 Done。
+        // 我们不期望 Done（cat 不退出），所以只收集一小段时间的事件。
+        // 用 bounded 轮询：最多 ~500ms， drain 已到达的事件。
+        let mut text_deltas: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                ev = rx.recv() => match ev {
+                    Some(AgentEvent::TextDelta(t)) => text_deltas.push(t),
+                    Some(_) => { /* Done/Failed 不期望，忽略 */ }
+                    None => break,
+                }
+            }
+        }
+
+        // 关 ECHO 后：sentinel 最多出现 1 次（cat 的真实回显）。
+        // 若 ECHO 没关：会出现 2 次（PTY echo + cat 回显）。
+        let sentinel_count = text_deltas
+            .iter()
+            .filter(|t| t.contains(sentinel))
+            .count();
+        assert!(
+            sentinel_count <= 1,
+            "PTY echo 应已关闭：sentinel 在 TextDelta 中最多出现 1 次（cat 的真实回显），\
+             实际 {sentinel_count} 次。text_deltas: {text_deltas:?}"
+        );
+        // 同时证明管道仍通：cat 至少回显过一次（sentinel_count >= 1）。
+        assert!(
+            sentinel_count >= 1,
+            "cat 应至少回显一次 sentinel（证明 stdin→stdout 管道通），\
+             实际 {sentinel_count} 次。text_deltas: {text_deltas:?}"
+        );
+
+        // 清理：stop 杀掉 cat（会走 SIGHUP+SIGKILL 进程组路径）。
+        rt.stop(&handle).await.expect("stop ok");
+    }
+}

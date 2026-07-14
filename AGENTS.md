@@ -13,6 +13,12 @@ This repository is a Tauri desktop app with a React + TypeScript frontend.
 - `src-tauri/`: Rust backend (`models/`, `services/`, `utils/`, command wiring in `lib.rs`).
 - `public/`: static files. `dist/` and `src-tauri/target/` are generated outputs; do not edit manually.
 
+## Code Exploration (prefer CodeGraph over blind grep)
+This repo ships a **CodeGraph** index at `.codegraph/codegraph.db` (gitignored — do not commit). When exploring code, prefer CodeGraph over repo-wide `grep`/`find` for structural questions (where a symbol is defined, who calls it, what a change impacts) — one call returns blast radius + line-numbered source + call paths.
+- MCP tools (preferred when installed): `codegraph_explore`, `codegraph_node`. Install via `codegraph install`.
+- CLI equivalents (same output): `codegraph explore <query>`, `codegraph node <name>`, `codegraph query <search>`, `codegraph callers <symbol>`, `codegraph callees <symbol>`, `codegraph impact <symbol>`. Run `codegraph sync` after edits to refresh the index.
+- Still use `grep` for plain text / string literals / comments / config values — CodeGraph indexes symbols, not arbitrary text.
+
 ## Build, Test, and Development Commands
 - `npm install`: install JavaScript dependencies.
 - `npm run dev`: run Vite frontend locally.

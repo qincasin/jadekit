@@ -14,6 +14,7 @@ pub mod provider_router;
 pub mod providers;
 pub mod server;
 pub mod session;
+pub mod takeover;
 pub mod thinking_budget_rectifier;
 pub mod thinking_rectifier;
 pub mod types;

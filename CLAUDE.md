@@ -25,6 +25,34 @@ npm run tauri dev    # 开发模式
 npm run tauri build  # 生产构建
 ```
 
+## 代码探索（优先用 codegraph，不要盲目 grep）
+
+本仓库已用 **CodeGraph** 建好代码知识图谱，索引文件在 `.codegraph/codegraph.db`（已被 `.gitignore`，**不要提交**）。
+AI agent 探索代码时**优先用 codegraph，而不是 `grep`/`find` 全仓库盲搜**——尤其是"某符号在哪定义 / 谁调用了它 / 改它会影响什么"这类结构性问题，codegraph 一次就能返回 blast radius + 逐行源码 + 调用链。
+
+### MCP 工具（已安装时优先）
+- `codegraph_explore` — 给一段自然语言或符号，返回相关符号源码 + 调用路径
+- `codegraph_node` — 单个符号的源码 + caller/callee 轨迹，或带行号读文件 + 依赖方
+
+> 装 MCP：`codegraph install`（可装进 Claude Code / Codex CLI / Cursor 等）。
+
+### CLI（MCP 未安装时等价使用，输出与 MCP 工具一致）
+```bash
+codegraph explore <query...>   # = codegraph_explore：相关符号源码 + 调用路径
+codegraph node <name>          # = codegraph_node：单符号源码 + 调用链
+codegraph query <search>       # 按符号名搜索
+codegraph callers <symbol>     # 谁调用了它
+codegraph callees <symbol>     # 它调用了谁
+codegraph impact <symbol>      # 改它会影响哪些代码
+codegraph sync                 # 改完代码后增量更新索引
+codegraph status               # 查看索引状态
+```
+
+### 适用边界
+- 找符号定义 / 调用关系 / 影响面 → 用 codegraph
+- 找纯文本 / 字符串字面量 / 注释 / 配置值 → 仍用 grep（codegraph 是符号图，不索引任意文本）
+- 索引落后于改动时，先 `codegraph sync` 再查
+
 ## 架构
 
 ```

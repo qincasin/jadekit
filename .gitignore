@@ -50,3 +50,6 @@ designs
 
 # codegraph 本地工具数据库（勿入库）
 .codegraph/
+
+# superpowers SDD 工作产物（task brief/report/review/progress，本地 scratch，勿入库）
+.superpowers/

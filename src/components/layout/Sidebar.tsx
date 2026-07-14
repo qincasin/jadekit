@@ -5,7 +5,7 @@ import { useConfigStore } from '../../stores/useConfigStore';
 import Logo from './Logo';
 import {
     LayoutDashboard, Key, Globe, FileText, Zap,
-    Bot, FolderOpen, Settings, Server, Rocket, MessageSquare
+    Bot, FolderOpen, Settings, Server, Rocket, MessageSquare, // Compass - Helm 图标暂时不使用
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -15,6 +15,7 @@ interface SidebarProps {
 const mainNavItems = [
     { path: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard' },
     { path: '/chat', icon: MessageSquare, labelKey: 'nav.chat' },
+    // { path: '/chat?helm=true', icon: Compass, labelKey: 'nav.helm' }, // Helm 入口暂时关闭
     { path: '/providers', icon: Key, labelKey: 'nav.providers' },
     { path: '/antigravity', icon: Rocket, labelKey: 'nav.antigravity' },
     { path: '/proxy', icon: Server, labelKey: 'nav.proxy' },

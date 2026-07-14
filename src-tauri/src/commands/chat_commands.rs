@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::{AppHandle, State};
 
-use crate::chat::ChatManager;
+use crate::chat::{ChatManager, DiffSummary, MergeOutcome, WorktreeInfo, WorktreeManager};
+
+const HELM_WORKTREES_DIR_NAME: &str = "helm-worktrees";
 
 /// 当前聊天工作目录的只读工作区状态。
 #[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
@@ -24,6 +26,30 @@ pub struct ChatWorkspaceStatus {
 pub struct ChatGitBranch {
     pub name: String,
     pub current: bool,
+}
+
+/// 一个 Helm worktree（给前端展示与绑定 cwd）。
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeInfoDto {
+    pub path: String,
+    pub branch: String,
+}
+
+/// worktree 相对 HEAD 的 diff 摘要。
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffSummaryDto {
+    pub files_changed: u32,
+    pub insertions: u32,
+    pub deletions: u32,
+}
+
+/// worktree merge 的结果；outcome 使用前端稳定字符串。
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeOutcomeDto {
+    pub outcome: String,
 }
 
 /// 一个工作目录文件项（供 `@` 文件引用补全使用）。
@@ -210,6 +236,42 @@ fn resolve_existing_chat_directory(path: String, label: &str) -> Result<PathBuf,
     Ok(path)
 }
 
+fn repo_worktrees_dir(repo_root: &Path) -> Result<PathBuf, String> {
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("repo");
+    crate::services::app_paths::data_subdir(HELM_WORKTREES_DIR_NAME)
+        .map(|root| root.join(repo_name))
+        .map_err(|e| format!("定位 Helm worktrees 目录失败: {e}"))
+}
+
+fn worktree_info_dto(info: WorktreeInfo) -> WorktreeInfoDto {
+    WorktreeInfoDto {
+        path: info.path.to_string_lossy().to_string(),
+        branch: info.branch,
+    }
+}
+
+fn diff_summary_dto(summary: DiffSummary) -> DiffSummaryDto {
+    DiffSummaryDto {
+        files_changed: summary.files_changed,
+        insertions: summary.insertions,
+        deletions: summary.deletions,
+    }
+}
+
+fn merge_outcome_dto(outcome: MergeOutcome) -> MergeOutcomeDto {
+    let outcome = match outcome {
+        MergeOutcome::Merged => "merged",
+        MergeOutcome::Conflict => "conflict",
+    };
+    MergeOutcomeDto {
+        outcome: outcome.to_string(),
+    }
+}
+
 fn normalize_chat_git_branch_name(branch_name: &str) -> Result<String, String> {
     let branch = branch_name.trim();
     if branch.is_empty() {
@@ -327,41 +389,68 @@ fn list_chat_git_branches_for_path(cwd: &Path) -> Result<Vec<ChatGitBranch>, Str
     Ok(branches)
 }
 
+/// 解析命令入参 agent_id：None 或空 → 默认 agent；否则归一化（去空白/路径分隔符）。
+fn resolve_agent_id(agent_id: Option<String>) -> crate::chat::AgentId {
+    crate::chat::sanitize_agent_id(agent_id.as_deref().unwrap_or(crate::chat::DEFAULT_AGENT_ID))
+}
+
+/// 计算某 session（= agent）的 permission 响应目录：`<permission_root>/<session_id>`。
+/// 多 agent 下每个 daemon 只读自己子目录的响应文件，故响应必须落到对应子目录。
+fn agent_permission_dir(root: &Path, session_id: &str) -> PathBuf {
+    root.join(session_id)
+}
+
 /// Send a chat message and stream the response via "chat://stream"/"chat://done".
 ///
-/// `provider` is "claude" or "codex". `command` is the ai-bridge verb, e.g.
-/// "send". `params` is the payload (message, sessionId, model, cwd, …).
-/// Returns the request id for correlating streamed events.
+/// `agent_id` 缺省回退默认 agent（兼容旧前端）。`provider` is "claude" or "codex".
+/// `command` is the ai-bridge verb, e.g. "send". `params` is the payload
+/// (message, sessionId, model, cwd, …). Returns the request id for correlating
+/// streamed events.
 #[tauri::command]
 pub async fn chat_send(
+    agent_id: Option<String>,
     provider: String,
     command: String,
     params: Value,
     state: State<'_, ChatState>,
 ) -> Result<String, String> {
+    let agent = resolve_agent_id(agent_id);
     let method = format!("{provider}.{command}");
-    state.manager.send(method, params).await
+    state.manager.send(agent, method, params).await
 }
 
-/// Abort the current in-flight turn.
+/// Abort the current in-flight turn for the given agent (`agent_id` 缺省回退默认 agent)。
 #[tauri::command]
-pub async fn chat_abort(state: State<'_, ChatState>) -> Result<(), String> {
-    state.manager.abort().await
+pub async fn chat_abort(
+    agent_id: Option<String>,
+    state: State<'_, ChatState>,
+) -> Result<(), String> {
+    let agent = resolve_agent_id(agent_id);
+    state.manager.abort(agent).await
 }
 
-/// Whether the daemon is running.
+/// Whether the given agent's daemon is running (`agent_id` 缺省回退默认 agent)。
 #[tauri::command]
-pub async fn chat_is_running(state: State<'_, ChatState>) -> Result<bool, String> {
-    Ok(state.manager.is_running().await)
+pub async fn chat_is_running(
+    agent_id: Option<String>,
+    state: State<'_, ChatState>,
+) -> Result<bool, String> {
+    let agent = resolve_agent_id(agent_id);
+    Ok(state.manager.is_running(&agent).await)
 }
 
 /// Explicitly start the daemon (otherwise it starts lazily on first send).
+/// `agent_id` 缺省回退默认 agent。
 #[tauri::command]
-pub async fn chat_start_daemon(state: State<'_, ChatState>) -> Result<(), String> {
+pub async fn chat_start_daemon(
+    agent_id: Option<String>,
+    state: State<'_, ChatState>,
+) -> Result<(), String> {
     // A no-op send path: starting happens inside the manager's lazy init.
     // We trigger it via is_running which forces client init only on send, so
     // instead expose a dedicated warm-up by sending a heartbeat-like start.
-    state.manager.warm_up().await
+    let agent = resolve_agent_id(agent_id);
+    state.manager.warm_up(agent).await
 }
 
 /// 发送系统级桌面通知，用于聊天任务完成/失败/中断后的右下角提示。
@@ -437,6 +526,80 @@ pub fn chat_git_create_and_checkout_branch(
     resolve_chat_workspace_status(Some(repo_root.to_string_lossy().to_string()))
 }
 
+/// 为 Helm agent 创建独立 worktree，并返回其路径与分支名。
+#[tauri::command]
+pub fn helm_worktree_create(repo_root: String, name: String) -> Result<WorktreeInfoDto, String> {
+    let cwd = resolve_existing_chat_directory(repo_root, "Git 仓库")?;
+    let (repo_root, _) = resolve_git_repository(&cwd)?;
+    let worktrees_dir = repo_worktrees_dir(&repo_root)?;
+    WorktreeManager::create(&repo_root, &worktrees_dir, name.trim()).map(worktree_info_dto)
+}
+
+/// 删除 Helm worktree。非 force 时底层会先做脏检查，拒绝删除有改动的工作树。
+#[tauri::command]
+pub fn helm_worktree_remove(
+    repo_root: String,
+    worktree_path: String,
+    force: bool,
+) -> Result<(), String> {
+    let cwd = resolve_existing_chat_directory(repo_root, "Git 仓库")?;
+    let (repo_root, _) = resolve_git_repository(&cwd)?;
+    let worktree_path = resolve_existing_chat_directory(worktree_path, "worktree 路径")?;
+    WorktreeManager::remove(&repo_root, &worktree_path, force)
+}
+
+/// 列出指定 Git 仓库下的所有 worktree。
+#[tauri::command]
+pub fn helm_worktree_list(repo_root: String) -> Result<Vec<WorktreeInfoDto>, String> {
+    let cwd = resolve_existing_chat_directory(repo_root, "Git 仓库")?;
+    let (repo_root, _) = resolve_git_repository(&cwd)?;
+    WorktreeManager::list(&repo_root)
+        .map(|items| items.into_iter().map(worktree_info_dto).collect())
+}
+
+/// 返回 worktree 相对 HEAD 的 diff 摘要。
+#[tauri::command]
+pub fn helm_worktree_diff(worktree_path: String) -> Result<DiffSummaryDto, String> {
+    let worktree_path = resolve_existing_chat_directory(worktree_path, "worktree 路径")?;
+    WorktreeManager::diff_summary(&worktree_path).map(diff_summary_dto)
+}
+
+/// 把赢家 worktree 分支合并进当前仓库分支；冲突时底层会自动 abort 回滚。
+#[tauri::command]
+pub fn helm_worktree_merge(
+    repo_root: String,
+    source_branch: String,
+) -> Result<MergeOutcomeDto, String> {
+    let cwd = resolve_existing_chat_directory(repo_root, "Git 仓库")?;
+    let (repo_root, _) = resolve_git_repository(&cwd)?;
+    WorktreeManager::merge_into_current(&repo_root, source_branch.trim()).map(merge_outcome_dto)
+}
+
+/// 关闭 Helm agent，并可选删除其 worktree（删除前由 WorktreeManager 做脏检查）。
+#[tauri::command]
+pub async fn helm_close_agent(
+    agent_id: String,
+    remove_worktree: bool,
+    repo_root: Option<String>,
+    worktree_path: Option<String>,
+    force: bool,
+    state: State<'_, ChatState>,
+) -> Result<(), String> {
+    let agent = resolve_agent_id(Some(agent_id));
+    state.manager.close_agent(agent).await;
+
+    if !remove_worktree {
+        return Ok(());
+    }
+
+    let repo_root = repo_root.ok_or_else(|| "删除 worktree 需要 Git 仓库路径".to_string())?;
+    let worktree_path = worktree_path.ok_or_else(|| "删除 worktree 需要 worktree 路径".to_string())?;
+    let cwd = resolve_existing_chat_directory(repo_root, "Git 仓库")?;
+    let (repo_root, _) = resolve_git_repository(&cwd)?;
+    let worktree_path = resolve_existing_chat_directory(worktree_path, "worktree 路径")?;
+    WorktreeManager::remove(&repo_root, &worktree_path, force)
+}
+
 /// 列出所有 SDK 的安装状态（Claude / Codex）。
 #[tauri::command]
 pub async fn chat_sdk_status(
@@ -478,10 +641,15 @@ pub async fn chat_uninstall_sdk(sdk_id: String, state: State<'_, ChatState>) -> 
     state.manager.uninstall_sdk(sdk_id).await
 }
 
-/// 重启 daemon（用于手动刷新）。
+/// 重启 daemon（用于手动刷新 / SDK 安装后）。
+/// `agent_id = None` 重启所有在跑 daemon（deps 目录共享）；指定则只重启该 agent。
 #[tauri::command]
-pub async fn chat_restart_daemon(state: State<'_, ChatState>) -> Result<(), String> {
-    state.manager.restart_daemon().await
+pub async fn chat_restart_daemon(
+    agent_id: Option<String>,
+    state: State<'_, ChatState>,
+) -> Result<(), String> {
+    let agent = agent_id.map(|raw| crate::chat::sanitize_agent_id(&raw));
+    state.manager.restart_daemon(agent).await
 }
 
 /// 列出 Slash 命令，用于输入框 `/` 补全。
@@ -517,8 +685,13 @@ pub async fn permission_respond_ask_user_question(
     answers: std::collections::HashMap<String, String>,
     state: State<'_, ChatState>,
 ) -> Result<(), String> {
-    let perm_dir = crate::chat::permission_dir(state.manager.app())?;
     let session_id = crate::chat::permission_response_session_id(session_id);
+    // 多 agent：响应写到该 agent 的 permission 子目录（daemon 只读自己子目录）。
+    let perm_dir = agent_permission_dir(
+        &crate::chat::permission_dir(state.manager.app())?,
+        &session_id,
+    );
+    let _ = std::fs::create_dir_all(&perm_dir);
     crate::chat::write_ask_user_question_response(&perm_dir, &session_id, &request_id, answers)
 }
 
@@ -533,8 +706,12 @@ pub async fn permission_respond_tool(
     allow: bool,
     state: State<'_, ChatState>,
 ) -> Result<(), String> {
-    let perm_dir = crate::chat::permission_dir(state.manager.app())?;
     let session_id = crate::chat::permission_response_session_id(session_id);
+    let perm_dir = agent_permission_dir(
+        &crate::chat::permission_dir(state.manager.app())?,
+        &session_id,
+    );
+    let _ = std::fs::create_dir_all(&perm_dir);
     crate::chat::write_tool_permission_response(&perm_dir, &session_id, &request_id, allow)
 }
 
@@ -661,8 +838,12 @@ pub async fn permission_respond_plan_approval(
     message: Option<String>,
     state: State<'_, ChatState>,
 ) -> Result<(), String> {
-    let perm_dir = crate::chat::permission_dir(state.manager.app())?;
     let session_id = crate::chat::permission_response_session_id(session_id);
+    let perm_dir = agent_permission_dir(
+        &crate::chat::permission_dir(state.manager.app())?,
+        &session_id,
+    );
+    let _ = std::fs::create_dir_all(&perm_dir);
     crate::chat::write_plan_approval_response(
         &perm_dir,
         &session_id,
@@ -848,6 +1029,20 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn agent_permission_dir_routes_to_session_subdir() {
+        let root = PathBuf::from("/tmp/perm");
+        // 多 agent：响应文件必须落到该 agent 的 permission 子目录，daemon 才读得到。
+        assert_eq!(
+            agent_permission_dir(&root, "agent-7"),
+            PathBuf::from("/tmp/perm/agent-7")
+        );
+        assert_eq!(
+            agent_permission_dir(&root, "default"),
+            PathBuf::from("/tmp/perm/default")
+        );
+    }
 
     fn unique_test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

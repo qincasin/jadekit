@@ -36,6 +36,18 @@ import {
 import {CHAT_DAEMON_READY_TIMEOUT_ERROR_KEY} from '../utils/chatDaemonStatus';
 import {CHAT_MODEL_SELECTION_KEY_PREFIX, getDefaultChatModelId,} from '../utils/chatModels';
 import {getNextTabAfterClose} from '../utils/chatUiBehavior';
+import {
+    closeAgent,
+    createWorktree,
+    type HelmDiffSummary,
+    mergeWorktree,
+    removeWorktree,
+    worktreeDiff,
+} from '../services/worktreeService';
+import {resolveSendCwd} from './chatSendCwd';
+import {resolveTabForEvent} from './chatEventRouting';
+import type {FanoutPlan} from './fanoutPlan';
+import {worktreesToRollback} from './fanoutRollback';
 
 const DRAFT_KEY_PREFIX = 'ccg-chat-draft:';
 const REASONING_KEY = 'ccg-chat-reasoning';
@@ -304,6 +316,8 @@ type ChatTabStatus = 'idle' | 'loading' | 'running' | 'queued' | 'error';
 
 export interface ChatSessionTab {
     key: string;
+    /** 该 tab 绑定的 agent id（daemon 池键），创建时生成、生命周期内稳定。 */
+    agentId: string;
     messages: ChatMessage[];
     provider: ChatProvider;
     permissionMode: PermissionMode;
@@ -316,6 +330,10 @@ export interface ChatSessionTab {
     activeRequestId: string | null;
     sessionId: string | null;
     currentCwd: string | null;
+    worktreePath: string | null;
+    worktreeBranch: string | null;
+    worktreeDiff: HelmDiffSummary | null;
+    fanoutGroupId: string | null;
     activeSession: SessionMeta | null;
     pendingSessionKey: string | null;
     lastSessionLoadMetrics: ChatSessionLoadMetrics | null;
@@ -364,8 +382,17 @@ interface ChatState {
     activeRequestId: string | null;
     /** 当前会话 id（由 daemon 的 SESSION_ID 回填） */
     sessionId: string | null;
+    /** 当前活跃 tab 绑定的 agent id（daemon 池键）；顶层状态是活跃 tab 的投影。 */
+    agentId: string;
     /** 当前会话关联的工作目录，供 @ 文件补全和 daemon cwd 使用 */
     currentCwd: string | null;
+    /** 当前 Agent 绑定的独立 worktree 路径；发送时优先作为 daemon cwd。 */
+    worktreePath: string | null;
+    /** 当前 Agent worktree 分支名与 diff 摘要，用于 tab 徽章。 */
+    worktreeBranch: string | null;
+    worktreeDiff: HelmDiffSummary | null;
+    /** 当前 tab 所属的扇出组 id；非扇出 tab 为 null。 */
+    fanoutGroupId: string | null;
     /** 当前从历史中载入的会话元信息 */
     activeSession: SessionMeta | null;
     /** 当前正在切换/加载中的历史会话 key */
@@ -415,7 +442,11 @@ interface ChatState {
         model?: string;
         attachments?: ChatAttachment[];
         displayText?: string;
+        createWorktree?: boolean;
     }) => Promise<boolean>;
+    launchFanout: (repoRoot: string, plan: FanoutPlan) => Promise<void>;
+    discardFanoutAgent: (tabKey: string) => Promise<void>;
+    mergeFanoutWinner: (tabKey: string) => Promise<'merged' | 'conflict'>;
     loadSession: (session: SessionMeta) => Promise<void>;
     loadActiveSessionFullHistory: () => Promise<ChatMessage[] | null>;
     expandActiveSessionHistory: () => Promise<void>;
@@ -445,6 +476,11 @@ function newId(): string {
     return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** 生成一个稳定的 agent id（daemon 池键）。crypto.randomUUID 在 WebView 与 Node 测试环境均可用。 */
+function createAgentId(): string {
+    return crypto.randomUUID();
+}
+
 function createDraftTabKey(): string {
     return `draft:${newId()}`;
 }
@@ -457,6 +493,7 @@ function createTabFromState(
     const now = overrides.updatedAt ?? overrides.createdAt ?? 0;
     return {
         key,
+        agentId: state.agentId,
         messages: state.messages,
         provider: state.provider,
         permissionMode: state.permissionMode,
@@ -469,6 +506,10 @@ function createTabFromState(
         activeRequestId: state.activeRequestId,
         sessionId: state.sessionId,
         currentCwd: state.currentCwd,
+        worktreePath: state.worktreePath,
+        worktreeBranch: state.worktreeBranch,
+        worktreeDiff: state.worktreeDiff,
+        fanoutGroupId: state.fanoutGroupId,
         activeSession: state.activeSession,
         pendingSessionKey: state.pendingSessionKey,
         lastSessionLoadMetrics: state.lastSessionLoadMetrics,
@@ -490,6 +531,7 @@ function createEmptyTabFromState(
 ): ChatSessionTab {
     return {
         key,
+        agentId: createAgentId(),
         messages: [],
         provider: state.provider,
         permissionMode: state.permissionMode,
@@ -502,6 +544,10 @@ function createEmptyTabFromState(
         activeRequestId: null,
         sessionId: null,
         currentCwd: cwd ?? state.currentCwd,
+        worktreePath: null,
+        worktreeBranch: null,
+        worktreeDiff: null,
+        fanoutGroupId: null,
         activeSession: null,
         pendingSessionKey: null,
         lastSessionLoadMetrics: null,
@@ -528,7 +574,12 @@ function projectTabToState(tab: ChatSessionTab): Partial<ChatState> {
         contextMaxTokens: tab.contextMaxTokens,
         activeRequestId: tab.activeRequestId,
         sessionId: tab.sessionId,
+        agentId: tab.agentId,
         currentCwd: tab.currentCwd,
+        worktreePath: tab.worktreePath,
+        worktreeBranch: tab.worktreeBranch,
+        worktreeDiff: tab.worktreeDiff,
+        fanoutGroupId: tab.fanoutGroupId,
         activeSession: tab.activeSession,
         pendingSessionKey: tab.pendingSessionKey,
         lastSessionLoadMetrics: tab.lastSessionLoadMetrics,
@@ -549,6 +600,18 @@ function removeTab(tabs: ChatSessionTab[], key: string): ChatSessionTab[] {
     return tabs.filter((tab) => tab.key !== key);
 }
 
+function closeAgentForTab(tab: ChatSessionTab | null | undefined): void {
+    if (!tab?.agentId) return;
+    void closeAgent({
+        agentId: tab.agentId,
+        removeWorktree: false,
+        repoRoot: tab.currentCwd,
+        worktreePath: tab.worktreePath,
+    }).catch((error) => {
+        console.error('[ChatStore] close agent failed:', error);
+    });
+}
+
 function getActiveTabKey(state: ChatState): string {
     return state.activeTabKey ?? createDraftTabKey();
 }
@@ -565,15 +628,21 @@ function saveActiveProjection(state: ChatState): ChatSessionTab[] {
     return upsertTab(state.openTabs, currentTopLevelTab(state));
 }
 
-function requestTargetTabKey(state: ChatState, requestId: string | null | undefined): string | null {
+function requestTargetTabKey(state: ChatState, requestId: string | null | undefined, agentId?: string): string | null {
+    // 优先按 agentId / requestId 解析（多 agent 池下 agentId 是每 tab 稳定标识）。
+    const resolved = resolveTabForEvent(
+        state.openTabs,
+        {agentId, requestId: requestId ?? undefined},
+        requestTabKeys,
+    );
+    if (resolved) return resolved;
     if (!requestId) return null;
-    return requestTabKeys.get(requestId)
-        ?? state.openTabs.find((tab) => tab.activeRequestId === requestId)?.key
+    return state.openTabs.find((tab) => tab.activeRequestId === requestId)?.key
         ?? (state.activeRequestId === requestId ? state.activeTabKey : null);
 }
 
-function requestTargetTab(state: ChatState, requestId: string | null | undefined): ChatSessionTab | null {
-    const targetKey = requestTargetTabKey(state, requestId);
+function requestTargetTab(state: ChatState, requestId: string | null | undefined, agentId?: string): ChatSessionTab | null {
+    const targetKey = requestTargetTabKey(state, requestId, agentId);
     if (!targetKey) return null;
     if (state.activeTabKey === targetKey) return currentTopLevelTab(state);
     return state.openTabs.find((tab) => tab.key === targetKey) ?? null;
@@ -583,8 +652,9 @@ function updateRequestTabState(
     state: ChatState,
     requestId: string,
     updater: (tab: ChatSessionTab) => ChatSessionTab,
+    agentId?: string,
 ): Partial<ChatState> {
-    const targetKey = requestTargetTabKey(state, requestId);
+    const targetKey = requestTargetTabKey(state, requestId, agentId);
     if (!targetKey && state.activeRequestId === requestId) {
         const legacy = createTabFromState(createDraftTabKey(), state);
         const updated = updater(legacy);
@@ -830,10 +900,10 @@ function stopStreamingAssistantMessages(
     ));
 }
 
-function shouldAcceptRequestEvent(state: ChatState, requestId: string | null | undefined): boolean {
+function shouldAcceptRequestEvent(state: ChatState, requestId: string | null | undefined, agentId?: string): boolean {
     if (!requestId) return false;
     if (retiredRequestIds.has(requestId)) return false;
-    if (requestTargetTab(state, requestId)) return true;
+    if (requestTargetTab(state, requestId, agentId)) return true;
     if (state.activeRequestId) return state.activeRequestId === requestId;
     return hasStreamingAssistant(state.messages);
 }
@@ -842,9 +912,24 @@ function bindPendingRequestIfNeeded(
     set: (state: Partial<ChatState>) => void,
     state: ChatState,
     requestId: string,
+    agentId?: string,
 ): void {
     if (retiredRequestIds.has(requestId)) return;
     if (requestTabKeys.has(requestId)) return;
+
+    // 优先按 agentId 把 requestId 绑到对应 tab（多 agent 池下稳定归属）。
+    if (agentId) {
+        const agentTab = state.openTabs.find((tab) => tab.agentId === agentId);
+        if (agentTab) {
+            requestTabKeys.set(requestId, agentTab.key);
+            set(updateTabStateByKey(state, agentTab.key, (tab) => ({
+                ...tab,
+                activeRequestId: requestId,
+                status: 'running',
+            })));
+            return;
+        }
+    }
 
     const activeKey = state.activeTabKey;
     if (activeKey && !state.activeRequestId && hasStreamingAssistant(state.messages)) {
@@ -1116,7 +1201,7 @@ async function abortActiveRequestIfNeeded(
 
     let abortError: string | null = null;
     try {
-        await invoke('chat_abort');
+        await invoke('chat_abort', { agentId: state.agentId });
     } catch (e) {
         abortError = String(e);
         set({ error: abortError });
@@ -1158,7 +1243,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     daemonLogs: [],
     activeRequestId: null,
     sessionId: null,
+    agentId: createAgentId(),
     currentCwd: null,
+    worktreePath: null,
+    worktreeBranch: null,
+    worktreeDiff: null,
+    fanoutGroupId: null,
     activeSession: null,
     pendingSessionKey: null,
     lastSessionLoadMetrics: null,
@@ -1195,10 +1285,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         unlisteners = [];
 
         const streamUn = await listen<ChatStreamEvent>('chat://stream', (event) => {
-            const { requestId, text } = event.payload;
+            const { requestId, text, agentId } = event.payload;
             const stateBeforeStream = get();
-            if (!shouldAcceptRequestEvent(stateBeforeStream, requestId)) return;
-            bindPendingRequestIfNeeded(set, stateBeforeStream, requestId);
+            if (!shouldAcceptRequestEvent(stateBeforeStream, requestId, agentId)) return;
+            bindPendingRequestIfNeeded(set, stateBeforeStream, requestId, agentId);
 
             // 解析 daemon 的标签化输出。daemon stdout 每行都带标签前缀，
             // 只有 [CONTENT_DELTA] 是真正要显示的回复文本，其余（[DEBUG]、
@@ -1293,11 +1383,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         });
 
         const doneUn = await listen<ChatDoneEvent>('chat://done', (event) => {
-            const { requestId, success, error } = event.payload;
+            const { requestId, success, error, agentId } = event.payload;
             const stateBeforeDone = get();
-            if (!shouldAcceptRequestEvent(stateBeforeDone, requestId)) return;
-            bindPendingRequestIfNeeded(set, stateBeforeDone, requestId);
-            const targetBeforeDone = requestTargetTab(get(), requestId) ?? stateBeforeDone;
+            if (!shouldAcceptRequestEvent(stateBeforeDone, requestId, agentId)) return;
+            bindPendingRequestIfNeeded(set, stateBeforeDone, requestId, agentId);
+            const targetBeforeDone = requestTargetTab(get(), requestId, agentId) ?? stateBeforeDone;
             notifyStoppedRequestOnce(
                 requestId,
                 success ? 'success' : 'error',
@@ -1379,10 +1469,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // 监听 chat://message 事件（工具调用可视化）
         const messageUn = await listen<ChatMessageEvent>('chat://message', (event) => {
             try {
-                const { requestId } = event.payload;
+                const { requestId, agentId } = event.payload;
                 const stateBeforeMessage = get();
-                if (!shouldAcceptRequestEvent(stateBeforeMessage, requestId)) return;
-                bindPendingRequestIfNeeded(set, stateBeforeMessage, requestId);
+                if (!shouldAcceptRequestEvent(stateBeforeMessage, requestId, agentId)) return;
+                bindPendingRequestIfNeeded(set, stateBeforeMessage, requestId, agentId);
                 const raw = JSON.parse(event.payload.json) as MessageRaw;
 
                 // 子代理消息(带 parent_tool_use_id)不进主 transcript，
@@ -1416,12 +1506,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // 子代理(Task)消息走专用通道，按 parentToolUseId 路由进对应卡片的 subagentRuns。
         const subagentMessageUn = await listen<SubagentMessageEvent>('chat://subagent-message', (event) => {
             try {
-                const { requestId, parentToolUseId } = event.payload;
+                const { requestId, parentToolUseId, agentId } = event.payload;
                 const trimmedParent = parentToolUseId?.trim();
                 if (!trimmedParent) return;
                 const stateBeforeMessage = get();
-                if (!shouldAcceptRequestEvent(stateBeforeMessage, requestId)) return;
-                bindPendingRequestIfNeeded(set, stateBeforeMessage, requestId);
+                if (!shouldAcceptRequestEvent(stateBeforeMessage, requestId, agentId)) return;
+                bindPendingRequestIfNeeded(set, stateBeforeMessage, requestId, agentId);
                 const raw = JSON.parse(event.payload.json) as MessageRaw;
                 set((state) => updateRequestTabState(state, requestId, (tab) => ({
                     ...tab,
@@ -1436,7 +1526,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
         // 预热 daemon（懒启动也可，但提前启动可减少首条消息延迟）
         try {
-            await invoke('chat_start_daemon');
+            await invoke('chat_start_daemon', { agentId: get().agentId });
             if (!get().daemonReady && get().daemonStatus === 'starting') {
                 scheduleDaemonReadyTimeout(get, set);
             }
@@ -1460,7 +1550,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             error: null,
         });
         try {
-            await invoke('chat_start_daemon');
+            await invoke('chat_start_daemon', { agentId: get().agentId });
             scheduleDaemonReadyTimeout(get, set);
         } catch (e) {
             clearDaemonReadyTimeout();
@@ -1601,7 +1691,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         const tabKey = stateBeforeSend.pendingSessionKey
             ? createDraftTabKey()
             : (stateBeforeSend.activeTabKey ?? createDraftTabKey());
-        const sendState = stateBeforeSend.pendingSessionKey
+        let sendState = stateBeforeSend.pendingSessionKey
             ? {
                 ...stateBeforeSend,
                 messages: [],
@@ -1614,6 +1704,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 handoffContextProvider: null,
             }
             : stateBeforeSend;
+
+        if (opts?.createWorktree && !sendState.worktreePath) {
+            const repoRoot = sendState.currentCwd?.trim();
+            if (!repoRoot) {
+                set({error: '创建 worktree 需要先选择 Git 工作目录'});
+                return false;
+            }
+            try {
+                const worktreeName = `agent-${sendState.agentId.slice(0, 8)}`;
+                const info = await createWorktree(repoRoot, worktreeName);
+                const diff = await worktreeDiff(info.path).catch(() => null);
+                sendState = {
+                    ...sendState,
+                    worktreePath: info.path,
+                    worktreeBranch: info.branch,
+                    worktreeDiff: diff,
+                };
+            } catch (e) {
+                set({error: String(e)});
+                return false;
+            }
+        }
+
         const outboundMessage = sendState.handoffContextProvider
             && sendState.handoffContextProvider !== sendState.provider
             && !sendState.sessionId
@@ -1653,6 +1766,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
                     longContextEnabled: sendState.longContextEnabled,
                     messages: sendState.messages,
                     sessionId: sendState.sessionId,
+                    worktreePath: sendState.worktreePath,
+                    worktreeBranch: sendState.worktreeBranch,
+                    worktreeDiff: sendState.worktreeDiff,
+                    fanoutGroupId: sendState.fanoutGroupId,
                     activeSession: sendState.activeSession,
                     pendingSessionKey: sendState.pendingSessionKey,
                     lastSessionLoadMetrics: sendState.lastSessionLoadMetrics,
@@ -1679,6 +1796,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
             longContextEnabled: sendState.longContextEnabled,
             sessionId: sendState.sessionId,
             currentCwd: sendState.currentCwd,
+            worktreePath: sendState.worktreePath,
+            worktreeBranch: sendState.worktreeBranch,
+            worktreeDiff: sendState.worktreeDiff,
+            fanoutGroupId: sendState.fanoutGroupId,
             activeSession: sendState.activeSession,
             activeRequestId: sendState.activeRequestId,
             contextTokens: sendState.contextTokens,
@@ -1705,6 +1826,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             longContextEnabled,
             reasoningEffort,
             currentCwd,
+            worktreePath,
         } = sendState;
         const requestedModel = opts?.model ?? model;
         const effectiveModel = provider === 'claude'
@@ -1714,7 +1836,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             message: outboundMessage,
             sessionId: provider === 'claude' ? (sessionId ?? undefined) : undefined,
             threadId: provider === 'codex' ? (sessionId ?? undefined) : undefined,
-            cwd: opts?.cwd ?? currentCwd ?? undefined,
+            cwd: resolveSendCwd({worktreePath, cwd: currentCwd}, opts?.cwd),
             model: effectiveModel,
             permissionMode,
             reasoningEffort,
@@ -1746,6 +1868,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 scheduleDaemonReadyTimeout(get, set);
             }
             const requestId = await invoke<string>('chat_send', {
+                agentId: sendState.agentId,
                 provider,
                 command: provider === 'claude' && hasAttachments ? 'sendWithAttachments' : 'send',
                 params,
@@ -1789,6 +1912,204 @@ export const useChatStore = create<ChatState>((set, get) => ({
             })));
             return false;
         }
+    },
+
+    launchFanout: async (repoRoot, plan) => {
+        const normalizedRepo = repoRoot.trim();
+        if (!normalizedRepo) {
+            set({error: '扇出需要先选择 Git 工作目录'});
+            return;
+        }
+        if (plan.agents.length === 0) {
+            set({error: '扇出需要至少选择一个模型'});
+            return;
+        }
+        latestSessionLoadToken += 1;
+        prepareChatTurnStoppedNotificationPermission();
+
+        if (get().providerConfigDirty) {
+            await invoke('chat_restart_daemon');
+            set({
+                providerConfigDirty: false,
+                daemonReady: false,
+                daemonStatus: 'starting',
+                daemonReconnecting: false,
+                error: null,
+            });
+            scheduleDaemonReadyTimeout(get, set);
+        }
+
+        const stateBeforeFanout = get();
+        const prepared: Array<{
+            tab: ChatSessionTab;
+            assistantMessageId: string;
+        }> = [];
+        // 本轮已成功创建的 worktree，用于部分失败时回滚，避免泄漏。
+        const created: {path: string; branch: string}[] = [];
+
+        for (const agent of plan.agents) {
+            try {
+                const info = await createWorktree(normalizedRepo, agent.worktreeName);
+                created.push(info);
+                const diff = await worktreeDiff(info.path).catch(() => null);
+                const timestamp = nowMs();
+                const userMsg: ChatMessage = {
+                    id: newId(),
+                    role: 'user',
+                    content: plan.prompt,
+                    raw: buildUserRawMessage(plan.prompt, []),
+                    createdAt: timestamp,
+                };
+                const assistantMsg: ChatMessage = {
+                    id: newId(),
+                    role: 'assistant',
+                    content: '',
+                    streaming: true,
+                    createdAt: timestamp,
+                };
+                prepared.push({
+                    assistantMessageId: assistantMsg.id,
+                    tab: {
+                        ...createEmptyTabFromState(stateBeforeFanout, normalizedRepo, timestamp, `fanout:${plan.groupId}:${agent.agentId}`),
+                        agentId: agent.agentId,
+                        messages: [userMsg, assistantMsg],
+                        provider: agent.pick.chatProvider,
+                        model: agent.pick.model,
+                        currentCwd: normalizedRepo,
+                        worktreePath: info.path,
+                        worktreeBranch: info.branch,
+                        worktreeDiff: diff,
+                        fanoutGroupId: plan.groupId,
+                        status: 'running',
+                        updatedAt: timestamp,
+                    },
+                });
+            } catch (e) {
+                // 部分失败：best-effort 回滚本轮已成功创建的 worktree，避免泄漏。
+                // 单个 removeWorktree 失败不应掩盖原始错误，故吞掉异常。
+                for (const path of worktreesToRollback(created)) {
+                    await removeWorktree(normalizedRepo, path, true).catch(() => {});
+                }
+                set({error: String(e)});
+                return;
+            }
+        }
+
+        const firstTab = prepared[0].tab;
+        set((state) => ({
+            openTabs: prepared.reduce(
+                (tabs, item) => upsertTab(tabs, item.tab),
+                saveProjectionBeforeSwitch(state),
+            ),
+            activeTabKey: firstTab.key,
+            ...projectTabToState(firstTab),
+            error: null,
+        }));
+
+        for (const item of prepared) {
+            const {tab, assistantMessageId} = item;
+            pendingSendOwners.set(assistantMessageId, {tabKey: tab.key, assistantMessageId});
+            try {
+                const effectiveModel = tab.provider === 'claude'
+                    ? apply1MContextSuffix(tab.model, tab.longContextEnabled)
+                    : tab.model;
+                const requestId = await invoke<string>('chat_send', {
+                    agentId: tab.agentId,
+                    provider: tab.provider,
+                    command: 'send',
+                    params: {
+                        message: plan.prompt,
+                        cwd: resolveSendCwd({worktreePath: tab.worktreePath, cwd: tab.currentCwd}),
+                        model: effectiveModel,
+                        permissionMode: tab.permissionMode,
+                        reasoningEffort: tab.reasoningEffort,
+                        streaming: true,
+                    },
+                });
+                pendingSendOwners.delete(assistantMessageId);
+                requestTabKeys.set(requestId, tab.key);
+                set((state) => updateTabStateByKey(state, tab.key, (current) => ({
+                    ...current,
+                    activeRequestId: requestId,
+                    status: 'running',
+                    error: null,
+                })));
+            } catch (e) {
+                pendingSendOwners.delete(assistantMessageId);
+                notifyStoppedRequestOnce(
+                    `fanout-send-error:${assistantMessageId}`,
+                    'error',
+                    tab.provider,
+                    String(e),
+                );
+                set((state) => updateTabStateByKey(state, tab.key, (current) => ({
+                    ...current,
+                    error: String(e),
+                    status: 'error',
+                    messages: current.messages.map((message) => (
+                        message.id === assistantMessageId
+                            ? {...message, streaming: false, error: String(e)}
+                            : message
+                    )),
+                })));
+            }
+        }
+    },
+
+    discardFanoutAgent: async (tabKey) => {
+        const tab = get().openTabs.find((item) => item.key === tabKey);
+        if (!tab) return;
+        await closeAgent({
+            agentId: tab.agentId,
+            removeWorktree: true,
+            repoRoot: tab.currentCwd,
+            worktreePath: tab.worktreePath,
+            force: true,
+        });
+        retirePendingSendsForTab(tab.key);
+        retireRequestOwnership(tab.activeRequestId);
+        set((state) => {
+            const tabs = saveProjectionBeforeSwitch(state);
+            const nextTabs = removeTab(tabs, tab.key);
+            const nextActive = getNextTabAfterClose({
+                tabs,
+                closingKey: tab.key,
+                activeKey: state.activeTabKey,
+            });
+            const nextTab = nextTabs.find((item) => item.key === nextActive) ?? null;
+            if (!nextTab) {
+                const emptyTab = createEmptyTabFromState(state);
+                return {
+                    openTabs: [],
+                    activeTabKey: null,
+                    ...projectTabToState(emptyTab),
+                };
+            }
+            return {
+                openTabs: nextTabs,
+                activeTabKey: nextTab.key,
+                ...projectTabToState(nextTab),
+            };
+        });
+    },
+
+    mergeFanoutWinner: async (tabKey) => {
+        const tab = get().openTabs.find((item) => item.key === tabKey);
+        const repoRoot = tab?.currentCwd?.trim();
+        const sourceBranch = tab?.worktreeBranch?.trim();
+        if (!tab || !repoRoot || !sourceBranch) {
+            set({error: '无法合并：缺少 worktree 分支信息'});
+            return 'conflict';
+        }
+        const result = await mergeWorktree(repoRoot, sourceBranch);
+        if (result.outcome === 'conflict') {
+            set((state) => updateTabStateByKey(state, tab.key, (current) => ({
+                ...current,
+                error: '合并冲突，已自动回滚，请手动查看差异',
+                status: 'error',
+            })));
+        }
+        return result.outcome;
     },
 
     loadSession: async (session) => {
@@ -2195,6 +2516,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     closeTab: (key) => {
         set((state) => {
             const tabs = saveActiveProjection(state);
+            const closingTab = tabs.find((tab) => tab.key === key);
+            closeAgentForTab(closingTab);
             const remainingTabs = removeTab(tabs, key);
             const nextActiveKey = getNextTabAfterClose({
                 tabs,
@@ -2227,6 +2550,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             const tabs = saveActiveProjection(state);
             const targetTab = tabs.find((tab) => tab.key === key);
             if (!targetTab) return {};
+            tabs.filter((tab) => tab.key !== key).forEach(closeAgentForTab);
 
             return {
                 openTabs: [targetTab],
@@ -2238,6 +2562,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     closeAllTabs: () => {
         set((state) => {
+            saveActiveProjection(state).forEach(closeAgentForTab);
             const emptyTab = createEmptyTabFromState(state, state.currentCwd);
             return {
                 openTabs: [],
@@ -2302,7 +2627,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         prepareChatTurnStoppedNotificationPermission();
 
         try {
-            await invoke('chat_abort');
+            await invoke('chat_abort', { agentId: stateBeforeAbort.agentId });
             notifyStoppedRequestOnce(
                 activeRequestId,
                 'aborted',
