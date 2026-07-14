@@ -188,6 +188,7 @@ impl WorkerSupervisor {
         state.last_activity_at = now;
 
         match event {
+            AgentEvent::MessageRaw { .. } |
             AgentEvent::TextDelta(_) | AgentEvent::Thinking(_) => {
                 // 仅刷新活动时间，状态不变。
             }

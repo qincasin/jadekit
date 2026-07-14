@@ -6,6 +6,7 @@
 pub mod cli_runtime;
 pub mod coordinator;
 pub mod events;
+pub mod mock_runtime;
 pub mod planner;
 pub mod run_lifecycle;
 pub mod runtime;
@@ -25,6 +26,7 @@ pub use events::{NullEventSink, OrchestrationEvent, OrchestrationEventSink};
 pub use supervisor::{DEFAULT_MAX_TURN_MS, WorkerStatus, WorkerSupervisor};
 pub use sdk_runtime::{parse_stream_line, SdkRuntime};
 pub use cli_runtime::CliRuntime;
+pub use mock_runtime::ScriptedRuntime;
 pub use store::{GateListFilter, InboxFilter, ReconcileReport, Store, TaskListFilter};
 pub use types::{
     AgentAssignment, CoordinatorRun, DecisionGate, DispatchContext, DispatchStatus, GateStatus,

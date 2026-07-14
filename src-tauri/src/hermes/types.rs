@@ -277,10 +277,17 @@ pub struct Task {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentAssignment {
     pub runtime: RuntimeKind,
+    /// Provider token selected from the roster (`claude` or `codex`).
+    #[serde(default = "default_agent_assignment_provider")]
+    pub provider: String,
     /// 工具/介质名（如 `"claude-sdk"`、`"claude-cli"`）。
     pub tool: String,
     /// 模型 id（如 `"sonnet"`、`"glm-5.2"`）。
     pub model: String,
+}
+
+fn default_agent_assignment_provider() -> String {
+    "claude".to_string()
 }
 
 /// 派发上下文（`dispatch_contexts` 表）——某次「任务 → Agent」派发的运行时账本。

@@ -71,6 +71,12 @@ const C_LAST_HEARTBEAT_AT: &str = "last_heartbeat_at";
 /// 熔断阈值：累计失败次数达到此值 → `CircuitBroken`（对齐 orca）。
 const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 
+/// 启动恢复时持久化到既有 task/dispatch 原因字段的事实性原因。
+/// `coordinator_runs` 没有 error 列，因此 run 本身只记录 Failed；任务和派发的既有
+/// result / last_failure 列保留可向用户展示的恢复原因。
+const STARTUP_ORPHAN_RECOVERY_REASON: &str =
+    "previous Hermes process ended before the coordinator completed";
+
 // =============================================================================
 // Store 结构
 // =============================================================================
@@ -84,6 +90,16 @@ pub struct Store {
     /// 故仍需独占锁。
     conn: Arc<Mutex<Connection>>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerSession {
+    pub dispatch_id: String, pub run_id: String, pub task_id: String, pub worker_id: String,
+    pub final_response: Option<String>, pub error: Option<String>, pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerTranscriptEntry { pub kind: String, pub payload: String, pub created_at: String }
 
 impl Store {
     /// 克隆内部 Arc 句柄——两个 clone 共享同一 SQLite 连接。
@@ -194,6 +210,18 @@ impl Store {
             ",
         )
         .map_err(|e| format!("Failed to create messages table: {e}"))?;
+
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS worker_sessions (
+            dispatch_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, task_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL, final_response TEXT, error TEXT,
+            created_at TEXT NOT NULL, completed_at TEXT);
+            CREATE INDEX IF NOT EXISTS idx_worker_sessions_run ON worker_sessions(run_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS worker_transcript_entries (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT, dispatch_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('message_raw', 'activity')), payload TEXT NOT NULL,
+            created_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS idx_worker_transcript_dispatch ON worker_transcript_entries(dispatch_id, sequence);")
+            .map_err(|e| format!("Failed to create worker transcript tables: {e}"))?;
 
         // ── tasks ──
         // Hermes 增量：assignment TEXT 列（AgentAssignment 的 JSON 序列化）。NULL 表示未选兵。
@@ -1232,6 +1260,67 @@ impl Store {
         })
     }
 
+    // ── Durable worker transcript ──────────────────────────────────────
+
+    pub fn create_worker_session(&self, dispatch_id: &str, run_id: &str, task_id: &str, worker_id: &str) -> Result<(), String> {
+        let conn = lock_conn!(self.conn);
+        conn.execute("INSERT INTO worker_sessions (dispatch_id, run_id, task_id, worker_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![dispatch_id, run_id, task_id, worker_id, chrono::Utc::now().to_rfc3339()])
+            .map_err(|e| format!("Failed to create worker session: {e}"))?;
+        Ok(())
+    }
+
+    pub fn append_worker_transcript_entry(&self, dispatch_id: &str, kind: &str, payload: &str) -> Result<(), String> {
+        if !matches!(kind, "message_raw" | "activity") { return Err(format!("Invalid transcript entry kind: {kind}")); }
+        let conn = lock_conn!(self.conn);
+        conn.execute("INSERT INTO worker_transcript_entries (dispatch_id, kind, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![dispatch_id, kind, payload, chrono::Utc::now().to_rfc3339()])
+            .map_err(|e| format!("Failed to append worker transcript entry: {e}"))?;
+        Ok(())
+    }
+
+    pub fn complete_worker_session(&self, dispatch_id: &str, final_response: Option<&str>, error: Option<&str>) -> Result<(), String> {
+        let conn = lock_conn!(self.conn);
+        let updated = conn.execute("UPDATE worker_sessions SET final_response = ?1, error = ?2, completed_at = ?3 WHERE dispatch_id = ?4",
+            params![final_response, error, chrono::Utc::now().to_rfc3339(), dispatch_id])
+            .map_err(|e| format!("Failed to complete worker session: {e}"))?;
+        if updated == 0 { return Err(format!("Worker session not found: {dispatch_id}")); }
+        Ok(())
+    }
+
+    /// User cancellation is not a worker failure: it must never consume circuit-breaker budget.
+    pub fn abort_dispatch(&self, dispatch_id: &str, reason: &str) -> Result<Option<DispatchContext>, String> {
+        let conn = lock_conn!(self.conn);
+        let updated = conn.execute("UPDATE dispatch_contexts SET status = ?1, last_failure = ?2, completed_at = ?3 WHERE id = ?4 AND status = ?5",
+            params![DispatchStatus::Failed.as_str(), reason, chrono::Utc::now().to_rfc3339(), dispatch_id, DispatchStatus::Dispatched.as_str()])
+            .map_err(|e| format!("Failed to abort dispatch: {e}"))?;
+        if updated == 0 { return Ok(None); }
+        let mut stmt = conn.prepare("SELECT id, task_id, assignee_handle, status, failure_count, last_heartbeat_at, last_failure, dispatched_at, completed_at, created_at FROM dispatch_contexts WHERE id = ?1").map_err(|e| format!("prepare aborted dispatch: {e}"))?;
+        let row = stmt.query_row(params![dispatch_id], |row| Ok(DispatchContext { id: row.get(0)?, task_id: row.get(1)?, assignee: row.get(2)?, status: DispatchStatus::from_str(&row.get::<_, String>(3)?).map_err(|_| rusqlite::Error::InvalidQuery)?, failure_count: row.get::<_, i64>(4)? as u32, last_heartbeat_at: row.get(5)?, last_failure: row.get(6)?, dispatched_at: row.get(7)?, completed_at: row.get(8)?, created_at: row.get(9)? })).map_err(|e| format!("read aborted dispatch: {e}"))?;
+        Ok(Some(row))
+    }
+
+    pub fn list_worker_sessions(&self, run_id: Option<&str>) -> Result<Vec<WorkerSession>, String> {
+        let conn = lock_conn!(self.conn);
+        let sql = if run_id.is_some() { "SELECT dispatch_id, run_id, task_id, worker_id, final_response, error, created_at, completed_at FROM worker_sessions WHERE run_id = ?1 ORDER BY created_at DESC" } else { "SELECT dispatch_id, run_id, task_id, worker_id, final_response, error, created_at, completed_at FROM worker_sessions ORDER BY created_at DESC" };
+        let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare list worker sessions: {e}"))?;
+        let mut rows = if let Some(id) = run_id { stmt.query(params![id]) } else { stmt.query([]) }.map_err(|e| format!("query list worker sessions: {e}"))?;
+        let mut sessions = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| format!("read worker session: {e}"))? {
+            sessions.push(WorkerSession { dispatch_id: row.get(0).map_err(|e| e.to_string())?, run_id: row.get(1).map_err(|e| e.to_string())?, task_id: row.get(2).map_err(|e| e.to_string())?, worker_id: row.get(3).map_err(|e| e.to_string())?, final_response: row.get(4).ok(), error: row.get(5).ok(), created_at: row.get(6).map_err(|e| e.to_string())?, completed_at: row.get(7).ok() });
+        }
+        Ok(sessions)
+    }
+
+    pub fn list_worker_transcript_entries(&self, dispatch_id: &str) -> Result<Vec<WorkerTranscriptEntry>, String> {
+        let conn = lock_conn!(self.conn);
+        let mut stmt = conn.prepare("SELECT kind, payload, created_at FROM worker_transcript_entries WHERE dispatch_id = ?1 ORDER BY sequence ASC").map_err(|e| format!("prepare worker transcript: {e}"))?;
+        let mut rows = stmt.query(params![dispatch_id]).map_err(|e| format!("query worker transcript: {e}"))?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| format!("read worker transcript: {e}"))? { entries.push(WorkerTranscriptEntry { kind: row.get(0).map_err(|e| e.to_string())?, payload: row.get(1).map_err(|e| e.to_string())?, created_at: row.get(2).map_err(|e| e.to_string())? }); }
+        Ok(entries)
+    }
+
     // ── Coordinator runs ────────────────────────────────────────────────
 
     /// 开启一次 Coordinator 编排运行。状态置为 `Running`（对齐 orca `createCoordinatorRun`）。
@@ -1245,8 +1334,47 @@ impl Store {
         // `now`（此前 DB 走 schema DEFAULT datetime('now')，struct 走 chrono——格式不一致）。
         let now = chrono::Utc::now().to_rfc3339();
         let id = format!("run_{}", uuid_v4_short());
-        let conn = lock_conn!(self.conn);
-        conn.execute(
+        let mut conn = lock_conn!(self.conn);
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to BEGIN create coordinator_run tx: {e}"))?;
+
+        match tx.query_row(
+            "SELECT id FROM coordinator_runs WHERE status = ?1 ORDER BY created_at DESC LIMIT 1",
+            params![RunStatus::Running.as_str()],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(active_run_id) => {
+                return Err(format!(
+                    "Cannot start a new Hermes run while run {active_run_id} is still active"
+                ));
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(format!("Failed to check active coordinator_run: {e}")),
+        }
+
+        // Task / dispatch rows are global operational state, not run history. Once no run is
+        // active, terminal rows from the prior run must not suppress the next planner pass.
+        tx.execute(
+            "DELETE FROM dispatch_contexts WHERE status IN (?1, ?2, ?3)",
+            params![
+                DispatchStatus::Completed.as_str(),
+                DispatchStatus::Failed.as_str(),
+                DispatchStatus::CircuitBroken.as_str(),
+            ],
+        )
+        .map_err(|e| format!("Failed to clear terminal dispatch state: {e}"))?;
+        tx.execute(
+            "DELETE FROM tasks WHERE status IN (?1, ?2, ?3)",
+            params![
+                TaskStatus::Completed.as_str(),
+                TaskStatus::Failed.as_str(),
+                TaskStatus::Blocked.as_str(),
+            ],
+        )
+        .map_err(|e| format!("Failed to clear terminal task state: {e}"))?;
+
+        tx.execute(
             "INSERT INTO coordinator_runs
                 (id, spec, status, coordinator_handle, poll_interval_ms, created_at)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -1260,6 +1388,8 @@ impl Store {
             ],
         )
         .map_err(|e| format!("Failed to insert coordinator_run: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("Failed to COMMIT create coordinator_run tx: {e}"))?;
 
         Ok(CoordinatorRun {
             id,
@@ -1270,6 +1400,42 @@ impl Store {
             created_at: now,
             completed_at: None,
         })
+    }
+
+    /// Returns the most recent persisted reason for a terminal task failure. The task result is
+    /// the authoritative root cause; a terminal dispatch reason is retained as a fallback.
+    pub fn terminal_failure_reason(&self) -> Result<Option<String>, String> {
+        let conn = lock_conn!(self.conn);
+        match conn.query_row(
+            "SELECT result
+             FROM tasks
+             WHERE status = ?1 AND result IS NOT NULL AND trim(result) <> ''
+             ORDER BY completed_at DESC, created_at DESC
+             LIMIT 1",
+            params![TaskStatus::Failed.as_str()],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(reason) => return Ok(Some(reason)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(format!("Failed to read failed task reason: {e}")),
+        }
+
+        match conn.query_row(
+            "SELECT last_failure
+             FROM dispatch_contexts
+             WHERE status IN (?1, ?2) AND last_failure IS NOT NULL AND trim(last_failure) <> ''
+             ORDER BY completed_at DESC, created_at DESC
+             LIMIT 1",
+            params![
+                DispatchStatus::Failed.as_str(),
+                DispatchStatus::CircuitBroken.as_str(),
+            ],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(reason) => Ok(Some(reason)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to read failed dispatch reason: {e}")),
+        }
     }
 
     pub fn update_run(
@@ -1405,6 +1571,18 @@ impl Store {
         let mut completed_via_worker_done: u64 = 0;
         let mut marked_for_redispatch: u64 = 0;
 
+        // This method is called only during application startup, before this process has built
+        // any RunHandle. A persisted Running row is therefore an orphan from a previous process.
+        // Tasks and dispatches are global operational state with no run_id, so once such a row is
+        // found every non-terminal task/dispatch belongs to that interrupted operational epoch.
+        let has_orphaned_run: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM coordinator_runs WHERE status = ?1)",
+                params![RunStatus::Running.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query orphaned coordinator_run: {e}"))?;
+
         // 1) 收集所有"孤儿 dispatched"任务 + 它们当前活跃的 dispatch 上下文。
         //    一条 task 理论上同时只有一个活跃 dispatch；取最新的那条（对齐 orca
         //    `getDispatchContext` ORDER BY rowid DESC LIMIT 1）。
@@ -1495,6 +1673,56 @@ impl Store {
                 .map_err(|e| format!("reconcile fail dispatch: {e}"))?;
                 marked_for_redispatch += 1;
             }
+        }
+
+        if has_orphaned_run {
+            // Preserve the existing dispatched-task reconciliation above so a persisted
+            // worker_done is still recorded as Completed. Then converge all remaining
+            // non-terminal operational rows before the next create_run transaction clears its
+            // terminal state and starts the planner from empty state.
+            let now = chrono::Utc::now().to_rfc3339();
+            tx.execute(
+                "UPDATE coordinator_runs
+                 SET status = ?1, completed_at = COALESCE(completed_at, ?2)
+                 WHERE status = ?3",
+                params![
+                    RunStatus::Failed.as_str(),
+                    now,
+                    RunStatus::Running.as_str(),
+                ],
+            )
+            .map_err(|e| format!("fail orphaned coordinator_run: {e}"))?;
+            tx.execute(
+                "UPDATE tasks
+                 SET status = ?1,
+                     result = COALESCE(NULLIF(result, ''), ?2),
+                     completed_at = COALESCE(completed_at, ?3)
+                 WHERE status IN (?4, ?5, ?6)",
+                params![
+                    TaskStatus::Failed.as_str(),
+                    STARTUP_ORPHAN_RECOVERY_REASON,
+                    now,
+                    TaskStatus::Pending.as_str(),
+                    TaskStatus::Ready.as_str(),
+                    TaskStatus::Dispatched.as_str(),
+                ],
+            )
+            .map_err(|e| format!("fail orphaned task state: {e}"))?;
+            tx.execute(
+                "UPDATE dispatch_contexts
+                 SET status = ?1,
+                     last_failure = COALESCE(NULLIF(last_failure, ''), ?2),
+                     completed_at = COALESCE(completed_at, ?3)
+                 WHERE status IN (?4, ?5)",
+                params![
+                    DispatchStatus::Failed.as_str(),
+                    STARTUP_ORPHAN_RECOVERY_REASON,
+                    now,
+                    DispatchStatus::Pending.as_str(),
+                    DispatchStatus::Dispatched.as_str(),
+                ],
+            )
+            .map_err(|e| format!("fail orphaned dispatch state: {e}"))?;
         }
 
         Ok(ReconcileReport {
@@ -1753,6 +1981,7 @@ mod tests {
         t.status = TaskStatus::Pending; // create_task 会按 deps 推导
         t.assignment = Some(AgentAssignment {
             runtime: RuntimeKind::Sdk,
+            provider: "claude".to_string(),
             tool: "claude-sdk".to_string(),
             model: "sonnet".to_string(),
         });
@@ -1769,6 +1998,7 @@ mod tests {
             got.assignment,
             Some(AgentAssignment {
                 runtime: RuntimeKind::Sdk,
+                provider: "claude".to_string(),
                 tool: "claude-sdk".to_string(),
                 model: "sonnet".to_string(),
             }),
@@ -1776,6 +2006,34 @@ mod tests {
         );
         assert_eq!(got.created_at, "2026-06-28T00:00:00Z");
         assert_eq!(got.completed_at, None);
+    }
+
+    #[test]
+    fn task_round_trip_deserializes_legacy_assignment_without_provider() {
+        let store = Store::open_in_memory().unwrap();
+        store.create_task(sample_task("legacy-assignment", vec![])).unwrap();
+
+        let legacy_json = r#"{"runtime":"Sdk","tool":"claude-sdk","model":"sonnet"}"#;
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tasks SET assignment = ?1 WHERE id = ?2",
+            params![legacy_json, "legacy-assignment"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let task = store
+            .get_task("legacy-assignment")
+            .unwrap()
+            .expect("legacy task is present");
+        let assignment = task.assignment.expect("legacy assignment is present");
+        assert_eq!(assignment.provider, "claude");
+        assert!(
+            serde_json::to_string(&assignment)
+                .unwrap()
+                .contains(r#""provider":"claude""#),
+            "the round-tripped assignment must carry the compatibility default"
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -1973,6 +2231,83 @@ mod tests {
         assert_eq!(d.status, DispatchStatus::Failed, "stale dispatch marked Failed");
     }
 
+    #[test]
+    fn reconcile_startup_converges_an_orphan_run_before_a_new_run() {
+        let store = Store::open_in_memory().unwrap();
+        let orphan = store
+            .create_run("interrupted goal", "coordinator", 5)
+            .expect("create run that represents the previous process");
+
+        store
+            .create_task(sample_task("ready-task", vec![]))
+            .expect("create ready task");
+        store
+            .create_task(sample_task("dispatched-task", vec![]))
+            .expect("create dispatched task");
+        store
+            .update_task_status("dispatched-task", TaskStatus::Dispatched, None)
+            .expect("mark task dispatched");
+        store
+            .create_task(sample_task("pending-task", vec!["ready-task"]))
+            .expect("create pending task");
+
+        let mut active_dispatch = sample_dispatch("active-dispatch", "dispatched-task");
+        active_dispatch.status = DispatchStatus::Dispatched;
+        store
+            .create_dispatch(active_dispatch)
+            .expect("create dispatched context");
+        let mut pending_dispatch = sample_dispatch("pending-dispatch", "ready-task");
+        pending_dispatch.status = DispatchStatus::Pending;
+        store
+            .create_dispatch(pending_dispatch)
+            .expect("create pending context");
+
+        let report = store
+            .reconcile_on_startup()
+            .expect("reconcile interrupted process state");
+
+        assert_eq!(
+            store.get_run(&orphan.id).unwrap().unwrap().status,
+            RunStatus::Failed,
+            "the persisted running run must become terminal at startup"
+        );
+        for task_id in ["ready-task", "dispatched-task", "pending-task"] {
+            let task = store.get_task(task_id).unwrap().unwrap();
+            assert_eq!(task.status, TaskStatus::Failed, "{task_id} must converge");
+            assert!(
+                task.result.as_deref().unwrap_or_default().contains("previous Hermes process"),
+                "{task_id} must retain the factual recovery reason"
+            );
+        }
+        for dispatch_id in ["active-dispatch", "pending-dispatch"] {
+            let dispatch = store.get_dispatch(dispatch_id).unwrap().unwrap();
+            assert_eq!(
+                dispatch.status,
+                DispatchStatus::Failed,
+                "{dispatch_id} must converge before cleanup"
+            );
+        }
+        assert_eq!(report.marked_for_redispatch, 1);
+
+        let next = store
+            .create_run("fresh goal", "coordinator", 5)
+            .expect("an orphaned run must not block the next run");
+        assert_eq!(next.status, RunStatus::Running);
+        assert!(
+            store.list_tasks(TaskListFilter::default()).unwrap().is_empty(),
+            "the new run must start with an empty planner state"
+        );
+        assert!(
+            store.get_dispatch("active-dispatch").unwrap().is_none(),
+            "terminal operational state is cleared only by create_run"
+        );
+        assert_eq!(
+            store.get_run(&orphan.id).unwrap().unwrap().status,
+            RunStatus::Failed,
+            "run history is retained after starting the next run"
+        );
+    }
+
     /// T6 (M1 回归): update_task_status 携带 result 时被持久化。
     #[test]
     fn update_task_status_persists_result() {
@@ -2005,6 +2340,7 @@ mod tests {
         let mut t = sample_task("asg", vec![]);
         t.assignment = Some(AgentAssignment {
             runtime: RuntimeKind::Sdk,
+            provider: "claude".to_string(),
             tool: "claude-sdk".to_string(),
             model: "sonnet".to_string(),
         });
@@ -2017,6 +2353,7 @@ mod tests {
         // 换兵：runtime=cli, model=glm-5.2。
         let new_assignment = AgentAssignment {
             runtime: RuntimeKind::Cli,
+            provider: "codex".to_string(),
             tool: "claude-cli".to_string(),
             model: "glm-5.2".to_string(),
         };
@@ -2166,6 +2503,112 @@ mod tests {
         assert!(
             is_rfc3339_chrono(&resolved_at),
             "resolved_at 必须是 RFC3339（chrono 格式），实际：{resolved_at}"
+        );
+    }
+
+    #[test]
+    fn create_run_rejects_an_overlapping_active_run() {
+        let store = Store::open_in_memory().unwrap();
+        let active = store.create_run("first goal", "coordinator", 5).unwrap();
+
+        let err = store
+            .create_run("second goal", "coordinator", 5)
+            .expect_err("a second run must not start while another run is active");
+
+        assert!(
+            err.contains(&active.id),
+            "overlap error must identify the active run, got: {err}"
+        );
+    }
+
+    #[test]
+    fn create_run_clears_terminal_operational_state_but_preserves_run_history() {
+        let store = Store::open_in_memory().unwrap();
+        let previous = store.create_run("failed goal", "coordinator", 5).unwrap();
+        store
+            .create_task(sample_task("t1", vec![]))
+            .expect("create terminal task");
+        store
+            .update_task_status("t1", TaskStatus::Failed, Some("worker exited with code 1"))
+            .expect("mark task failed");
+        let mut failed_dispatch = sample_dispatch("disp_t1", "t1");
+        failed_dispatch.status = DispatchStatus::CircuitBroken;
+        failed_dispatch.last_failure = Some("worker exited with code 1".to_string());
+        store
+            .create_dispatch(failed_dispatch)
+            .expect("create terminal dispatch");
+        store
+            .update_run(&previous.id, RunStatus::Failed)
+            .expect("mark previous run failed");
+
+        let next = store
+            .create_run("next goal", "coordinator", 5)
+            .expect("terminal operational state must not block a new run");
+
+        assert_eq!(next.status, RunStatus::Running);
+        assert!(
+            store
+                .list_tasks(TaskListFilter::default())
+                .expect("list tasks")
+                .is_empty(),
+            "terminal tasks must not leak into the next planner run"
+        );
+        assert!(
+            store
+                .get_dispatch("disp_t1")
+                .expect("get dispatch")
+                .is_none(),
+            "terminal dispatches must not leak into the next planner run"
+        );
+        assert_eq!(
+            store
+                .get_run(&previous.id)
+                .expect("get previous run")
+                .expect("previous run history")
+                .status,
+            RunStatus::Failed,
+            "coordinator run history must be retained"
+        );
+    }
+
+    #[test]
+    fn worker_transcript_entries_survive_terminal_run_and_operational_cleanup() {
+        let store = Store::open_in_memory().unwrap();
+        let run = store.create_run("history goal", "coordinator", 5).unwrap();
+
+        store.create_worker_session("disp-1", &run.id, "task-1", "worker-1").unwrap();
+        store.append_worker_transcript_entry(
+            "disp-1",
+            "message_raw",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"real response"}]}}"#,
+        ).unwrap();
+        store.complete_worker_session("disp-1", Some("real response"), None).unwrap();
+        store.update_run(&run.id, RunStatus::Completed).unwrap();
+        store.create_run("next goal", "coordinator", 5).unwrap();
+
+        let sessions = store.list_worker_sessions(Some(&run.id)).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].final_response.as_deref(), Some("real response"));
+        let entries = store.list_worker_transcript_entries("disp-1").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "message_raw");
+    }
+
+    #[test]
+    fn terminal_failure_reason_reads_the_failed_task_result() {
+        let store = Store::open_in_memory().unwrap();
+        store.create_task(sample_task("failed-task", vec![])).unwrap();
+        store
+            .update_task_status(
+                "failed-task",
+                TaskStatus::Failed,
+                Some("worker exited with code 1"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.terminal_failure_reason().unwrap(),
+            Some("worker exited with code 1".to_string())
         );
     }
 

@@ -20,8 +20,10 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::hermes::{
-    self, sweep_run_worktrees, Coordinator, DispatchContext, OrchestrationEventSink, RuntimeRegistry,
-    RunStatus, Store, SweepReport, Task, TaskListFilter, TaskStatus,
+    sweep_run_worktrees, AgentHandle, Coordinator, DecisionGate, DispatchContext,
+    DispatchStatus, GateListFilter, GateStatus, OrchestrationEventSink, Planner, Roster,
+    RosterEntry, RuntimeKind, RuntimeRegistry, RunStatus, ScriptedRuntime, Store, SweepReport,
+    Task, TaskListFilter, TaskStatus,
 };
 use crate::hermes::coordinator::HELM_BASE_BRANCH;
 
@@ -46,6 +48,10 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 2000;
 const DEFAULT_MAX_CONCURRENT: usize = 4;
 /// Coordinator 自身 handle（与 `hermes::coordinator::COORDINATOR_HANDLE` 对齐）。
 const COORDINATOR_HANDLE: &str = "coordinator";
+/// Safe fallback used only when no terminal task or dispatch persisted a root cause.
+const GENERIC_RUN_FAILURE_ERROR: &str = "run ended in failed state";
+/// Bound terminal error text before it crosses the backend/UI event boundary.
+const MAX_RUN_FAILURE_REASON_CHARS: usize = 500;
 
 // =============================================================================
 // 参数归一化（纯函数，命令层调用 + 单测覆盖）
@@ -61,6 +67,18 @@ pub struct HermesRunOpts {
     pub poll_interval_ms: Option<u64>,
     /// 本次 run 的工作目录（缺省 = `HermesEngine::repo_root`）。
     pub repo_root: Option<String>,
+    /// 本次 run 的候选 Agent roster。前端按用户选择传入；缺省走后端默认 roster。
+    pub roster: Option<Vec<HermesRosterEntryOpt>>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HermesRosterEntryOpt {
+    pub runtime: String,
+    pub provider: String,
+    pub model: String,
+    pub label: String,
+    pub cost_hint: Option<String>,
 }
 
 /// 归一化后的 run 参数（已应用默认值，供 [`HermesEngine::start_run`] 消费）。
@@ -69,6 +87,62 @@ pub struct NormalizedRunOpts {
     pub max_concurrent: usize,
     pub poll_interval_ms: u64,
     pub repo_root: Option<PathBuf>,
+    pub roster: Option<Roster>,
+}
+
+fn parse_roster_runtime(runtime: &str) -> Result<RuntimeKind, String> {
+    match runtime.trim() {
+        "sdk" => Ok(RuntimeKind::Sdk),
+        "cli" => Ok(RuntimeKind::Cli),
+        other => Err(format!("hermes_run: roster runtime 不支持 {other}")),
+    }
+}
+
+fn normalize_roster_provider(provider: &str) -> Result<String, String> {
+    match provider.trim() {
+        "claude" | "codex" => Ok(provider.trim().to_string()),
+        other => Err(format!("hermes_run: roster provider 不支持 {other}")),
+    }
+}
+
+fn normalize_roster(entries: Vec<HermesRosterEntryOpt>) -> Result<Roster, String> {
+    if entries.is_empty() {
+        return Err("hermes_run: roster 不能为空".to_string());
+    }
+
+    let mut roster = Vec::with_capacity(entries.len());
+    let mut runtime_models = std::collections::HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let runtime = parse_roster_runtime(&entry.runtime)?;
+        let provider = normalize_roster_provider(&entry.provider)?;
+        let model = entry.model.trim().to_string();
+        if model.is_empty() {
+            return Err("hermes_run: roster model 不能为空".to_string());
+        }
+        let label = entry.label.trim().to_string();
+        if label.is_empty() {
+            return Err("hermes_run: roster label 不能为空".to_string());
+        }
+        if !runtime_models.insert((runtime, model.clone())) {
+            return Err(format!(
+                "hermes_run: roster 存在重复 runtime={} model={}",
+                runtime.as_str(),
+                model
+            ));
+        }
+        roster.push(RosterEntry {
+            runtime,
+            provider,
+            model,
+            label,
+            cost_hint: entry
+                .cost_hint
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        });
+    }
+
+    Ok(Roster(roster))
 }
 
 /// 把前端可选 opts 归一化：None → 默认值；非法值（poll=0 / max=0）→ Err。
@@ -98,10 +172,13 @@ pub fn normalize_run_opts(opts: HermesRunOpts) -> Result<NormalizedRunOpts, Stri
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
 
+    let roster = opts.roster.map(normalize_roster).transpose()?;
+
     Ok(NormalizedRunOpts {
         max_concurrent,
         poll_interval_ms,
         repo_root,
+        roster,
     })
 }
 
@@ -178,6 +255,64 @@ impl From<DispatchContext> for DispatchDto {
     }
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GateDto {
+    pub id: String,
+    pub task_id: String,
+    pub question: String,
+    pub options: Vec<String>,
+    pub resolution: Option<String>,
+    pub status: String,
+}
+
+impl From<DecisionGate> for GateDto {
+    fn from(g: DecisionGate) -> Self {
+        Self {
+            id: g.id,
+            task_id: g.task_id,
+            question: g.question,
+            options: g.options,
+            resolution: g.resolution,
+            status: g.status.as_str().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct JudgeVerdictDto {
+    pub winner_index: usize,
+    pub scores: Vec<f64>,
+    pub reason: String,
+    pub candidates: Vec<JudgeCandidateDto>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct JudgeCandidateDto {
+    pub index: usize,
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerSessionDto {
+    pub dispatch_id: String, pub run_id: String, pub task_id: String, pub worker_id: String,
+    pub final_response: Option<String>, pub error: Option<String>, pub created_at: String, pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerTranscriptDto { pub source: String, pub entries: Vec<WorkerTranscriptEntryDto> }
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum WorkerTranscriptEntryDto {
+    MessageRaw { json: String, created_at: String },
+    Activity { text: String, created_at: String },
+}
+
 /// `hermes_task_list` 的可选过滤参数（镜像 [`TaskListFilter`]）。
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -200,6 +335,63 @@ fn parse_task_list_filter(dto: Option<TaskListFilterDto>) -> Result<TaskListFilt
         status,
         ready: dto.ready.unwrap_or(false),
     })
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GateListFilterDto {
+    pub task_id: Option<String>,
+    pub status: Option<String>,
+}
+
+fn parse_gate_list_filter(dto: Option<GateListFilterDto>) -> Result<GateListFilter, String> {
+    let Some(dto) = dto else {
+        return Ok(GateListFilter::default());
+    };
+    let task_id = dto
+        .task_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let status = match dto.status.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => Some(GateStatus::from_str(s).map_err(|e| format!("hermes_gate_list: {e}"))?),
+        None => None,
+    };
+    Ok(GateListFilter { task_id, status })
+}
+
+fn default_roster() -> Roster {
+    Roster(vec![
+        RosterEntry {
+            runtime: RuntimeKind::Sdk,
+            provider: "claude".to_string(),
+            model: "sonnet".to_string(),
+            label: "Claude SDK".to_string(),
+            cost_hint: Some("mid".to_string()),
+        },
+        RosterEntry {
+            runtime: RuntimeKind::Sdk,
+            provider: "codex".to_string(),
+            model: "glm-5.2".to_string(),
+            label: "Hermes Codex SDK".to_string(),
+            cost_hint: Some("low".to_string()),
+        },
+    ])
+}
+
+fn terminal_run_failure_error(store: &Store) -> String {
+    let Some(reason) = store.terminal_failure_reason().ok().flatten() else {
+        return GENERIC_RUN_FAILURE_ERROR.to_string();
+    };
+    let normalized = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let bounded: String = normalized
+        .chars()
+        .take(MAX_RUN_FAILURE_REASON_CHARS)
+        .collect();
+    if bounded.is_empty() {
+        GENERIC_RUN_FAILURE_ERROR.to_string()
+    } else {
+        bounded
+    }
 }
 
 // =============================================================================
@@ -324,6 +516,12 @@ pub struct RunHandle {
     pub cancel: Arc<AtomicBool>,
 }
 
+fn finish_run_handle(runs: &Arc<StdMutex<HashMap<String, RunHandle>>>, run_id: &str) {
+    if let Ok(mut runs) = runs.lock() {
+        runs.remove(run_id);
+    }
+}
+
 /// Hermes 编排引擎的 Tauri 管理状态。
 ///
 /// 持有：
@@ -338,7 +536,7 @@ pub struct HermesEngine {
     registry: RuntimeRegistry,
     repo_root: PathBuf,
     worktrees_dir: PathBuf,
-    runs: StdMutex<HashMap<String, RunHandle>>,
+    runs: Arc<StdMutex<HashMap<String, RunHandle>>>,
 }
 
 impl HermesEngine {
@@ -355,8 +553,25 @@ impl HermesEngine {
             registry,
             repo_root,
             worktrees_dir,
-            runs: StdMutex::new(HashMap::new()),
+            runs: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    fn planner_runtime(&self) -> Result<Arc<dyn crate::hermes::AgentRuntime>, String> {
+        self.registry
+            .get(RuntimeKind::Sdk)
+            .or_else(|_| self.registry.get(RuntimeKind::Cli))
+    }
+
+    fn planner_runtime_for_roster(
+        &self,
+        roster: &Roster,
+    ) -> Result<Arc<dyn crate::hermes::AgentRuntime>, String> {
+        roster
+            .0
+            .first()
+            .map(|entry| self.registry.get(entry.runtime))
+            .unwrap_or_else(|| self.planner_runtime())
     }
 
     /// 启动一次编排 run：建 run 记录 + spawn 后台 Coordinator 循环 + 注册 RunHandle。
@@ -375,6 +590,8 @@ impl HermesEngine {
     ) -> Result<String, String> {
         let normalized_goal = normalize_run_goal(&goal)?;
         let repo_root = opts.repo_root.unwrap_or_else(|| self.repo_root.clone());
+        let roster = opts.roster.unwrap_or_else(default_roster);
+        let planner_runtime = self.planner_runtime_for_roster(&roster)?;
 
         // 建 run 记录（Store 置为 Running）。
         let run = self
@@ -408,6 +625,7 @@ impl HermesEngine {
         let run_id = run.id.clone();
         let run_goal = run.goal.clone();
         let cancel_for_task = cancel.clone();
+        let runs_for_task = Arc::clone(&self.runs);
         // Task 4：把 sink 也 move 进 spawned closure，让错误路径 / 终态 emit 都走 sink。
         let sink_for_task = sink.clone();
 
@@ -415,6 +633,11 @@ impl HermesEngine {
             let coordinator =
                 Coordinator::new(store.clone_handle(), registry, repo_root, worktrees_dir)
                     .with_max_concurrent(opts.max_concurrent)
+                    .with_planner(
+                        Arc::new(Planner::new(planner_runtime)),
+                        roster,
+                        run_goal.clone(),
+                    )
                     // Task 11（3c）：注入取消信号，让 Coordinator 的 run() 每轮 tick 前都检查
                     // mid-run cancel（置位 → abort 在飞 dispatch + 标 Cancelled）。Phase 2 的
                     // pre-loop 单次检查（下方 if 分支）保留不变——二者共用同一 `cancel` Arc：
@@ -446,6 +669,7 @@ impl HermesEngine {
                             status: RunStatus::Failed.as_str().to_string(),
                             error: Some(e),
                         });
+                        finish_run_handle(&runs_for_task, &run_id);
                         return;
                     }
                 }
@@ -457,11 +681,12 @@ impl HermesEngine {
                 goal: run_goal,
                 status: final_status.as_str().to_string(),
                 error: if final_status == RunStatus::Failed {
-                    Some("run ended in failed state".to_string())
+                    Some(terminal_run_failure_error(&store))
                 } else {
                     None
                 },
             });
+            finish_run_handle(&runs_for_task, &run_id);
         });
 
         Ok(run.id)
@@ -485,6 +710,55 @@ impl HermesEngine {
         self.store.list_active_dispatches()
     }
 
+    pub fn list_gates(&self, filter: GateListFilter) -> Result<Vec<DecisionGate>, String> {
+        self.store.list_gates(filter)
+    }
+
+    pub fn show_gate(&self, gate_id: &str) -> Result<DecisionGate, String> {
+        let trimmed = gate_id.trim();
+        if trimmed.is_empty() {
+            return Err("hermes_gate_show: gate_id 不能为空".to_string());
+        }
+        self.store
+            .list_gates(GateListFilter::default())?
+            .into_iter()
+            .find(|gate| gate.id == trimmed)
+            .ok_or_else(|| format!("hermes_gate_show: 未找到 gate_id {trimmed}"))
+    }
+
+    pub fn show_judge(&self, run_id: &str) -> Result<Option<JudgeVerdictDto>, String> {
+        let trimmed = run_id.trim();
+        if trimmed.is_empty() {
+            return Err("hermes_judge_show: run_id 不能为空".to_string());
+        }
+        Ok(None)
+    }
+
+    pub fn worker_transcript(
+        &self,
+        agent_or_dispatch_id: &str,
+    ) -> Result<WorkerTranscriptDto, String> {
+        let trimmed = agent_or_dispatch_id.trim();
+        if trimmed.is_empty() {
+            return Err("hermes_worker_transcript: agent_id/dispatch_id 不能为空".to_string());
+        }
+        let dispatch_id = self.store.list_worker_sessions(None)?.into_iter()
+            .find(|session| session.dispatch_id == trimmed || session.worker_id == trimmed)
+            .map(|session| session.dispatch_id)
+            .unwrap_or_else(|| trimmed.to_string());
+        let entries = self.store.list_worker_transcript_entries(&dispatch_id)?
+            .into_iter().filter_map(|entry| match entry.kind.as_str() {
+                "message_raw" => serde_json::from_str::<serde_json::Value>(&entry.payload).ok().map(|_| WorkerTranscriptEntryDto::MessageRaw { json: entry.payload, created_at: entry.created_at }),
+                "activity" => Some(WorkerTranscriptEntryDto::Activity { text: entry.payload, created_at: entry.created_at }),
+                _ => None,
+            }).collect::<Vec<_>>();
+        Ok(WorkerTranscriptDto { source: if entries.is_empty() { "none".into() } else { "persisted".into() }, entries })
+    }
+
+    pub fn list_worker_sessions(&self, run_id: Option<&str>) -> Result<Vec<WorkerSessionDto>, String> {
+        self.store.list_worker_sessions(run_id).map(|sessions| sessions.into_iter().map(|s| WorkerSessionDto { dispatch_id: s.dispatch_id, run_id: s.run_id, task_id: s.task_id, worker_id: s.worker_id, final_response: s.final_response, error: s.error, created_at: s.created_at, completed_at: s.completed_at }).collect())
+    }
+
     /// 列出任务（薄 delegate 到 Store）。
     pub fn list_tasks(&self, filter: TaskListFilter) -> Result<Vec<Task>, String> {
         self.store.list_tasks(filter)
@@ -503,6 +777,55 @@ impl HermesEngine {
         }
         self.store
             .resolve_gate(gate_id, trimmed.to_string())
+    }
+
+    pub async fn abort_agent(&self, agent_or_dispatch_id: &str) -> Result<DispatchContext, String> {
+        let trimmed = agent_or_dispatch_id.trim();
+        if trimmed.is_empty() {
+            return Err("hermes_agent_abort: agent_id/dispatch_id 不能为空".to_string());
+        }
+
+        let dispatch = self
+            .store
+            .list_active_dispatches()?
+            .into_iter()
+            .find(|ctx| {
+                ctx.id == trimmed || ctx.assignee.as_deref() == Some(trimmed)
+            })
+            .ok_or_else(|| format!("hermes_agent_abort: 未找到活跃 agent/dispatch {trimmed}"))?;
+
+        let agent_id = dispatch
+            .assignee
+            .clone()
+            .ok_or_else(|| "hermes_agent_abort: dispatch 缺少 assignee".to_string())?;
+        let kind = self
+            .store
+            .get_task(&dispatch.task_id)?
+            .and_then(|task| task.assignment.map(|a| a.runtime))
+            .unwrap_or(RuntimeKind::Sdk);
+        let runtime = self.registry.get(kind)?;
+        let handle = AgentHandle { agent_id };
+
+        // Claim the dispatch before awaiting runtime shutdown. The coordinator watcher uses
+        // this same persisted status as its lifecycle guard, so late stream events are inert.
+        let updated = self
+            .store
+            .abort_dispatch(&dispatch.id, "aborted by user")?
+            .ok_or_else(|| format!("hermes_agent_abort: dispatch disappeared {}", dispatch.id))?;
+        self.store.update_task_status(&updated.task_id, TaskStatus::Ready, None)?;
+
+        // Do not return after abort failure: stop still needs to release the worker process.
+        // Both awaits happen outside the Store and runs mutexes.
+        let abort_result = runtime.abort(&handle).await;
+        let stop_result = runtime.stop(&handle).await;
+        if let Err(error) = abort_result {
+            return Err(format!("hermes_agent_abort: runtime abort failed: {:?}", error));
+        }
+        if let Err(error) = stop_result {
+            return Err(format!("hermes_agent_abort: runtime stop failed: {:?}", error));
+        }
+
+        Ok(updated)
     }
 
     /// 取消指定 run：置 cancel 标志，spawned 循环会在下一轮 tick 前退出并把 run 标 Failed。
@@ -541,6 +864,86 @@ impl HermesEngine {
             run_id,
         )?;
         Ok(SweepReportDto::from(report))
+    }
+
+    pub fn start_mock_run(
+        &self,
+        app: AppHandle,
+        goal: String,
+        opts: NormalizedRunOpts,
+    ) -> Result<String, String> {
+        let normalized_goal = normalize_run_goal(&goal)?;
+        let repo_root = opts.repo_root.unwrap_or_else(|| self.repo_root.clone());
+        let roster = opts.roster.unwrap_or_else(default_roster);
+        let run = self
+            .store
+            .create_run(&normalized_goal, COORDINATOR_HANDLE, opts.poll_interval_ms)?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.runs
+            .lock()
+            .map_err(|e| format!("HermesEngine runs lock poisoned: {e}"))?
+            .insert(
+                run.id.clone(),
+                RunHandle {
+                    cancel: Arc::clone(&cancel),
+                },
+            );
+
+        let sink = Arc::new(TauriEventSink::new(app, run.id.clone()));
+        sink.emit(crate::hermes::OrchestrationEvent::Run {
+            run_id: run.id.clone(),
+            goal: run.goal.clone(),
+            status: RunStatus::Running.as_str().to_string(),
+            error: None,
+        });
+
+        let store = self.store.clone_handle();
+        let run_id = run.id.clone();
+        let run_goal = run.goal.clone();
+        let worktrees_dir = self.worktrees_dir.clone();
+        let sink_for_task = sink.clone();
+        let runs_for_task = Arc::clone(&self.runs);
+        tauri::async_runtime::spawn(async move {
+            let scripted = Arc::new(ScriptedRuntime::default());
+            let runtime: Arc<dyn crate::hermes::AgentRuntime> = scripted.clone();
+            let registry = RuntimeRegistry::single(runtime.clone());
+            let planner = Arc::new(Planner::new(runtime));
+            let coordinator =
+                Coordinator::new(store.clone_handle(), registry, repo_root, worktrees_dir)
+                    .with_max_concurrent(opts.max_concurrent)
+                    .with_planner(planner, roster, run_goal.clone())
+                    .with_cancel(cancel)
+                    .with_event_sink(
+                        sink_for_task.clone() as Arc<dyn crate::hermes::OrchestrationEventSink>,
+                    );
+            let final_status = match coordinator.run(&run_id).await {
+                Ok(status) => status,
+                Err(e) => {
+                    let _ = store.update_run(&run_id, RunStatus::Failed);
+                    sink_for_task.emit(crate::hermes::OrchestrationEvent::Run {
+                        run_id: run_id.clone(),
+                        goal: run_goal.clone(),
+                        status: RunStatus::Failed.as_str().to_string(),
+                        error: Some(e),
+                    });
+                    finish_run_handle(&runs_for_task, &run_id);
+                    return;
+                }
+            };
+            sink_for_task.emit(crate::hermes::OrchestrationEvent::Run {
+                run_id: run_id.clone(),
+                goal: run_goal,
+                status: final_status.as_str().to_string(),
+                error: if final_status == RunStatus::Failed {
+                    Some(terminal_run_failure_error(&store))
+                } else {
+                    None
+                },
+            });
+            finish_run_handle(&runs_for_task, &run_id);
+        });
+
+        Ok(run.id)
     }
 }
 
@@ -604,6 +1007,46 @@ pub async fn hermes_gate_resolve(
     state.resolve_gate(trimmed_id, resolution)
 }
 
+#[tauri::command]
+pub async fn hermes_gate_list(
+    filter: Option<GateListFilterDto>,
+    state: State<'_, HermesEngine>,
+) -> Result<Vec<GateDto>, String> {
+    let parsed = parse_gate_list_filter(filter)?;
+    let gates = state.list_gates(parsed)?;
+    Ok(gates.into_iter().map(GateDto::from).collect())
+}
+
+#[tauri::command]
+pub async fn hermes_gate_show(
+    gate_id: String,
+    state: State<'_, HermesEngine>,
+) -> Result<GateDto, String> {
+    let gate = state.show_gate(&gate_id)?;
+    Ok(GateDto::from(gate))
+}
+
+#[tauri::command]
+pub async fn hermes_judge_show(
+    run_id: String,
+    state: State<'_, HermesEngine>,
+) -> Result<Option<JudgeVerdictDto>, String> {
+    state.show_judge(&run_id)
+}
+
+#[tauri::command]
+pub async fn hermes_worker_transcript(
+    agent_id: String,
+    state: State<'_, HermesEngine>,
+) -> Result<WorkerTranscriptDto, String> {
+    state.worker_transcript(&agent_id)
+}
+
+#[tauri::command]
+pub async fn hermes_worker_session_list(run_id: Option<String>, state: State<'_, HermesEngine>) -> Result<Vec<WorkerSessionDto>, String> {
+    state.list_worker_sessions(run_id.as_deref().map(str::trim).filter(|id| !id.is_empty()))
+}
+
 /// 取消指定 run（设置取消标志，spawned 循环会在下一轮 tick 前退出）。
 ///
 /// Phase 2 语义：置 `RunHandle.cancel` 标志。`start_run` 的 pre-loop 快路径命中时
@@ -631,6 +1074,15 @@ pub async fn hermes_run_cancel(
     // 复用 stop_run 的取消标志置位逻辑（同一 RunHandle.cancel）。mid-run 行为来自
     // start_run 内 with_cancel 注入（Task 11），而非本命令自身。
     state.stop_run(&run_id)
+}
+
+#[tauri::command]
+pub async fn hermes_agent_abort(
+    agent_id: String,
+    state: State<'_, HermesEngine>,
+) -> Result<DispatchDto, String> {
+    let dispatch = state.abort_agent(&agent_id).await?;
+    Ok(DispatchDto::from(dispatch))
 }
 
 /// Task 4：取一条 run 的概览 + 任务计数（驾驶舱顶部用）。
@@ -677,6 +1129,18 @@ pub async fn hermes_run_cleanup(
     state.cleanup_run(trimmed, app)
 }
 
+#[tauri::command]
+pub async fn hermes_run_mock(
+    goal: String,
+    opts: Option<HermesRunOpts>,
+    state: State<'_, HermesEngine>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let normalized_goal = normalize_run_goal(&goal)?;
+    let normalized_opts = normalize_run_opts(opts.unwrap_or_default())?;
+    state.start_mock_run(app, normalized_goal, normalized_opts)
+}
+
 // =============================================================================
 // 测试
 // =============================================================================
@@ -685,8 +1149,8 @@ pub async fn hermes_run_cleanup(
 mod tests {
     use super::*;
     use crate::hermes::{
-        AgentEvent, AgentHandle, AgentRuntime, GateStatus, Liveness, RuntimeCapabilities,
-        RuntimeError, RuntimeStartSpec, Store,
+        AgentEvent, AgentHandle, AgentRuntime, DispatchStatus, GateStatus, Liveness,
+        RuntimeCapabilities, RuntimeError, RuntimeStartSpec, Store,
     };
     use async_trait::async_trait;
     use std::path::PathBuf;
@@ -715,6 +1179,7 @@ mod tests {
             max_concurrent: Some(8),
             poll_interval_ms: Some(500),
             repo_root: Some("/tmp/repo".to_string()),
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(opts.max_concurrent, 8);
@@ -728,6 +1193,7 @@ mod tests {
             max_concurrent: Some(0),
             poll_interval_ms: None,
             repo_root: None,
+            ..Default::default()
         })
         .is_err());
     }
@@ -738,8 +1204,87 @@ mod tests {
             max_concurrent: None,
             poll_interval_ms: Some(0),
             repo_root: None,
+            ..Default::default()
         })
         .is_err());
+    }
+
+    #[test]
+    fn normalize_run_opts_converts_selected_roster() {
+        let opts = normalize_run_opts(HermesRunOpts {
+            roster: Some(vec![HermesRosterEntryOpt {
+                runtime: "cli".to_string(),
+                provider: "codex".to_string(),
+                model: "glm-5.2".to_string(),
+                label: "glm-luster".to_string(),
+                cost_hint: Some("low".to_string()),
+            }]),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let roster = opts.roster.expect("selected roster should be preserved");
+        assert_eq!(roster.0.len(), 1);
+        assert_eq!(roster.0[0].runtime, RuntimeKind::Cli);
+        assert_eq!(roster.0[0].provider, "codex");
+        assert_eq!(roster.0[0].model, "glm-5.2");
+        assert_eq!(roster.0[0].label, "glm-luster");
+    }
+
+    #[test]
+    fn normalize_run_opts_rejects_unsupported_roster_provider() {
+        let err = normalize_run_opts(HermesRunOpts {
+            roster: Some(vec![HermesRosterEntryOpt {
+                runtime: "sdk".to_string(),
+                provider: "gemini".to_string(),
+                model: "gemini-2.5".to_string(),
+                label: "unsupported".to_string(),
+                cost_hint: None,
+            }]),
+            ..Default::default()
+        })
+        .expect_err("unsupported providers must be rejected at the command boundary");
+
+        assert!(err.contains("provider"), "got: {err}");
+    }
+
+    #[test]
+    fn normalize_run_opts_rejects_duplicate_runtime_model_across_providers() {
+        let err = normalize_run_opts(HermesRunOpts {
+            roster: Some(vec![
+                HermesRosterEntryOpt {
+                    runtime: "sdk".to_string(),
+                    provider: "claude".to_string(),
+                    model: "sonnet".to_string(),
+                    label: "Claude Sonnet".to_string(),
+                    cost_hint: None,
+                },
+                HermesRosterEntryOpt {
+                    runtime: "sdk".to_string(),
+                    provider: "codex".to_string(),
+                    model: "sonnet".to_string(),
+                    label: "Codex Sonnet".to_string(),
+                    cost_hint: None,
+                },
+            ]),
+            ..Default::default()
+        })
+        .expect_err("provider must not make a duplicate runtime/model roster entry ambiguous");
+
+        assert!(err.contains("重复"), "got: {err}");
+        assert!(err.contains("runtime=sdk"), "got: {err}");
+        assert!(err.contains("model=sonnet"), "got: {err}");
+    }
+
+    #[test]
+    fn normalize_run_opts_rejects_empty_selected_roster() {
+        let err = normalize_run_opts(HermesRunOpts {
+            roster: Some(vec![]),
+            ..Default::default()
+        })
+        .expect_err("empty selected roster must be rejected");
+
+        assert!(err.contains("roster 不能为空"), "got: {err}");
     }
 
     #[test]
@@ -878,6 +1423,34 @@ mod tests {
     }
 
     #[test]
+    fn engine_planner_runtime_follows_selected_roster_runtime() {
+        let store = Store::open_in_memory().unwrap();
+        let runtime: Arc<dyn AgentRuntime> = Arc::new(NoopRuntime);
+        let engine = HermesEngine::new(
+            store,
+            RuntimeRegistry::new().with(RuntimeKind::Sdk, runtime),
+            PathBuf::from("/tmp/repo"),
+            PathBuf::from("/tmp/worktrees"),
+        );
+        let roster = Roster(vec![RosterEntry {
+            runtime: RuntimeKind::Cli,
+            provider: "codex".to_string(),
+            model: "glm-5.2".to_string(),
+            label: "glm-luster".to_string(),
+            cost_hint: Some("low".to_string()),
+        }]);
+
+        let err = match engine.planner_runtime_for_roster(&roster) {
+            Ok(_) => panic!("CLI-only roster must require CLI runtime"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("Cli"),
+            "planner runtime error should mention selected runtime, got: {err}"
+        );
+    }
+
+    #[test]
     fn engine_stop_run_registers_and_cancels_handle() {
         // 手动注入 RunHandle 模拟 start_run 的注册步骤（spawned 循环在单测里跑不起来）。
         let engine = build_test_engine();
@@ -898,6 +1471,34 @@ mod tests {
 
         // 不存在的 run_id 报错。
         assert!(engine.stop_run("run_does_not_exist").is_err());
+    }
+
+    #[test]
+    fn engine_terminal_paths_remove_run_handles() {
+        let engine = build_test_engine();
+
+        for terminal_path in [
+            "coordinator success",
+            "coordinator error",
+            "pre-loop cancel",
+            "mock run",
+        ] {
+            let run_id = format!("run_{terminal_path}");
+            engine.runs.lock().unwrap().insert(
+                run_id.clone(),
+                RunHandle {
+                    cancel: Arc::new(AtomicBool::new(false)),
+                },
+            );
+
+            finish_run_handle(&engine.runs, &run_id);
+
+            let err = engine.stop_run(&run_id).unwrap_err();
+            assert!(
+                err.contains("未找到") && err.contains("已结束"),
+                "{terminal_path} must remove its run handle: {err}"
+            );
+        }
     }
 
     /// Task 11（3c）：`hermes_run_cancel` 命令薄 delegate 到 `stop_run`——二者置同一
@@ -944,10 +1545,227 @@ mod tests {
         // Store 里读回 status = Resolved。
         let gates = engine
             .store
-            .list_gates(hermes::GateListFilter { task_id: Some("t1".into()), status: None })
+            .list_gates(GateListFilter { task_id: Some("t1".into()), status: None })
             .unwrap();
         assert_eq!(gates[0].status, GateStatus::Resolved);
         assert_eq!(gates[0].resolution.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn engine_list_and_show_gates_filter_by_task_and_status() {
+        let engine = build_test_engine();
+        let first = engine
+            .store
+            .create_gate("task-a", "Approve task A?", vec!["yes".into(), "no".into()])
+            .unwrap();
+        let second = engine
+            .store
+            .create_gate("task-b", "Approve task B?", vec!["approve".into()])
+            .unwrap();
+        engine.resolve_gate(&second.id, "approve".into()).unwrap();
+
+        let pending_task_a = engine
+            .list_gates(GateListFilter {
+                task_id: Some("task-a".into()),
+                status: Some(GateStatus::Pending),
+            })
+            .unwrap();
+
+        assert_eq!(pending_task_a.len(), 1);
+        assert_eq!(pending_task_a[0].id, first.id);
+
+        let shown = engine.show_gate(&first.id).unwrap();
+        assert_eq!(shown.task_id, "task-a");
+        assert_eq!(shown.status, GateStatus::Pending);
+
+        assert!(engine.show_gate("missing-gate").is_err());
+    }
+
+    struct AbortRecordingRuntime {
+        aborted: std::sync::Mutex<Vec<String>>,
+        stopped: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl AbortRecordingRuntime {
+        fn new() -> Self {
+            Self {
+                aborted: std::sync::Mutex::new(Vec::new()),
+                stopped: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgentRuntime for AbortRecordingRuntime {
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities {
+                structured_events: true,
+                supports_resume: false,
+                supports_permission_prompt: false,
+            }
+        }
+        async fn start(&self, spec: RuntimeStartSpec) -> Result<AgentHandle, RuntimeError> {
+            Ok(AgentHandle { agent_id: spec.agent_id })
+        }
+        async fn send(
+            &self,
+            _handle: &AgentHandle,
+            _prompt: String,
+        ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, RuntimeError> {
+            let (_tx, rx) = mpsc::unbounded_channel();
+            Ok(rx)
+        }
+        async fn abort(&self, handle: &AgentHandle) -> Result<(), RuntimeError> {
+            self.aborted
+                .lock()
+                .unwrap()
+                .push(handle.agent_id.clone());
+            Ok(())
+        }
+        async fn liveness(&self, _handle: &AgentHandle) -> Liveness {
+            Liveness::Alive
+        }
+        async fn stop(&self, handle: &AgentHandle) -> Result<(), RuntimeError> {
+            self.stopped.lock().unwrap().push(handle.agent_id.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_abort_agent_aborts_runtime_and_marks_dispatch_failed() {
+        let store = Store::open_in_memory().unwrap();
+        let runtime = Arc::new(AbortRecordingRuntime::new());
+        let registry = crate::hermes::RuntimeRegistry::single(runtime.clone());
+        let engine = HermesEngine::new(
+            store,
+            registry,
+            PathBuf::from("/tmp/repo"),
+            PathBuf::from("/tmp/worktrees"),
+        );
+        engine
+            .store
+            .create_task(Task {
+                id: "task-abort".into(),
+                parent_id: None,
+                spec: "abort me".into(),
+                status: TaskStatus::Dispatched,
+                deps: vec![],
+                result: None,
+                assignment: None,
+                created_at: "2026-06-28T00:00:00Z".into(),
+                completed_at: None,
+            })
+            .unwrap();
+        engine
+            .store
+            .create_dispatch(DispatchContext {
+                id: "disp-abort".into(),
+                task_id: "task-abort".into(),
+                assignee: Some("agent-abort".into()),
+                status: DispatchStatus::Dispatched,
+                failure_count: 0,
+                last_heartbeat_at: Some("2026-06-28T00:00:00Z".into()),
+                last_failure: None,
+                dispatched_at: Some("2026-06-28T00:00:00Z".into()),
+                completed_at: None,
+                created_at: "2026-06-28T00:00:00Z".into(),
+            })
+            .unwrap();
+
+        let aborted = engine.abort_agent("agent-abort").await.unwrap();
+
+        assert_eq!(aborted.id, "disp-abort");
+        assert_eq!(
+            runtime.aborted.lock().unwrap().as_slice(),
+            &["agent-abort".to_string()]
+        );
+        assert_eq!(
+            runtime.stopped.lock().unwrap().as_slice(),
+            &["agent-abort".to_string()]
+        );
+        let dispatch = engine.store.get_dispatch("disp-abort").unwrap().unwrap();
+        assert_eq!(dispatch.status, DispatchStatus::Failed);
+        let task = engine.store.get_task("task-abort").unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn scripted_runtime_produces_plan_and_worker_events() {
+        let runtime = crate::hermes::ScriptedRuntime::default();
+        let planner_handle = runtime
+            .start(RuntimeStartSpec {
+                agent_id: "planner-plan-test".into(),
+                cwd: PathBuf::from("/tmp/repo"),
+                model: "sonnet".into(),
+                provider: "claude".into(),
+            })
+            .await
+            .unwrap();
+        let mut planner_rx = runtime.send(&planner_handle, "plan".into()).await.unwrap();
+        let mut plan_text = String::new();
+        while let Some(event) = planner_rx.recv().await {
+            if let AgentEvent::TextDelta(text) = event {
+                plan_text.push_str(&text);
+            }
+        }
+        assert!(plan_text.contains("\"tasks\""));
+
+        let worker_handle = runtime
+            .start(RuntimeStartSpec {
+                agent_id: "mock-task-1".into(),
+                cwd: PathBuf::from("/tmp/repo"),
+                model: "sonnet".into(),
+                provider: "claude".into(),
+            })
+            .await
+            .unwrap();
+        let mut worker_rx = runtime.send(&worker_handle, "work".into()).await.unwrap();
+        let mut saw_tool = false;
+        let mut saw_done = false;
+        while let Some(event) = worker_rx.recv().await {
+            match event {
+                AgentEvent::ToolUse { .. } => saw_tool = true,
+                AgentEvent::Done { success, .. } => saw_done = success,
+                _ => {}
+            }
+        }
+        assert!(saw_tool);
+        assert!(saw_done);
+    }
+
+    #[test]
+    fn engine_show_judge_returns_empty_until_verdict_source_is_connected() {
+        let engine = build_test_engine();
+
+        assert_eq!(engine.show_judge("run_123").unwrap(), None);
+        assert!(engine.show_judge("   ").is_err());
+    }
+
+    #[test]
+    fn engine_worker_transcript_returns_discriminated_empty_bridge_contract() {
+        let engine = build_test_engine();
+
+        let transcript = engine.worker_transcript("agent_123").unwrap();
+        assert!(transcript.entries.is_empty());
+        assert_eq!(transcript.source, "none");
+        assert!(engine.worker_transcript("   ").is_err());
+    }
+
+    #[test]
+    fn engine_planner_runtime_is_checked_before_creating_run() {
+        let store = Store::open_in_memory().unwrap();
+        let engine = HermesEngine::new(
+            store,
+            RuntimeRegistry::new(),
+            PathBuf::from("/tmp/repo"),
+            PathBuf::from("/tmp/worktrees"),
+        );
+
+        assert!(engine.planner_runtime().is_err());
+        assert!(
+            engine.store.get_active_run().unwrap().is_none(),
+            "runtime validation failures must not leave invisible runs in the store"
+        );
     }
 
     #[test]

@@ -8,6 +8,8 @@ import {
   TaskListFilterDto,
   JudgeVerdictDto,
   InterventionGateDto,
+  WorkerTranscriptDto,
+  WorkerSessionDto,
 } from '../types/hermes';
 
 /**
@@ -58,18 +60,7 @@ export async function gateList(filter?: { taskId?: string; status?: string }): P
  * 获取决策门详情
  */
 export async function gateShow(gateId: string): Promise<InterventionGateDto> {
-  try {
-    return await invoke<InterventionGateDto>('hermes_gate_show', { gateId });
-  } catch (error) {
-    console.error('gateShow failed:', error);
-    return {
-      id: gateId,
-      taskId: 'task-fallback',
-      question: 'Fallback Gate',
-      options: ['approve', 'reject'],
-      status: 'pending',
-    };
-  }
+  return await invoke<InterventionGateDto>('hermes_gate_show', { gateId });
 }
 
 
@@ -102,6 +93,13 @@ export async function agentList(): Promise<DispatchDto[]> {
 }
 
 /**
+ * 停止单个 agent / dispatch。
+ */
+export async function agentAbort(agentId: string): Promise<DispatchDto> {
+  return await invoke<DispatchDto>('hermes_agent_abort', { agentId });
+}
+
+/**
  * 手动触发一次 run 的 worktree 清扫
  */
 export async function runCleanup(runId: string): Promise<SweepReportDto> {
@@ -120,9 +118,19 @@ export async function judgeShow(runId: string): Promise<JudgeVerdictDto | null> 
 }
 
 /**
+ * 获取 worker 完整执行记录；桥未接通时后端返回空数组。
+ */
+export async function workerTranscript(agentId: string): Promise<WorkerTranscriptDto> {
+  return await invoke<WorkerTranscriptDto>('hermes_worker_transcript', { agentId });
+}
+
+export async function workerSessionList(runId?: string): Promise<WorkerSessionDto[]> {
+  return await invoke<WorkerSessionDto[]>('hermes_worker_session_list', { runId });
+}
+
+/**
  * 演示运行 (mock run)
  */
 export async function runMock(goal: string, opts?: HermesRunOpts): Promise<string> {
   return await invoke<string>('hermes_run_mock', { goal, opts });
 }
-

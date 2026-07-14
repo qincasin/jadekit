@@ -458,6 +458,7 @@ impl Coordinator {
                 .unwrap_or(RuntimeKind::Sdk);
             if let Ok(rt) = self.registry.get(kind) {
                 let _ = rt.abort(&handle).await;
+                let _ = rt.stop(&handle).await;
             }
 
             // —— 中文：fail_dispatch + 熔断级联（接入已建好的路径） ——
@@ -506,8 +507,15 @@ impl Coordinator {
             match msg.kind {
                 MessageType::WorkerDone => {
                     // 解析 payload { taskId, dispatchId, result? }
-                    let (task_id, result_text) = parse_worker_done_payload(&msg.payload);
-                    if let Some(task_id) = task_id {
+                    let (task_id, dispatch_id, result_text) = parse_worker_done_payload(&msg.payload);
+                    if let (Some(task_id), Some(dispatch_id)) = (task_id, dispatch_id) {
+                        // A terminal worker event is only authoritative while its original
+                        // dispatch is still active. User aborts claim the dispatch before
+                        // awaiting runtime shutdown, so a late Done cannot revive it.
+                        if !is_dispatch_active(&self.store, &dispatch_id)? {
+                            read_seqs.push(msg.sequence as i64);
+                            continue;
+                        }
                         // Store 的 update_task_status(Completed) 会在同一事务把
                         // 下游 Pending → Ready。
                         let task = self.store.get_task(&task_id)?;
@@ -623,21 +631,17 @@ impl Coordinator {
 
         // —— 3. runtime.start ——
         //
-        // Fix B（Task 9 review）：RuntimeStartSpec.provider 必须是 **vendor**（如 "claude"），
-        // 不是 assignment.tool（medium 标识 "claude-sdk"/"claude-cli"）。vendor 决定路由到
-        // 哪个 runtime 实现；medium 由 Coordinator 当前持有的 runtime 实例决定（Phase 2 只有
-        // SdkRuntime 一种；Phase 3 才支持 Sdk+Cli 异构选择，YAGNI 暂不做）。
-        // assignment.runtime（RuntimeKind）是 medium selector，但在 Phase 2 单介质下，它和
-        // Coordinator 持有的 runtime 实例一致——此处不读它，统一用 DEFAULT_PROVIDER。
-        let model = match &task.assignment {
-            Some(a) => a.model.clone(),
-            None => DEFAULT_MODEL.to_string(),
+        // Provider/model originate from the validated roster assignment. `tool` is only a
+        // medium label and must never decide the provider route.
+        let (provider, model) = match &task.assignment {
+            Some(assignment) => (assignment.provider.clone(), assignment.model.clone()),
+            None => (DEFAULT_PROVIDER.to_string(), DEFAULT_MODEL.to_string()),
         };
         let start_spec = RuntimeStartSpec {
             agent_id: task.id.clone(),
             cwd: worktree_info.path.clone(),
             model,
-            provider: DEFAULT_PROVIDER.to_string(),
+            provider,
         };
         let handle = runtime
             .start(start_spec)
@@ -652,7 +656,7 @@ impl Coordinator {
         let carried_failures = self.store.latest_failure_count_for_task(&task.id)?;
         let dispatch_id = format!("disp_{}_{}", task.id, nanos_hex());
         let now = chrono::Utc::now().to_rfc3339();
-        self.store.create_dispatch(DispatchContext {
+        if let Err(error) = self.store.create_dispatch(DispatchContext {
             id: dispatch_id.clone(),
             task_id: task.id.clone(),
             assignee: Some(handle.agent_id.clone()),
@@ -663,13 +667,30 @@ impl Coordinator {
             dispatched_at: Some(now),
             completed_at: None,
             created_at: chrono::Utc::now().to_rfc3339(),
-        })?;
+        }) {
+            let _ = runtime.stop(&handle).await;
+            return Err(error);
+        }
+        let run_id_for_session = self.event_run_id.get().cloned().unwrap_or_default();
+        if let Err(error) = self.store.create_worker_session(
+            &dispatch_id,
+            &run_id_for_session,
+            &task.id,
+            &handle.agent_id,
+        ) {
+            let _ = runtime.stop(&handle).await;
+            return Err(error);
+        }
 
         // —— 5. runtime.send（task.spec + preamble）——
         let prompt = build_prompt(task, &dispatch_id);
-        let mut rx = runtime.send(&handle, prompt).await.map_err(|e| {
-            format!("runtime.send({}) failed: {:?}", task.id, e)
-        })?;
+        let mut rx = match runtime.send(&handle, prompt).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                let _ = runtime.stop(&handle).await;
+                return Err(format!("runtime.send({}) failed: {:?}", task.id, e));
+            }
+        };
 
         // —— 5b. Supervisor.register（可选；Task 18：把判活状态机接进循环） ——
         //
@@ -695,6 +716,8 @@ impl Coordinator {
         // 若注入了 Planner，watcher 调 planner.replan 并应用决策（重试/换兵/升级/收敛）。
         // 没注入 Planner 时走原路径，行为不变。
         let store = self.store_clone_for_watcher();
+        let runtime_w = runtime.clone();
+        let handle_w = handle.clone();
         let task_id = task.id.clone();
         let agent_id = handle.agent_id.clone();
         let dispatch_id_w = dispatch_id.clone();
@@ -719,7 +742,23 @@ impl Coordinator {
         tokio::spawn(async move {
             // RAII guard：watcher 退出时 dec 计数器（若注入）。
             let _guard = ActiveGuard(counter);
+            let mut final_response: Option<String> = None;
             while let Some(event) = rx.recv().await {
+                // The dispatch row is the shared lifecycle authority with command-side abort.
+                // Do this before supervisor/event processing so late stream events cannot
+                // change worker state or enqueue a terminal message after abort claimed it.
+                match is_dispatch_active(&store, &dispatch_id_w) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        let _ = store.complete_worker_session(&dispatch_id_w, final_response.as_deref(), Some(&error));
+                        eprintln!("Hermes watcher dispatch state read failed for {}: {}", dispatch_id_w, error);
+                        break;
+                    }
+                }
+                if let Some(text) = persist_worker_event(&store, &dispatch_id_w, &event) {
+                    final_response = Some(text);
+                }
                 // Task 18：先把事件喂给 supervisor.on_event（刷新活动时间 / 更新
                 // open_tool_uses / 标记 WaitingInput 等），supervisor=None 时零成本跳过。
                 // 注意：on_event 在状态机迁移（Done/Failed）前调用——supervisor 只用
@@ -733,6 +772,7 @@ impl Coordinator {
                 match event {
                     AgentEvent::Done { success, .. } => {
                         if success {
+                            let _ = store.complete_worker_session(&dispatch_id_w, final_response.as_deref(), None);
                             // 写 worker_done：下轮 tick drain_inbox 会把 task 标 Completed。
                             let _ = write_worker_done(
                                 &store,
@@ -774,6 +814,7 @@ impl Coordinator {
                         }
                     }
                     AgentEvent::Failed { error } => {
+                        let _ = store.complete_worker_session(&dispatch_id_w, final_response.as_deref(), Some(&error));
                         let broke = fail_dispatch_with_cascade(
                             &store,
                             &dispatch_id_w,
@@ -802,6 +843,7 @@ impl Coordinator {
                     _ => {}
                 }
             }
+            let _ = runtime_w.stop(&handle_w).await;
         });
 
         // Task 2：派发成功 → 发 Task{dispatched} 事件（驾驶舱 Roster 高亮新派发）。
@@ -870,7 +912,7 @@ impl Coordinator {
                 if let Err(e) = self.decompose_at_start(run_id).await {
                     // 拆解失败：记录原因并把 run 置 Failed，不进入循环。
                     self.record_run_failure(run_id, &e)?;
-                    return Ok(RunStatus::Failed);
+                    return Err(e);
                 }
             }
         }
@@ -1018,6 +1060,12 @@ impl Coordinator {
             let handle = AgentHandle {
                 agent_id: ctx.assignee.clone().unwrap_or_default(),
             };
+            // Claim the persisted dispatch before awaiting runtime shutdown. A watcher may
+            // still receive a terminal event after abort, but both watcher and inbox guards
+            // treat any non-Dispatched row as stale.
+            let updated = self.store.abort_dispatch(&ctx.id, "cancelled by user")?
+                .ok_or_else(|| format!("cancelled dispatch disappeared: {}", ctx.id))?;
+            self.store.update_task_status(&updated.task_id, TaskStatus::Ready, None)?;
             // 按该 task 的 assignment.runtime 选介质（缺省 Sdk）；缺 kind 跳过。
             let kind = self
                 .store
@@ -1028,6 +1076,7 @@ impl Coordinator {
                 .unwrap_or(RuntimeKind::Sdk);
             if let Ok(rt) = self.registry.get(kind) {
                 let _ = rt.abort(&handle).await;
+                let _ = rt.stop(&handle).await;
             }
         }
         Ok(())
@@ -1113,19 +1162,56 @@ impl Drop for ActiveGuard {
 
 /// 从 worker_done 消息 payload 中提取 (taskId, result?)。
 /// payload 形如 `{"taskId":"...","dispatchId":"...","result":"..."}`。
-fn parse_worker_done_payload(payload: &Option<String>) -> (Option<String>, Option<String>) {
+fn parse_worker_done_payload(
+    payload: &Option<String>,
+) -> (Option<String>, Option<String>, Option<String>) {
     let Some(p) = payload else {
-        return (None, None);
+        return (None, None, None);
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(p) else {
-        return (None, None);
+        return (None, None, None);
     };
     let task_id = v.get("taskId").and_then(|s| s.as_str()).map(String::from);
+    let dispatch_id = v
+        .get("dispatchId")
+        .and_then(|s| s.as_str())
+        .map(String::from);
     let result = v.get("result").map(|r| match r {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
     });
-    (task_id, result)
+    (task_id, dispatch_id, result)
+}
+
+fn is_dispatch_active(store: &Store, dispatch_id: &str) -> Result<bool, String> {
+    Ok(matches!(
+        store.get_dispatch(dispatch_id)?,
+        Some(DispatchContext {
+            status: DispatchStatus::Dispatched,
+            ..
+        })
+    ))
+}
+
+/// Append-only transcript persistence. Raw MESSAGE snapshots remain raw; every other event is
+/// recorded as a compact grounded activity record and is never promoted to a faux chat message.
+fn persist_worker_event(store: &Store, dispatch_id: &str, event: &AgentEvent) -> Option<String> {
+    match event {
+        AgentEvent::MessageRaw { json } => {
+            let _ = store.append_worker_transcript_entry(dispatch_id, "message_raw", json);
+            serde_json::from_str::<serde_json::Value>(json).ok().and_then(|message| {
+                message.get("message")?.get("content")?.as_array().map(|blocks| blocks.iter()
+                    .filter_map(|block| block.get("text")?.as_str()).collect::<String>())
+            }).filter(|text| !text.is_empty())
+        }
+        AgentEvent::TextDelta(text) => { let _ = store.append_worker_transcript_entry(dispatch_id, "activity", &format!("text: {text}")); Some(text.clone()) }
+        AgentEvent::Thinking(text) => { let _ = store.append_worker_transcript_entry(dispatch_id, "activity", &format!("thinking: {text}")); None }
+        AgentEvent::ToolUse { id, name } => { let _ = store.append_worker_transcript_entry(dispatch_id, "activity", &format!("tool_use: {name} ({id})")); None }
+        AgentEvent::ToolResult { tool_use_id, is_error } => { let _ = store.append_worker_transcript_entry(dispatch_id, "activity", &format!("tool_result: {tool_use_id} error={is_error}")); None }
+        AgentEvent::NeedsInput => { let _ = store.append_worker_transcript_entry(dispatch_id, "activity", "needs_input"); None }
+        AgentEvent::Done { success, .. } => { let _ = store.append_worker_transcript_entry(dispatch_id, "activity", &format!("done: {success}")); None }
+        AgentEvent::Failed { error } => { let _ = store.append_worker_transcript_entry(dispatch_id, "activity", &format!("failed: {error}")); None }
+    }
 }
 
 /// watcher 调用：写入一条 worker_done 消息到 Coordinator inbox。
@@ -1223,6 +1309,7 @@ fn emit_agent_event(
     event: &AgentEvent,
 ) {
     let (status, activity): (&str, Option<&str>) = match event {
+        AgentEvent::MessageRaw { .. } => (AGENT_STATUS_WORKING, Some(AGENT_ACTIVITY_TEXT)),
         AgentEvent::TextDelta(_) => (AGENT_STATUS_WORKING, Some(AGENT_ACTIVITY_TEXT)),
         AgentEvent::Thinking(_) => (AGENT_STATUS_WORKING, Some(AGENT_ACTIVITY_THINKING)),
         AgentEvent::ToolUse { .. } => (AGENT_STATUS_WORKING, Some(AGENT_ACTIVITY_TOOL_USE)),
@@ -1453,12 +1540,14 @@ mod tests {
 
     struct MockRuntime {
         events: std::sync::Mutex<ProgrammedEvents>,
+        stopped: std::sync::Mutex<Vec<String>>,
     }
 
     impl MockRuntime {
         fn new() -> Self {
             Self {
                 events: std::sync::Mutex::new(HashMap::new()),
+                stopped: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -1470,6 +1559,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(agent_id.to_string(), events);
+        }
+
+        fn stopped_agents(&self) -> Vec<String> {
+            self.stopped.lock().unwrap().clone()
         }
     }
 
@@ -1524,7 +1617,8 @@ mod tests {
             Liveness::Alive
         }
 
-        async fn stop(&self, _handle: &AgentHandle) -> Result<(), RuntimeError> {
+        async fn stop(&self, handle: &AgentHandle) -> Result<(), RuntimeError> {
+            self.stopped.lock().unwrap().push(handle.agent_id.clone());
             Ok(())
         }
     }
@@ -1661,6 +1755,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn late_terminal_event_after_abort_cannot_complete_or_reactivate_dispatch() {
+        let fx = Fixture::new();
+        fx.create_task("aborted", "must remain aborted", vec![]);
+        fx.store
+            .update_task_status("aborted", TaskStatus::Dispatched, None)
+            .unwrap();
+        fx.store
+            .create_dispatch(DispatchContext {
+                id: "disp-aborted".into(),
+                task_id: "aborted".into(),
+                assignee: Some("agent-aborted".into()),
+                status: DispatchStatus::Dispatched,
+                failure_count: 0,
+                last_heartbeat_at: None,
+                last_failure: None,
+                dispatched_at: None,
+                completed_at: None,
+                created_at: "2026-06-28T00:00:00Z".into(),
+            })
+            .unwrap();
+
+        // Abort claims the dispatch before the runtime stream can yield a late Done event.
+        fx.store.fail_dispatch("disp-aborted", "aborted by user").unwrap();
+        fx.store
+            .update_task_status("aborted", TaskStatus::Ready, None)
+            .unwrap();
+        write_worker_done(&fx.store, "agent-aborted", "aborted", "disp-aborted").unwrap();
+
+        let completed = fx.coordinator().drain_inbox().await.unwrap();
+
+        assert_eq!(completed, 0, "late Done must be ignored after abort");
+        assert_eq!(
+            fx.store.get_task("aborted").unwrap().unwrap().status,
+            TaskStatus::Ready
+        );
+        assert_eq!(
+            fx.store.get_dispatch("disp-aborted").unwrap().unwrap().status,
+            DispatchStatus::Failed
+        );
+    }
+
     // ── 用例 2：两任务带依赖 → 拓扑顺序（A 先完成，B 才 ready） ──────────
 
     #[tokio::test]
@@ -1726,6 +1862,9 @@ mod tests {
         assert!(o3.converged, "应已收敛");
         let b_after_3 = fx.store.get_task("B").unwrap().unwrap();
         assert_eq!(b_after_3.status, TaskStatus::Completed);
+        let stopped = fx.runtime.stopped_agents();
+        assert!(stopped.iter().any(|agent| agent == "A"));
+        assert!(stopped.iter().any(|agent| agent == "B"));
     }
 
     // ── 用例 3：连续 3 次 Failed → CircuitBroken + task Failed + 不再派发 ─
@@ -1813,6 +1952,15 @@ mod tests {
             !ready.iter().any(|t| t.id == "F"),
             "Failed 任务绝不能再出现在 ready 列表（不再派发）"
         );
+        assert_eq!(
+            fx.runtime
+                .stopped_agents()
+                .iter()
+                .filter(|agent| agent.as_str() == "F")
+                .count(),
+            3,
+            "every failed worker attempt must be stopped"
+        );
 
         // 再跑一轮 tick：不应派发任何东西；应已收敛。
         let o4 = coord.tick().await.unwrap();
@@ -1832,15 +1980,17 @@ mod tests {
             })
             .to_string(),
         );
-        let (task_id, result) = parse_worker_done_payload(&payload);
+        let (task_id, dispatch_id, result) = parse_worker_done_payload(&payload);
         assert_eq!(task_id.as_deref(), Some("t9"));
+        assert_eq!(dispatch_id.as_deref(), Some("disp_t9_abc"));
         assert_eq!(result.as_deref(), Some("all good"));
     }
 
     #[test]
     fn parse_worker_done_payload_handles_missing_payload() {
-        let (task_id, result) = parse_worker_done_payload(&None);
+        let (task_id, dispatch_id, result) = parse_worker_done_payload(&None);
         assert!(task_id.is_none());
+        assert!(dispatch_id.is_none());
         assert!(result.is_none());
     }
 
@@ -1853,8 +2003,9 @@ mod tests {
             })
             .to_string(),
         );
-        let (task_id, result) = parse_worker_done_payload(&payload);
+        let (task_id, dispatch_id, result) = parse_worker_done_payload(&payload);
         assert_eq!(task_id.as_deref(), Some("t9"));
+        assert_eq!(dispatch_id.as_deref(), Some("disp_t9_abc"));
         assert!(result.is_none(), "缺 result 字段 → None（task 仍 Completed）");
     }
 
@@ -2149,12 +2300,14 @@ mod tests {
         Roster(vec![
             RosterEntry {
                 runtime: RuntimeKind::Sdk,
+                provider: "claude".to_string(),
                 model: "sonnet".to_string(),
                 label: "Claude Sonnet (SDK)".to_string(),
                 cost_hint: Some("mid".to_string()),
             },
             RosterEntry {
                 runtime: RuntimeKind::Cli,
+                provider: "codex".to_string(),
                 model: "glm-5.2".to_string(),
                 label: "GLM 5.2 (CLI)".to_string(),
                 cost_hint: Some("low".to_string()),
@@ -2243,6 +2396,29 @@ mod tests {
         );
         let p1 = fx.store.get_task("p1").unwrap().unwrap();
         assert_eq!(p1.status, TaskStatus::Completed, "p1 必须完成");
+    }
+
+    #[tokio::test]
+    async fn coordinator_with_planner_decompose_failure_returns_root_cause() {
+        let fx = Fixture::new();
+        fx.runtime.program_wildcard(vec![]);
+        let run = fx
+            .store
+            .create_run("planner decompose failure", COORDINATOR_HANDLE, 5)
+            .unwrap();
+        let coord = fx.coordinator_with_planner("发布 v1.0");
+
+        let err = coord
+            .run(&run.id)
+            .await
+            .expect_err("planner decompose failure must propagate root cause");
+
+        assert!(
+            err.contains("without Done"),
+            "root cause should mention planner stream closure, got: {err}"
+        );
+        let stored = fx.store.get_run(&run.id).unwrap().unwrap();
+        assert_eq!(stored.status, RunStatus::Failed);
     }
 
     // ===== Case 5: 失败熔断 → replan → Retry → 任务回 Ready =====
@@ -2388,6 +2564,7 @@ mod tests {
             result: None,
             assignment: Some(AgentAssignment {
                 runtime: RuntimeKind::Sdk,
+                provider: "claude".to_string(),
                 tool: "claude-sdk".to_string(),
                 model: "sonnet".to_string(),
             }),
@@ -3634,11 +3811,13 @@ mod tests {
     /// 记录介质：把每次 start 的 agent_id 存下来，供断言路由命中。
     struct RecordingRuntime {
         started: std::sync::Mutex<Vec<String>>,
+        start_specs: std::sync::Mutex<Vec<RuntimeStartSpec>>,
     }
     impl RecordingRuntime {
         fn new() -> Self {
             Self {
                 started: std::sync::Mutex::new(Vec::new()),
+                start_specs: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -3653,6 +3832,7 @@ mod tests {
         }
         async fn start(&self, spec: RuntimeStartSpec) -> Result<AgentHandle, RuntimeError> {
             self.started.lock().unwrap().push(spec.agent_id.clone());
+            self.start_specs.lock().unwrap().push(spec.clone());
             Ok(AgentHandle {
                 agent_id: spec.agent_id,
             })
@@ -3696,6 +3876,7 @@ mod tests {
             result: None,
             assignment: Some(AgentAssignment {
                 runtime: RuntimeKind::Sdk,
+                provider: "claude".to_string(),
                 tool: "claude-sdk".to_string(),
                 model: "sonnet".to_string(),
             }),
@@ -3711,6 +3892,7 @@ mod tests {
             result: None,
             assignment: Some(AgentAssignment {
                 runtime: RuntimeKind::Cli,
+                provider: "codex".to_string(),
                 tool: "claude-cli".to_string(),
                 model: "sonnet".to_string(),
             }),
@@ -3762,6 +3944,12 @@ mod tests {
             !cli_started.iter().any(|a| a == "t_sdk"),
             "Sdk task 不应走 Cli 介质"
         );
+
+        let cli_spec = cli_mock.start_specs.lock().unwrap().first().cloned().unwrap();
+        assert_eq!(cli_spec.provider, "codex");
+        assert_eq!(cli_spec.model, "sonnet");
+        assert_ne!(cli_spec.cwd, fx.repo_root);
+        assert_eq!(cli_spec.cwd.file_name().and_then(|name| name.to_str()), Some("t_cli"));
     }
 
     // ===== Task 9：异构混跑 e2e —— Sdk×Cli×Sdk 3 task 全 Completed、run 收敛 =====
@@ -3785,6 +3973,11 @@ mod tests {
                 result: None,
                 assignment: Some(AgentAssignment {
                     runtime,
+                    provider: if runtime == RuntimeKind::Sdk {
+                        "claude".into()
+                    } else {
+                        "codex".into()
+                    },
                     tool: "tool".into(),
                     model: "m".into(),
                 }),
@@ -3883,6 +4076,7 @@ mod tests {
     /// watcher 的 recv() 永久阻塞（模拟"在飞 agent"）。同时记录 abort 调用。
     struct HangingRuntime {
         abort_calls: std::sync::Mutex<Vec<String>>,
+        stop_calls: std::sync::Mutex<Vec<String>>,
         /// 持有所有 sender 不 drop → watcher 的 recv() 永久阻塞。
         _senders: std::sync::Mutex<Vec<mpsc::UnboundedSender<AgentEvent>>>,
     }
@@ -3891,12 +4085,26 @@ mod tests {
         fn new() -> Self {
             Self {
                 abort_calls: std::sync::Mutex::new(Vec::new()),
+                stop_calls: std::sync::Mutex::new(Vec::new()),
                 _senders: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn abort_calls(&self) -> Vec<String> {
             self.abort_calls.lock().unwrap().clone()
+        }
+
+        fn stop_calls(&self) -> Vec<String> {
+            self.stop_calls.lock().unwrap().clone()
+        }
+
+        fn emit_late_done(&self) {
+            for sender in self._senders.lock().unwrap().iter() {
+                let _ = sender.send(AgentEvent::Done {
+                    success: true,
+                    files_modified: vec![],
+                });
+            }
         }
     }
 
@@ -3939,7 +4147,8 @@ mod tests {
             Liveness::Alive
         }
 
-        async fn stop(&self, _handle: &AgentHandle) -> Result<(), RuntimeError> {
+        async fn stop(&self, handle: &AgentHandle) -> Result<(), RuntimeError> {
+            self.stop_calls.lock().unwrap().push(handle.agent_id.clone());
             Ok(())
         }
     }
@@ -4004,6 +4213,31 @@ mod tests {
             aborts.iter().any(|a| a == "long"),
             "cancel 应触发在飞 dispatch 的介质 abort 被调；got abort_calls={:?}",
             aborts
+        );
+        assert!(
+            hanging.stop_calls().iter().any(|agent| agent == "long"),
+            "cancelled worker must be stopped after abort"
+        );
+
+        let dispatch = fx.store.list_active_dispatches().unwrap();
+        assert!(
+            dispatch.is_empty(),
+            "cancel must claim dispatched work before runtime shutdown"
+        );
+
+        // A runtime may emit Done after abort. The inactive dispatch must make the
+        // watcher and inbox consumer discard that terminal event.
+        hanging.emit_late_done();
+        fx.yield_for_watchers().await;
+        assert_eq!(
+            coord.drain_inbox().await.unwrap(),
+            0,
+            "late Done after cancel must not complete a task"
+        );
+        assert_ne!(
+            fx.store.get_task("long").unwrap().unwrap().status,
+            TaskStatus::Completed,
+            "late terminal event must not rewrite the cancelled task"
         );
 
         // Run{cancelled} 事件被发射（驾驶舱标灰/标停）。

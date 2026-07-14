@@ -89,6 +89,15 @@ export interface HermesRunOpts {
   maxConcurrent?: number | null;
   pollIntervalMs?: number | null;
   repoRoot?: string | null;
+  roster?: HermesRosterEntry[] | null;
+}
+
+export interface HermesRosterEntry {
+  runtime: 'sdk' | 'cli';
+  provider: 'claude' | 'codex';
+  model: string;
+  label: string;
+  costHint?: string | null;
 }
 
 export interface TaskListFilterDto {
@@ -147,6 +156,26 @@ export interface JudgeVerdictDto {
   }[];
 }
 
+export interface WorkerSessionDto {
+  dispatchId: string;
+  runId: string;
+  taskId: string;
+  workerId: string;
+  finalResponse: string | null;
+  error: string | null;
+  createdAt: string;
+  completedAt: string | null;
+}
+
+export type WorkerTranscriptEntryDto =
+  | { kind: 'messageRaw'; json: string; createdAt: string }
+  | { kind: 'activity'; text: string; createdAt: string };
+
+export interface WorkerTranscriptDto {
+  source: 'persisted' | 'none';
+  entries: WorkerTranscriptEntryDto[];
+}
+
 export interface InterventionGateDto {
   id: string;
   taskId: string;
@@ -157,5 +186,3 @@ export interface InterventionGateDto {
   createdAt?: string;
   resolvedAt?: string | null;
 }
-
-

@@ -16,7 +16,9 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::mpsc;
 
 use crate::chat::ChatManager;
@@ -27,11 +29,24 @@ use super::runtime::{
     RuntimeStartSpec,
 };
 
-/// 默认 send 方法名：`<provider>.send`，与 `chat_commands::chat_send` 对齐。
-/// 当前 `SdkRuntime::send` 不接收 provider，故固定为 claude（Hermes 2a 范围内）。
-/// 真正多 provider 的支持会在 Coordinator 子阶段通过 `RuntimeStartSpec.provider`
-/// 注入后补齐——届时此常量会被替换为按 provider 查表的结果。
-const DEFAULT_SDK_SEND_METHOD: &str = "claude.send";
+fn build_sdk_send_request(
+    spec: &RuntimeStartSpec,
+    prompt: String,
+) -> Result<(String, Value), RuntimeError> {
+    let provider = match spec.provider.as_str() {
+        "claude" | "codex" => spec.provider.as_str(),
+        other => return Err(RuntimeError(format!("unsupported Hermes provider: {other}"))),
+    };
+    Ok((
+        format!("{provider}.send"),
+        json!({
+            "message": prompt,
+            "model": spec.model,
+            "cwd": spec.cwd,
+            "streaming": true,
+        }),
+    ))
+}
 
 // ===== 标签词汇表（与 src-tauri/resources/ai-bridge/services/claude/*.js 对齐）=====
 //
@@ -195,7 +210,7 @@ pub fn parse_stream_line(line: &str) -> Option<AgentEvent> {
         let Ok(v) = serde_json::from_str::<Value>(payload) else {
             return None;
         };
-        return parse_message_snapshot(&v);
+        return normalize_message_snapshot(&v).map(|json| AgentEvent::MessageRaw { json });
     }
 
     // 已知的元数据/诊断标签：返回 None，不污染结构化 AgentEvent 流。
@@ -237,51 +252,17 @@ fn decode_json_string(payload: &str) -> String {
 ///
 /// assistant message 形如 `{"type":"assistant","message":{"content":[{"type":"tool_use","id":..,"name":..},...]}}`；
 /// user message 形如 `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":..,"is_error":..}]}}`。
-fn parse_message_snapshot(v: &Value) -> Option<AgentEvent> {
-    // content 可能在 message.content 或顶层 content。
-    let content = v
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .or_else(|| v.get("content"));
-
-    if let Some(blocks) = content.and_then(|c| c.as_array()) {
-        // 优先：tool_use block → ToolUse
-        for b in blocks {
-            if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                let id = b
-                    .get("id")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let name = b
-                    .get("name")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                return Some(AgentEvent::ToolUse { id, name });
-            }
-        }
-        // 次之：tool_result block → ToolResult
-        for b in blocks {
-            if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
-                return Some(parse_tool_result(b));
-            }
-        }
-        // 否则：拼接所有 text block → TextDelta
-        let mut buf = String::new();
-        for b in blocks {
-            if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                if let Some(t) = b.get("text").and_then(|x| x.as_str()) {
-                    buf.push_str(t);
-                }
-            }
-        }
-        if buf.is_empty() {
-            return None;
-        }
-        return Some(AgentEvent::TextDelta(buf));
+fn normalize_message_snapshot(v: &Value) -> Option<String> {
+    let role = v.get("type")?.as_str()?;
+    if !matches!(role, "assistant" | "user") {
+        return None;
     }
-    None
+    let blocks = v.get("message")?.get("content")?.as_array()?;
+    if blocks.iter().any(|block| block.get("type").and_then(Value::as_str).is_none()) {
+        return None;
+    }
+    // Canonical JSON preserves every daemon field while ensuring UI receives data, never HTML.
+    serde_json::to_string(v).ok()
 }
 
 /// 从 tool_result block（`[TOOL_RESULT]` 或 `[MESSAGE]` 内）提取 `ToolResult`。
@@ -310,11 +291,15 @@ fn parse_tool_result(v: &Value) -> AgentEvent {
 /// 代理给 ChatManager。
 pub struct SdkRuntime {
     manager: Arc<ChatManager>,
+    start_specs: Mutex<HashMap<String, RuntimeStartSpec>>,
 }
 
 impl SdkRuntime {
     pub fn new(manager: Arc<ChatManager>) -> Self {
-        Self { manager }
+        Self {
+            manager,
+            start_specs: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -335,9 +320,13 @@ impl AgentRuntime for SdkRuntime {
     async fn start(&self, spec: RuntimeStartSpec) -> Result<AgentHandle, RuntimeError> {
         // 不主动启动 daemon：ChatManager 在首次 send_raw_stream 时会通过内部
         // running_client_for 懒启动（含心跳）。Hermes 视角下 start 只登记 agent_id。
-        Ok(AgentHandle {
-            agent_id: spec.agent_id,
-        })
+        build_sdk_send_request(&spec, String::new())?;
+        let agent_id = spec.agent_id.clone();
+        self.start_specs
+            .lock()
+            .map_err(|e| RuntimeError(format!("SdkRuntime start specs lock poisoned: {e}")))?
+            .insert(agent_id.clone(), spec);
+        Ok(AgentHandle { agent_id })
     }
 
     async fn send(
@@ -348,16 +337,14 @@ impl AgentRuntime for SdkRuntime {
         // 复用 ChatManager 的 send_raw_stream：返回原始 StreamLine 接收端，
         // 不 spawn chat:// 事件发射任务（与现有 send 并存的加法式入口）。
         let agent_id: AgentId = handle.agent_id.clone();
-        // method = "<provider>.send"，与 chat_commands::chat_send 对齐。
-        // 注意：当前 SdkRuntime 假设 provider=claude（Hermes 2a 范围内）。
-        // 真正多 provider 的支持会在 Coordinator 子阶段注入 spec.provider 后补齐。
-        let method = DEFAULT_SDK_SEND_METHOD.to_string();
-        let params = json!({
-            "message": prompt,
-            // cwd / model / sessionId 等参数由 RuntimeStartSpec 在 Coordinator
-            // 子阶段注入；此处先给最小可跑形状（Claude daemon 容忍缺字段）。
-            "streaming": true,
-        });
+        let spec = self
+            .start_specs
+            .lock()
+            .map_err(|e| RuntimeError(format!("SdkRuntime start specs lock poisoned: {e}")))?
+            .get(&handle.agent_id)
+            .cloned()
+            .ok_or_else(|| RuntimeError(format!("SdkRuntime missing start spec for agent {}", handle.agent_id)))?;
+        let (method, params) = build_sdk_send_request(&spec, prompt)?;
 
         let (_req_id, mut rx) = self
             .manager
@@ -423,6 +410,10 @@ impl AgentRuntime for SdkRuntime {
     async fn stop(&self, handle: &AgentHandle) -> Result<(), RuntimeError> {
         // ChatManager::close_agent 幂等且自带回收（停 daemon + 移出 pool + 停 watcher）。
         self.manager.close_agent(handle.agent_id.clone()).await;
+        self.start_specs
+            .lock()
+            .map_err(|e| RuntimeError(format!("SdkRuntime start specs lock poisoned: {e}")))?
+            .remove(&handle.agent_id);
         Ok(())
     }
 }
@@ -430,6 +421,52 @@ impl AgentRuntime for SdkRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_snapshot_preserves_validated_raw_payload() {
+        let payload = r#"{"type":"assistant","uuid":"msg-1","message":{"content":[{"type":"text","text":"hello"},{"type":"tool_use","id":"tool-1","name":"read","input":{"path":"src/lib.rs"}}]}}"#;
+
+        let event = parse_stream_line(&format!("[MESSAGE] {payload}")).expect("MESSAGE event");
+
+        match event {
+            AgentEvent::MessageRaw { json } => assert_eq!(json, payload),
+            other => panic!("expected raw message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sdk_request_builder_routes_codex_with_model_and_cwd() {
+        let spec = RuntimeStartSpec {
+            agent_id: "worker-1".to_string(),
+            cwd: std::path::PathBuf::from("/tmp/worktree"),
+            model: "gpt-5.3-codex".to_string(),
+            provider: "codex".to_string(),
+        };
+
+        let (method, params) = build_sdk_send_request(&spec, "implement it".to_string())
+            .expect("codex is a supported Hermes SDK provider");
+
+        assert_eq!(method, "codex.send");
+        assert_eq!(params["message"], "implement it");
+        assert_eq!(params["model"], "gpt-5.3-codex");
+        assert_eq!(params["cwd"], "/tmp/worktree");
+        assert_eq!(params["streaming"], true);
+    }
+
+    #[test]
+    fn sdk_request_builder_rejects_unknown_provider() {
+        let spec = RuntimeStartSpec {
+            agent_id: "worker-1".to_string(),
+            cwd: std::path::PathBuf::from("/tmp/worktree"),
+            model: "unknown".to_string(),
+            provider: "gemini".to_string(),
+        };
+
+        let err = build_sdk_send_request(&spec, "implement it".to_string())
+            .expect_err("unknown providers must never be routed through Claude");
+
+        assert!(err.0.contains("unsupported Hermes provider"));
+    }
 
     #[test]
     fn content_delta_json_string_decodes_to_text_delta() {

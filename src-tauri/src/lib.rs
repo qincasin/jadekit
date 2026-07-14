@@ -1060,11 +1060,18 @@ pub fn run() {
             hermes_commands::hermes_task_list,
             hermes_commands::hermes_dispatch_show,
             hermes_commands::hermes_gate_resolve,
+            hermes_commands::hermes_gate_list,
+            hermes_commands::hermes_gate_show,
+            hermes_commands::hermes_judge_show,
+            hermes_commands::hermes_worker_transcript,
+            hermes_commands::hermes_worker_session_list,
             hermes_commands::hermes_run_stop,
             hermes_commands::hermes_run_cancel,
+            hermes_commands::hermes_agent_abort,
             hermes_commands::hermes_run_show,
             hermes_commands::hermes_agent_list,
             hermes_commands::hermes_run_cleanup,
+            hermes_commands::hermes_run_mock,
         ])
         .setup(|app| {
             // 初始化数据库

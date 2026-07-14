@@ -15,9 +15,9 @@ import {
 import { mergePreflight } from './mergeDiscard';
 import ChatDiffReviewPane from '../chat/ChatDiffReviewPane';
 import { selectActiveAgent } from './sessionSelect';
+import { buildInspectorDiffReviewEdit, resolveJudgeRunId } from './inspectorData';
 import { FileDiff, GitMerge, Trash2, AlertTriangle, Loader2 } from 'lucide-react';
 import { cn } from '../../utils/cn';
-import type { ChatStatusEditSummary } from '../../utils/chatStatusSummary';
 
 export interface InspectorPanelProps {
   onClose?: () => void;
@@ -86,42 +86,14 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({ onClose }) => {
   useEffect(() => {
     let active = true;
     const loadVerdict = async () => {
-      if (!task) {
+      const runId = resolveJudgeRunId(agent);
+      if (!runId) {
         setVerdict(null);
-        return;
-      }
-      
-      const taskId = task.id;
-      const agentId = agent?.id;
-
-      if (taskId === 'task_02' || agentId === 'codex-07') {
-        setVerdict({
-          winnerIndex: 0,
-          scores: [95, 82],
-          reason: 'Candidate 0 (codex-07) implemented the tab selection and active model resolution logic correctly. It successfully resolved the fallback model when the provider is changed, whereas Candidate 1 (codex-08) missed updating the active provider state in some edge cases.',
-          candidates: [
-            { index: 0, agentId: 'codex-07' },
-            { index: 1, agentId: 'codex-08' },
-          ],
-        });
-        return;
-      }
-
-      if (taskId === 'task_01' || agentId === 'codex-03') {
-        setVerdict({
-          winnerIndex: 0,
-          scores: [90, 78],
-          reason: 'Candidate 0 (codex-03) successfully updated providerService to use the DEFAULT_CHAT_PROVIDER constant as fallback, avoiding hardcoded string values. Candidate 1 left gpt-4 hardcoded.',
-          candidates: [
-            { index: 0, agentId: 'codex-03' },
-            { index: 1, agentId: 'codex-04' },
-          ],
-        });
         return;
       }
 
       try {
-        const v = await judgeShow(task.id);
+        const v = await judgeShow(runId);
         if (active) {
           setVerdict(v);
         }
@@ -138,125 +110,12 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({ onClose }) => {
     return () => {
       active = false;
     };
-  }, [task?.id, agent?.id]);
+  }, [agent]);
 
-  const mockEdit = useMemo((): ChatStatusEditSummary | undefined => {
-    if (!task) return undefined;
-
-    const taskId = task.id;
-    const agentId = agent?.id;
-
-    const isUseChatStoreMatch = taskId === 'task_02' || agentId === 'codex-07';
-
-    if (isUseChatStoreMatch) {
-      return {
-        toolId: 'mock-edit-usechatstore',
-        displayPath: 'src/stores/useChatStore.ts',
-        openPath: 'src/stores/useChatStore.ts',
-        lineStart: 2144,
-        lineEnd: 2145,
-        additions: diffSummary?.insertions ?? 2,
-        deletions: diffSummary?.deletions ?? 1,
-        status: 'completed',
-        diffPreviewLines: [
-          {
-            kind: 'context',
-            text: '  selectTab(tabId: string) {',
-            oldLineNumber: 2142,
-            newLineNumber: 2142,
-          },
-          {
-            kind: 'context',
-            text: '    const tab = get().tabs[tabId];',
-            oldLineNumber: 2143,
-            newLineNumber: 2143,
-          },
-          {
-            kind: 'removed',
-            text: '    set({ activeTabId: tabId, provider: tab.provider, model: defaultModel });',
-            oldLineNumber: 2144,
-          },
-          {
-            kind: 'added',
-            text: '    const resolvedModel = tab.model || getModelForProvider(tab.provider);',
-            newLineNumber: 2144,
-          },
-          {
-            kind: 'added',
-            text: '    set({ activeTabId: tabId, provider: tab.provider, model: resolvedModel });',
-            newLineNumber: 2145,
-          },
-          {
-            kind: 'context',
-            text: '  },',
-            oldLineNumber: 2145,
-            newLineNumber: 2146,
-          },
-        ],
-      };
-    }
-
-    if (taskId === 'task_01' || agentId === 'codex-03') {
-      return {
-        toolId: 'mock-edit-providerservice',
-        displayPath: 'src/services/providerService.ts',
-        openPath: 'src/services/providerService.ts',
-        lineStart: 43,
-        lineEnd: 43,
-        additions: diffSummary?.insertions ?? 1,
-        deletions: diffSummary?.deletions ?? 1,
-        status: 'completed',
-        diffPreviewLines: [
-          {
-            kind: 'context',
-            text: 'export const providerConfig = {',
-            oldLineNumber: 41,
-            newLineNumber: 41,
-          },
-          {
-            kind: 'removed',
-            text: "  fallbackProvider: 'gpt-4',",
-            oldLineNumber: 42,
-          },
-          {
-            kind: 'added',
-            text: '  fallbackProvider: DEFAULT_CHAT_PROVIDER,',
-            newLineNumber: 42,
-          },
-          {
-            kind: 'context',
-            text: '};',
-            oldLineNumber: 43,
-            newLineNumber: 43,
-          },
-        ],
-      };
-    }
-
-    // Fallback/generic diff summary for other review tasks
-    return {
-      toolId: `mock-edit-${taskId}`,
-      displayPath: 'src/stores/useChatStore.ts',
-      openPath: 'src/stores/useChatStore.ts',
-      lineStart: 1,
-      lineEnd: 2,
-      additions: diffSummary?.insertions ?? 1,
-      deletions: diffSummary?.deletions ?? 1,
-      status: 'completed',
-      diffPreviewLines: [
-        {
-          kind: 'removed',
-          text: '// Old logic here',
-          oldLineNumber: 1,
-        },
-        {
-          kind: 'added',
-          text: '// Corrected new logic here',
-          newLineNumber: 1,
-        },
-      ],
-    };
-  }, [task, agent, diffSummary]);
+  const diffReviewEdit = useMemo(
+    () => buildInspectorDiffReviewEdit({ task, diffSummary }),
+    [task, diffSummary]
+  );
 
   const handleMerge = () => {
     if (!task) return;
@@ -436,9 +295,9 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({ onClose }) => {
 
       {/* Diff Review Pane */}
       <div className="flex-1 overflow-hidden min-h-0 relative flex flex-col">
-        {mockEdit ? (
+        {diffReviewEdit ? (
           <ChatDiffReviewPane
-            edit={mockEdit}
+            edit={diffReviewEdit}
             mode={diffMode}
             wrapLines={wrapLines}
             currentCwd={currentCwd}
@@ -447,7 +306,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({ onClose }) => {
           />
         ) : (
           <div className="p-8 text-center text-xs text-base-content/40">
-            No changes detected.
+            暂无可预览的真实 diff。
           </div>
         )}
       </div>

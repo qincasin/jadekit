@@ -46,6 +46,8 @@ export interface HermesState {
   agents: Record<string, AgentState>;
 }
 
+const GENERIC_RUN_FAILURE_ERROR = 'run ended in failed state';
+
 export function reduceHermesEvent(state: HermesState, event: OrchestrationEvent): HermesState {
   if (isRunEvent(event)) {
     const existing = state.runs[event.runId];
@@ -56,8 +58,16 @@ export function reduceHermesEvent(state: HermesState, event: OrchestrationEvent)
         existing.status === 'failed' ||
         existing.status === 'cancelled'
       ) {
-        // Idempotency / Terminal regression prevention: do not change state
-        return state;
+        const hasConcreteFailureUpgrade =
+          existing.status === 'failed' &&
+          event.status === 'failed' &&
+          (existing.error === null || existing.error === GENERIC_RUN_FAILURE_ERROR) &&
+          event.error !== null &&
+          event.error !== GENERIC_RUN_FAILURE_ERROR;
+        if (!hasConcreteFailureUpgrade) {
+          // Idempotency / terminal regression prevention.
+          return state;
+        }
       }
       // If nothing has changed, return the exact same state reference
       if (

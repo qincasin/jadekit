@@ -7,8 +7,13 @@ export interface SessionHeaderAction {
   tooltipKey?: string;
 }
 
+export function isAbortableActiveAgent(agent: AgentState | null | undefined): boolean {
+  return !!agent?.taskId && (agent.status === 'working' || agent.status === 'needs-attention');
+}
+
 export function sessionHeaderActions(agent: AgentState | null | undefined): SessionHeaderAction[] {
   const hasTaskId = !!agent?.taskId;
+  const canStopAgent = isAbortableActiveAgent(agent);
 
   return [
     {
@@ -20,8 +25,8 @@ export function sessionHeaderActions(agent: AgentState | null | undefined): Sess
     {
       id: 'stop',
       labelKey: 'helm.actions.stop',
-      disabled: true,
-      tooltipKey: 'helm.tooltips.stopDisabled',
+      disabled: !canStopAgent,
+      tooltipKey: canStopAgent ? undefined : 'helm.tooltips.stopDisabled',
     },
     {
       id: 'cancel',

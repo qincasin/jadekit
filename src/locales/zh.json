@@ -1158,6 +1158,7 @@
   },
   "helm": {
     "emptyState": "请从左侧舰队看板选择一个 Agent",
+    "agentAlreadyFinished": "该 Agent 已完成。",
     "agentId": "Agent ID",
     "taskId": "任务 ID",
     "actions": {
@@ -1190,6 +1191,14 @@
       "interruptedDesc": "在执行完成前被强行终止。"
     },
     "placeholderBanner": "完整执行记录将在引擎接通后显示",
+    "history": {
+      "title": "已完成工作器记录",
+      "select": "选择已归档工作器",
+      "empty": "该工作器未产生可持久化的执行记录。",
+      "noFinal": "该工作器没有可展示的最终文本。",
+      "failed": "失败",
+      "completed": "已完成"
+    },
     "attentionGate": {
       "title": "需要人工介入",
       "description": "该 Agent 已暂停，需要您进行评审或提供输入以继续执行。",
@@ -1211,9 +1220,18 @@
       "maxConcurrent": "最大并发任务数",
       "walkthrough": "启动 Walkthrough 演示",
       "walkthroughStop": "停止 Walkthrough",
-      "runMock": "演示运行",
-      "dispatch": "派发给 Hermes",
-      "launching": "启动中..."
-    }
+    "runMock": "演示运行",
+    "dispatch": "派发给 Hermes",
+    "launching": "启动中...",
+    "launchErrorActiveRun": "Hermes 当前运行尚未结束。请等待其完成、停止或处理后再派发新的运行。",
+    "launchErrorGeneric": "Hermes 派发失败。",
+    "launchErrorUnknown": "Hermes 派发失败：{{reason}}",
+    "selectProjectFolder": "选择项目文件夹",
+    "projectFolderDialogTitle": "选择 Git 项目文件夹",
+    "projectFolderPrompt": "选择 Git 项目文件夹路径",
+    "noProjectFolder": "未选择 Git 项目",
+    "projectFolderInvalid": "请选择 Git 仓库中的文件夹",
+    "projectFolderLoadFailed": "无法加载项目文件夹，请重试"
   }
+}
 }

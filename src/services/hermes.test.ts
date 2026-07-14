@@ -98,6 +98,17 @@ describe('Hermes Service and Contract Types', () => {
       });
     });
 
+    it('gateShow: propagates backend errors instead of fabricating fallback data', async () => {
+      const mockInvoke = vi.mocked(invoke);
+      mockInvoke.mockRejectedValueOnce(new Error('missing gate'));
+
+      await expect(hermesService.gateShow('gate_missing')).rejects.toThrow('missing gate');
+
+      expect(mockInvoke).toHaveBeenCalledWith('hermes_gate_show', {
+        gateId: 'gate_missing',
+      });
+    });
+
     it('runStop: invokes hermes_run_stop with runId', async () => {
       const mockInvoke = vi.mocked(invoke);
       mockInvoke.mockResolvedValueOnce(undefined);
@@ -165,6 +176,30 @@ describe('Hermes Service and Contract Types', () => {
       expect(activeAgents).toEqual(mockActiveAgents);
     });
 
+    it('agentAbort: invokes hermes_agent_abort with agentId', async () => {
+      const mockInvoke = vi.mocked(invoke);
+      const mockDispatch = {
+        id: 'disp_1',
+        taskId: 'task_1',
+        assignee: 'agent_1',
+        status: 'failed',
+        failureCount: 1,
+        lastHeartbeatAt: '2026-06-29T00:01:00Z',
+        lastFailure: 'aborted by user',
+        dispatchedAt: '2026-06-29T00:00:00Z',
+        completedAt: '2026-06-29T00:02:00Z',
+        createdAt: '2026-06-29T00:00:00Z',
+      };
+      mockInvoke.mockResolvedValueOnce(mockDispatch);
+
+      const dispatch = await hermesService.agentAbort('agent_1');
+
+      expect(mockInvoke).toHaveBeenCalledWith('hermes_agent_abort', {
+        agentId: 'agent_1',
+      });
+      expect(dispatch).toEqual(mockDispatch);
+    });
+
     it('runCleanup: invokes hermes_run_cleanup and returns SweepReportDto', async () => {
       const mockInvoke = vi.mocked(invoke);
       const mockReport = {
@@ -179,6 +214,21 @@ describe('Hermes Service and Contract Types', () => {
         runId: 'run_123',
       });
       expect(report).toEqual(mockReport);
+    });
+
+    it('workerTranscript: invokes hermes_worker_transcript with agentId', async () => {
+      const mockInvoke = vi.mocked(invoke);
+      const mockTranscript = [
+        { role: 'assistant', content: '完成脚本化 worker 回放' },
+      ];
+      mockInvoke.mockResolvedValueOnce(mockTranscript);
+
+      const transcript = await hermesService.workerTranscript('agent_1');
+
+      expect(mockInvoke).toHaveBeenCalledWith('hermes_worker_transcript', {
+        agentId: 'agent_1',
+      });
+      expect(transcript).toEqual(mockTranscript);
     });
   });
 

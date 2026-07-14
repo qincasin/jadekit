@@ -5,6 +5,7 @@ import { JumpPalette } from './JumpPalette';
 import SessionPanel from './SessionPanel';
 import HelmComposer from './HelmComposer';
 import { InspectorPanel } from './InspectorPanel';
+import { useHermesStore } from '../../stores/useHermesStore';
 
 export default function HelmCockpit() {
   const {
@@ -15,6 +16,26 @@ export default function HelmCockpit() {
   } = useCockpitLayout();
 
   const [isPaletteOpen, setIsPaletteOpen] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    let cleanup: (() => void) | undefined;
+    const store = useHermesStore.getState();
+
+    void store.refreshSnapshot();
+    void store.subscribeEvents().then((unsubscribe) => {
+      if (active) {
+        cleanup = unsubscribe;
+      } else {
+        unsubscribe();
+      }
+    });
+
+    return () => {
+      active = false;
+      cleanup?.();
+    };
+  }, []);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {

@@ -1,4 +1,21 @@
-import { HermesRunOpts } from '../../types/hermes';
+import { HermesRosterEntry, HermesRunOpts } from '../../types/hermes';
+
+export interface HelmRosterPick {
+  providerId: string;
+  providerName: string;
+  chatProvider: 'claude' | 'codex';
+  model: string;
+}
+
+function rosterEntryFromPick(pick: HelmRosterPick): HermesRosterEntry {
+  return {
+    runtime: 'sdk',
+    provider: pick.chatProvider,
+    model: pick.model,
+    label: pick.providerName,
+    costHint: pick.chatProvider === 'claude' ? 'mid' : 'low',
+  };
+}
 
 /**
  * Normalizes parameters for starting a Hermes run.
@@ -9,7 +26,8 @@ import { HermesRunOpts } from '../../types/hermes';
 export function buildLaunch(
   goal: string,
   opts: HermesRunOpts,
-  selectedPicks: string[]
+  selectedPicks: HelmRosterPick[],
+  repoRoot: string,
 ): { goal: string; opts: HermesRunOpts } {
   if (!goal || !goal.trim()) {
     throw new Error('Goal cannot be empty');
@@ -17,6 +35,11 @@ export function buildLaunch(
 
   if (!selectedPicks || selectedPicks.length === 0) {
     throw new Error('At least one agent must be selected');
+  }
+
+  const normalizedRepoRoot = repoRoot.trim();
+  if (!normalizedRepoRoot) {
+    throw new Error('A Git repository root is required');
   }
 
   let maxConcurrent = opts.maxConcurrent;
@@ -37,6 +60,8 @@ export function buildLaunch(
     opts: {
       ...opts,
       maxConcurrent,
+      repoRoot: normalizedRepoRoot,
+      roster: selectedPicks.map(rosterEntryFromPick),
     },
   };
 }

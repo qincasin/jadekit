@@ -1,11 +1,20 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useHermesStore } from '../../stores/useHermesStore';
-import { buildLaunch } from './launchPlan';
+import { buildLaunch, HelmRosterPick } from './launchPlan';
 import RosterPanel from './RosterPanel';
 import * as hermesService from '../../services/hermesService';
 import { reduceHermesEvent } from '../../stores/hermesReducer';
-import { Loader2, Play, Sparkles } from 'lucide-react';
+import { FolderOpen, Loader2, Play, Sparkles } from 'lucide-react';
+import { useProviderStore } from '../../stores/useProviderStore';
+import { rosterPicksFromProviders } from '../chat/fanout/roster';
+import { useChatStore } from '../../stores/useChatStore';
+import { pickWorkspaceFolder } from '../../utils/chatWorkspaceStatus';
+import { resolveHermesWorkspaceRoot } from './hermesWorkspace';
+import { extractHermesLaunchErrorReason, getHermesLaunchErrorMessageKey } from './hermesLaunchError';
+import { canRequestHermesLaunch } from './hermesLaunchReadiness';
+
+type HermesLaunchMode = 'real' | 'mock';
 
 export default function HelmComposer() {
   const { t } = useTranslation();
@@ -13,50 +22,113 @@ export default function HelmComposer() {
   const [selectedPicks, setSelectedPicks] = useState<string[]>([]);
   const [maxConcurrent, setMaxConcurrent] = useState<number | undefined>(undefined);
   const [launching, setLaunching] = useState(false);
+  const [workspaceRoot, setWorkspaceRoot] = useState<string | null>(null);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  const [launchError, setLaunchError] = useState<string | null>(null);
+  const providers = useProviderStore((state) => state.providers);
+  const currentCwd = useChatStore((state) => state.currentCwd);
+  const setCurrentCwd = useChatStore((state) => state.setCurrentCwd);
+  const roster = useMemo(() => rosterPicksFromProviders(providers), [providers]);
+  const launchPicks = useMemo<HelmRosterPick[]>(
+    () =>
+      selectedPicks.flatMap((providerId) => {
+        const pick = roster.find((item) => item.providerId === providerId);
+        const model = pick?.models[0]?.id.trim();
+        if (!pick || !model) return [];
+        return [
+          {
+            providerId: pick.providerId,
+            providerName: pick.providerName,
+            chatProvider: pick.chatProvider,
+            model,
+          },
+        ];
+      }),
+    [roster, selectedPicks]
+  );
   
-  // Mock support status: null = checking, true = supported, false = unsupported
-  const [isMockSupported, setIsMockSupported] = useState<boolean | null>(null);
-
   // Walkthrough simulation state
   const [isWalkthroughRunning, setIsWalkthroughRunning] = useState(false);
   const timeoutsRef = useRef<number[]>([]);
 
-  // Check if hermes_run_mock is supported on mount
   useEffect(() => {
-    const checkMockSupport = async () => {
-      try {
-        await hermesService.runMock('', { maxConcurrent: 1 });
-        setIsMockSupported(true);
-      } catch (err: any) {
-        const errMsg = String(err).toLowerCase();
-        if (errMsg.includes('not found') || errMsg.includes('missing') || errMsg.includes('unknown command')) {
-          setIsMockSupported(false);
-        } else {
-          // If it throws a validation error like empty goal, the command exists!
-          setIsMockSupported(true);
-        }
-      }
-    };
-    void checkMockSupport();
-
-    // Subscribe to events on mount
-    let unsubscribe: (() => void) | undefined;
-    const subscribe = async () => {
-      unsubscribe = await useHermesStore.getState().subscribeEvents();
-    };
-    void subscribe();
-
     return () => {
-      if (unsubscribe) unsubscribe();
-      // Clear timeouts on unmount
       timeoutsRef.current.forEach((timeoutId) => clearTimeout(timeoutId));
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const selectedFolder = currentCwd?.trim();
+
+    if (!selectedFolder) {
+      setWorkspaceRoot(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setWorkspaceRoot(null);
+    void resolveHermesWorkspaceRoot(selectedFolder)
+      .then((repoRoot) => {
+        if (!cancelled) setWorkspaceRoot(repoRoot);
+      })
+      .catch(() => {
+        if (!cancelled) setWorkspaceRoot(null);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentCwd]);
 
   const clearAllTimeouts = () => {
     timeoutsRef.current.forEach((timeoutId) => clearTimeout(timeoutId));
     timeoutsRef.current = [];
     setIsWalkthroughRunning(false);
+  };
+
+  const displayLaunchError = (error: unknown) => {
+    const reason = extractHermesLaunchErrorReason(error);
+    const messageKey = getHermesLaunchErrorMessageKey(reason);
+    setLaunchError(
+      messageKey === 'launchErrorUnknown'
+        ? t(`helm.composer.${messageKey}`, { reason })
+        : t(`helm.composer.${messageKey}`)
+    );
+  };
+
+  const handleProjectFolderSelect = async (): Promise<string | null> => {
+    try {
+      const selectedFolder = await pickWorkspaceFolder({
+        defaultPath: currentCwd,
+        title: t('helm.composer.projectFolderDialogTitle'),
+        promptFallbackLabel: t('helm.composer.projectFolderPrompt'),
+      });
+      if (!selectedFolder) return null;
+
+      setWorkspaceLoading(true);
+      setWorkspaceError(null);
+      const repoRoot = await resolveHermesWorkspaceRoot(selectedFolder);
+      if (!repoRoot) {
+        setWorkspaceRoot(null);
+        setCurrentCwd(null);
+        setWorkspaceError(t('helm.composer.projectFolderInvalid'));
+        return null;
+      }
+
+      setWorkspaceRoot(repoRoot);
+      setCurrentCwd(repoRoot);
+      return repoRoot;
+    } catch {
+      setWorkspaceRoot(null);
+      setCurrentCwd(null);
+      setWorkspaceError(t('helm.composer.projectFolderLoadFailed'));
+      return null;
+    } finally {
+      setWorkspaceLoading(false);
+    }
   };
 
   const startWalkthrough = () => {
@@ -351,40 +423,33 @@ export default function HelmComposer() {
     }, 18500);
   };
 
-  const handleLaunch = async () => {
-    if (!goal.trim() || selectedPicks.length === 0 || launching) return;
+  const handleLaunch = async (mode: HermesLaunchMode) => {
+    if (!canRequestHermesLaunch({
+      goal,
+      rosterCount: launchPicks.length,
+      launching,
+      workspaceLoading,
+    })) return;
+
+    const repoRoot = workspaceRoot ?? await handleProjectFolderSelect();
+    if (!repoRoot) return;
+
     setLaunching(true);
 
     try {
-      const normalized = buildLaunch(goal, { maxConcurrent }, selectedPicks);
-      const runId = await hermesService.run(normalized.goal, normalized.opts);
+      const normalized = buildLaunch(goal, { maxConcurrent }, launchPicks, repoRoot);
+      const runId = mode === 'mock'
+        ? await hermesService.runMock(normalized.goal, normalized.opts)
+        : await hermesService.run(normalized.goal, normalized.opts);
       
-      // Save state using initRun
-      useHermesStore.getState().initRun(runId, normalized.goal);
-      
-      setGoal('');
-    } catch (err: any) {
-      console.error('Launch failed:', err);
-      alert(err.message || 'Failed to dispatch run to Hermes.');
-    } finally {
-      setLaunching(false);
-    }
-  };
-
-  const handleRunMock = async () => {
-    if (!goal.trim() || selectedPicks.length === 0 || launching) return;
-    setLaunching(true);
-
-    try {
-      const normalized = buildLaunch(goal, { maxConcurrent }, selectedPicks);
-      const runId = await hermesService.runMock(normalized.goal, normalized.opts);
-      
-      useHermesStore.getState().initRun(runId, normalized.goal);
+      const store = useHermesStore.getState();
+      store.initRun(runId, normalized.goal);
+      void store.refreshSnapshotUntilHydrated();
       
       setGoal('');
-    } catch (err: any) {
-      console.error('Mock run failed:', err);
-      alert(err.message || 'Failed to trigger mock run.');
+      setLaunchError(null);
+    } catch (error) {
+      displayLaunchError(error);
     } finally {
       setLaunching(false);
     }
@@ -393,7 +458,7 @@ export default function HelmComposer() {
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
-      void handleLaunch();
+      void handleLaunch('real');
     }
   };
 
@@ -420,6 +485,25 @@ export default function HelmComposer() {
 
       {/* Options and buttons row */}
       <div className="flex flex-wrap items-center justify-between gap-3 border-t border-base-300/60 pt-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void handleProjectFolderSelect()}
+            disabled={workspaceLoading}
+            className="btn btn-ghost btn-xs"
+            title={t('helm.composer.selectProjectFolder')}
+            aria-label={t('helm.composer.selectProjectFolder')}
+          >
+            {workspaceLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : <FolderOpen className="h-3 w-3" />}
+          </button>
+          <span
+            className="max-w-48 truncate text-xs text-base-content/60"
+            title={workspaceRoot ?? t('helm.composer.noProjectFolder')}
+          >
+            {workspaceRoot ?? t('helm.composer.noProjectFolder')}
+          </span>
+        </div>
+
         {/* Max concurrent input */}
         <div className="flex items-center gap-2">
           <label className="text-xs font-medium text-base-content/70">
@@ -460,14 +544,16 @@ export default function HelmComposer() {
           </button>
 
           {/* Run Mock Button */}
-          <div
-            className={isMockSupported === false ? 'tooltip tooltip-top' : ''}
-            data-tip={t('helm.tooltips.requiresPhase35', 'Requires Phase 3.5 Engine / 需引擎 Phase 3.5')}
-          >
+          <div>
             <button
               type="button"
-              onClick={handleRunMock}
-              disabled={launching || !goal.trim() || selectedPicks.length === 0 || isMockSupported === false}
+              onClick={() => void handleLaunch('mock')}
+              disabled={!canRequestHermesLaunch({
+                goal,
+                rosterCount: launchPicks.length,
+                launching,
+                workspaceLoading,
+              })}
               className="btn btn-outline btn-xs rounded-lg gap-1 border border-base-300 hover:border-primary hover:bg-primary/5 hover:text-primary disabled:bg-base-200/50 disabled:text-base-content/30 disabled:border-base-200"
             >
               <Play className="h-3 w-3" />
@@ -478,8 +564,13 @@ export default function HelmComposer() {
           {/* Dispatch Button */}
           <button
             type="button"
-            onClick={handleLaunch}
-            disabled={launching || !goal.trim() || selectedPicks.length === 0}
+            onClick={() => void handleLaunch('real')}
+            disabled={!canRequestHermesLaunch({
+              goal,
+              rosterCount: launchPicks.length,
+              launching,
+              workspaceLoading,
+            })}
             className="btn btn-primary btn-xs rounded-lg gap-1 text-white shadow-sm font-semibold hover:shadow bg-gradient-to-r from-primary to-primary-focus border-none disabled:bg-base-200/50 disabled:text-base-content/30"
           >
             {launching ? (
@@ -495,6 +586,8 @@ export default function HelmComposer() {
           </button>
         </div>
       </div>
+      {launchError && <p role="alert" className="text-xs text-error">{launchError}</p>}
+      {workspaceError && <p role="alert" className="text-xs text-error">{workspaceError}</p>}
     </div>
   );
 }

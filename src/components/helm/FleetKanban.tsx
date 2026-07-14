@@ -13,6 +13,7 @@ import {
   listWorktrees,
   mergeWorktree,
 } from '../../services/worktreeService';
+import * as hermesService from '../../services/hermesService';
 
 // Custom lightweight VirtualList implementation
 interface VirtualListProps<T> {
@@ -206,7 +207,8 @@ export const FleetKanban: React.FC = () => {
         message: `确定要取消正在执行的任务吗？(ID: ${task.id})\nAre you sure you want to cancel the running task?`,
         onConfirm: async () => {
           try {
-            await closeAgent({ agentId: agent.id, removeWorktree: false });
+            await hermesService.agentAbort(agent.id);
+            await useHermesStore.getState().refreshSnapshot();
           } catch (err) {
             console.error('Failed to cancel agent:', err);
           }
@@ -491,4 +493,3 @@ export const FleetKanban: React.FC = () => {
 };
 
 export default FleetKanban;
-

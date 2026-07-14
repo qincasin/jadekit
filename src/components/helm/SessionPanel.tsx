@@ -1,17 +1,18 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useHermesStore } from '../../stores/useHermesStore';
 import { useChatStore } from '../../stores/useChatStore';
 import { listWorktrees } from '../../services/worktreeService';
 import { openChatPathInExplorer } from '../../utils/chatWorkspaceStatus';
 import { showToast } from '../common/ToastContainer';
-import { selectActiveAgent } from './sessionSelect';
-import { sessionHeaderActions } from './sessionHeaderActions';
+import { selectActiveAgent, selectVisibleRun, shouldFallbackToActivityTimeline } from './sessionSelect';
+import { isAbortableActiveAgent, sessionHeaderActions } from './sessionHeaderActions';
 import { cn } from '../../utils/cn';
 import { InterventionGateCard } from './InterventionGateCard';
-import { InterventionGateDto } from '../../types/hermes';
-import { reduceHermesEvent } from '../../stores/hermesReducer';
+import { InterventionGateDto, WorkerSessionDto, WorkerTranscriptDto } from '../../types/hermes';
 import * as hermesService from '../../services/hermesService';
+import MessageList from '../chat/MessageList';
+import type { ChatMessage, MessageRaw } from '../../types/chat';
 
 import {
   Activity,
@@ -24,111 +25,93 @@ import {
   XOctagon
 } from 'lucide-react';
 
-interface DummyMessage {
-  id: string;
-  role: string;
-  content: string;
-}
-
-// Dummy transcript loader that currently returns null
-async function loadWorkerTranscript(agentId: string): Promise<DummyMessage[] | null> {
-  if (!agentId) return null;
-  return null;
-}
-
 export const SessionPanel: React.FC = () => {
   const { t } = useTranslation();
   
   const selectedAgentId = useHermesStore((state) => state.selectedAgentId);
   const agents = useHermesStore((state) => state.agents);
+  const runs = useHermesStore((state) => state.runs);
   const agent = selectActiveAgent(agents, selectedAgentId);
+  const visibleRun = selectVisibleRun(runs);
 
   const currentCwd = useChatStore((state) => state.currentCwd);
   const setCurrentCwd = useChatStore((state) => state.setCurrentCwd);
 
-  const [transcript, setTranscript] = useState<DummyMessage[] | null>(null);
+  const [transcript, setTranscript] = useState<WorkerTranscriptDto | null>(null);
+  const [history, setHistory] = useState<WorkerSessionDto[]>([]);
+  const [selectedHistoryDispatchId, setSelectedHistoryDispatchId] = useState<string | null>(null);
   const [, setIsLoadingTranscript] = useState(false);
 
   useEffect(() => {
     if (selectedAgentId) {
       setIsLoadingTranscript(true);
-      loadWorkerTranscript(selectedAgentId).then((res) => {
-        setTranscript(res);
-        setIsLoadingTranscript(false);
-      });
+      hermesService
+        .workerTranscript(selectedAgentId)
+        .then((res) => {
+          setTranscript(res);
+        })
+        .catch((err) => {
+          console.error('Failed to load worker transcript:', err);
+          setTranscript(null);
+        })
+        .finally(() => {
+          setIsLoadingTranscript(false);
+        });
     } else {
       setTranscript(null);
     }
   }, [selectedAgentId]);
 
+  useEffect(() => {
+    hermesService.workerSessionList().then(setHistory).catch((err) => {
+      console.error('Failed to load worker session history:', err);
+      setHistory([]);
+    });
+  }, [visibleRun?.status]);
+
+  useEffect(() => {
+    if (!selectedHistoryDispatchId) return;
+    hermesService.workerTranscript(selectedHistoryDispatchId).then(setTranscript).catch((err) => {
+      console.error('Failed to load archived worker transcript:', err);
+      setTranscript(null);
+    });
+  }, [selectedHistoryDispatchId]);
+
+  const transcriptMessages = useMemo<ChatMessage[]>(() => (transcript?.entries ?? []).flatMap((entry, index) => {
+    if (entry.kind !== 'messageRaw') return [];
+    try {
+      const raw = JSON.parse(entry.json) as MessageRaw;
+      if ((raw.type !== 'assistant' && raw.type !== 'user') || !Array.isArray(raw.message?.content)) return [];
+      return [{ id: raw.uuid ?? `worker-${index}`, role: raw.type, content: '', raw, createdAt: Date.parse(entry.createdAt) || index }];
+    } catch { return []; }
+  }), [transcript]);
+
   const [gate, setGate] = useState<InterventionGateDto | null>(null);
 
   useEffect(() => {
     if (agent && agent.status === 'needs-attention') {
-      if (agent.id === 'codex-07') {
-        setGate({
-          id: 'gate-task-02',
-          taskId: 'task-02',
-          question: 'Review implementation of router wildcard matching and resolve conflict.',
-          options: ['approve', 'reject'],
-          status: 'pending',
-        });
-      } else {
-        const fetchGate = async () => {
-          try {
-            const list = await hermesService.gateList({ taskId: agent.taskId || undefined });
-            if (list && list.length > 0) {
-              setGate(list[0]);
-            } else {
-              setGate({
-                id: `gate-${agent.taskId || 'unknown'}`,
-                taskId: agent.taskId || 'unknown',
-                question: 'Requires manual review of the generated files and logic.',
-                options: ['approve', 'reject'],
-                status: 'pending',
-              });
-            }
-          } catch (e) {
-            setGate({
-              id: `gate-${agent.taskId || 'unknown'}`,
-              taskId: agent.taskId || 'unknown',
-              question: 'Requires manual review of the generated files and logic.',
-              options: ['approve', 'reject'],
-              status: 'pending',
-            });
+      const fetchGate = async () => {
+        try {
+          const list = await hermesService.gateList({ taskId: agent.taskId || undefined });
+          if (list && list.length > 0) {
+            setGate(list[0]);
+          } else {
+            setGate(null);
           }
-        };
-        void fetchGate();
-      }
+        } catch (e) {
+          console.error('Failed to load intervention gate:', e);
+          setGate(null);
+        }
+      };
+      void fetchGate();
     } else {
       setGate(null);
     }
   }, [agent?.id, agent?.status, agent?.taskId]);
 
   const handleResolveGate = (resolution: 'approve' | 'reject', _comment: string) => {
-    if (agent?.id === 'codex-07') {
-      // Transition codex-07 back to working/tool_use and task-02 back to dispatched
-      useHermesStore.setState((state) => {
-        const s1 = reduceHermesEvent(state, {
-          kind: 'task',
-          runId: 'walkthrough-run',
-          taskId: 'task-02',
-          status: 'dispatched',
-          dispatchId: 'codex-07',
-        });
-        return reduceHermesEvent(s1, {
-          kind: 'agent',
-          runId: 'walkthrough-run',
-          agentId: 'codex-07',
-          taskId: 'task-02',
-          status: 'working',
-          activity: 'tool_use',
-        });
-      });
-      showToast(t('common.success', 'Success') + `: Walkthrough simulation gate resolved (${resolution})`, 'success');
-    } else {
-      showToast(t('common.success', 'Success') + `: Gate resolved successfully with ${resolution}`, 'success');
-    }
+    setGate(null);
+    showToast(t('common.success', 'Success') + `: Gate resolved successfully with ${resolution}`, 'success');
   };
 
 
@@ -159,7 +142,82 @@ export const SessionPanel: React.FC = () => {
     }
   };
 
+  const handleStopAgent = async () => {
+    if (!agent) return;
+
+    const latestAgent = useHermesStore.getState().agents[agent.id];
+    if (!isAbortableActiveAgent(latestAgent)) {
+      showToast(t('helm.agentAlreadyFinished', 'This agent has already finished.'), 'info');
+      return;
+    }
+
+    try {
+      await hermesService.agentAbort(agent.id);
+      await useHermesStore.getState().refreshSnapshot();
+      showToast(t('common.success', 'Success') + ': Agent stopped', 'success');
+    } catch (err) {
+      console.error('Failed to stop agent:', err);
+      showToast(`Failed to stop agent: ${String(err)}`, 'error');
+    }
+  };
+
   if (!selectedAgentId || !agent) {
+    if (history.length > 0) {
+      const selectedHistory = history.find((session) => session.dispatchId === selectedHistoryDispatchId) ?? null;
+      return (
+        <div className="flex-1 overflow-y-auto bg-base-100 p-6">
+          <div className="mx-auto max-w-4xl">
+            <label className="text-xs font-medium" htmlFor="hermes-history-worker">{t('helm.history.title')}</label>
+            <select id="hermes-history-worker" className="select select-sm mt-1 w-full" value={selectedHistoryDispatchId ?? ''} onChange={(event) => setSelectedHistoryDispatchId(event.target.value || null)}>
+              <option value="">{t('helm.history.select')}</option>
+              {history.map((session) => <option key={session.dispatchId} value={session.dispatchId}>{session.taskId} {session.error ? t('helm.history.failed') : t('helm.history.completed')}</option>)}
+            </select>
+            {selectedHistory && <p className="mt-3 text-xs text-base-content/60">{selectedHistory.error ?? selectedHistory.finalResponse ?? t('helm.history.noFinal')}</p>}
+            {selectedHistoryDispatchId && (transcriptMessages.length > 0 ? <MessageList messages={transcriptMessages} /> : <p className="mt-6 text-center text-xs text-base-content/55">{t('helm.history.empty')}</p>)}
+          </div>
+        </div>
+      );
+    }
+    if (visibleRun) {
+      const isFailed = visibleRun.status === 'failed';
+      const isCompleted = visibleRun.status === 'completed';
+      return (
+        <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-base-100 select-none h-full">
+          <div className="max-w-xl rounded-lg border border-base-300 bg-base-100 px-6 py-5 shadow-sm">
+            <div className="flex items-center justify-center mb-3">
+              {isFailed ? (
+                <XOctagon className="h-8 w-8 text-error" />
+              ) : isCompleted ? (
+                <Check className="h-8 w-8 text-success" />
+              ) : (
+                <Loader2 className="h-8 w-8 animate-spin text-primary" />
+              )}
+            </div>
+            <h3 className="text-sm font-semibold text-base-content/85">
+              {isFailed
+                ? 'Hermes 运行失败'
+                : isCompleted
+                  ? 'Hermes 运行已完成'
+                  : 'Hermes 正在规划任务'}
+            </h3>
+            <p className="mt-2 text-xs leading-relaxed text-base-content/60">
+              {visibleRun.goal}
+            </p>
+            {visibleRun.error && (
+              <p className="mt-3 rounded border border-error/25 bg-error/5 px-3 py-2 text-left text-xs text-error">
+                {visibleRun.error}
+              </p>
+            )}
+            {!isFailed && !isCompleted && (
+              <p className="mt-3 text-[11px] text-base-content/45">
+                Planner 正在拆解目标；任务或 Agent 出现后会自动切换到会话视图。
+              </p>
+            )}
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-base-100 select-none h-full">
         <Activity className="h-12 w-12 text-base-content/30 mb-4 animate-pulse" />
@@ -172,6 +230,7 @@ export const SessionPanel: React.FC = () => {
 
   // Generate Timeline Events
   const timelineEvents = [];
+  const showActivityFallback = shouldFallbackToActivityTimeline(transcript?.entries ?? null);
 
   // 1. Initialized Event
   timelineEvents.push({
@@ -305,10 +364,11 @@ export const SessionPanel: React.FC = () => {
         <div className="flex items-center gap-2">
           {actions.map((act) => {
             const isJump = act.id === 'jumpToWorktree';
+            const isStop = act.id === 'stop';
             const buttonElement = (
               <button
                 key={act.id}
-                onClick={isJump ? handleJumpToWorktree : undefined}
+                onClick={isJump ? handleJumpToWorktree : isStop ? handleStopAgent : undefined}
                 disabled={act.disabled}
                 className={cn(
                   "btn btn-xs rounded-lg font-semibold",
@@ -341,7 +401,7 @@ export const SessionPanel: React.FC = () => {
       {/* Main Stream Activity Area */}
       <div className="flex-1 overflow-y-auto p-6 flex flex-col justify-between">
         <div>
-          {transcript === null ? (
+          {showActivityFallback ? (
             <div className="max-w-2xl mx-auto mt-4">
               <h3 className="text-sm font-semibold text-base-content/85 mb-6 uppercase tracking-wider">
                 Activity Stream
@@ -396,21 +456,13 @@ export const SessionPanel: React.FC = () => {
                 </ul>
               </div>
 
-              {/* Placeholder banner */}
-              <div className="mt-12 bg-base-200 border border-base-300 rounded-xl p-4 text-xs font-mono leading-relaxed text-base-content/70 text-center shadow-sm">
-                <div className="font-bold text-base-content/60">
-                  {t(
-                    'helm.placeholderBanner',
-                    '完整执行记录将在引擎接通后显示 / Full transcript will be shown after engine bridge is lit.'
-                  )}
-                </div>
-              </div>
+              {(transcript?.entries.length ?? 0) === 0 && <p className="mt-6 text-center text-xs text-base-content/55">{t('helm.history.empty')}</p>}
+              {(transcript?.entries ?? []).filter((entry) => entry.kind === 'activity').map((entry, index) => (
+                <p key={`${entry.createdAt}-${index}`} className="mt-2 text-xs text-base-content/65">{entry.text}</p>
+              ))}
             </div>
           ) : (
-            // Full transcript view (never loaded since loadWorkerTranscript returns null)
-            <div className="text-xs font-mono text-base-content/60">
-              Loaded transcript messages: {transcript.length}
-            </div>
+            <MessageList messages={transcriptMessages} />
           )}
         </div>
 
@@ -421,6 +473,7 @@ export const SessionPanel: React.FC = () => {
           </div>
         )}
       </div>
+
     </div>
   );
 };

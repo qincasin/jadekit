@@ -121,6 +121,8 @@ const DEFAULT_CLI_TOOL: &str = "claude-cli";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RosterEntry {
     pub runtime: RuntimeKind,
+    /// Provider token accepted by Hermes SDK routing (`claude` or `codex`).
+    pub provider: String,
     pub model: String,
     pub label: String,
     /// 形如 `"low"`/`"mid"`/`"high"` 或任意自由文本；提示里展示给模型参考。
@@ -137,6 +139,12 @@ impl Roster {
         self.0
             .iter()
             .any(|e| e.runtime == runtime && e.model == model)
+    }
+
+    fn entry_for(&self, runtime: RuntimeKind, model: &str) -> Option<&RosterEntry> {
+        self.0
+            .iter()
+            .find(|entry| entry.runtime == runtime && entry.model == model)
     }
 
     /// 空切片视图，便于测试与默认构造。
@@ -631,19 +639,20 @@ fn build_assignment(
         format!("parse_plan_response: task {task_id} 的 assignment 缺少 model")
     })?;
 
-    if !roster.contains(runtime, &model) {
-        return Err(format!(
+    let entry = roster.entry_for(runtime, &model).ok_or_else(|| {
+        format!(
             "parse_plan_response: task {task_id} 的 assignment (runtime={}, model={}) 不在 roster 内",
             runtime.as_str(),
             model
-        ));
-    }
+        )
+    })?;
 
     // tool 缺省：按 runtime 给一个稳定的默认（Sdk→claude-sdk, Cli→claude-cli）。
     // YAGNI：更复杂的 tool 映射留给后续子相位按 roster 的 label 决定。
     let tool = dto.tool.unwrap_or_else(|| default_tool(runtime).to_string());
     Ok(AgentAssignment {
         runtime,
+        provider: entry.provider.clone(),
         tool,
         model,
     })
@@ -819,6 +828,20 @@ impl Planner {
         Self { runtime }
     }
 
+    fn start_spec(&self, agent_id: String, roster: &Roster, repo_root: &Path) -> RuntimeStartSpec {
+        let selected = roster.0.first();
+        RuntimeStartSpec {
+            agent_id,
+            cwd: repo_root.to_path_buf(),
+            model: selected
+                .map(|entry| entry.model.clone())
+                .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            provider: selected
+                .map(|entry| entry.provider.clone())
+                .unwrap_or_else(|| DEFAULT_PROVIDER.to_string()),
+        }
+    }
+
     /// 开局拆解：起 planner agent → 发 `build_plan_prompt` → 收敛 TextDelta → 解析。
     ///
     /// 流程：
@@ -841,25 +864,27 @@ impl Planner {
         // 起临时 planner agent：无 worktree，cwd = repo_root（planner 不改代码）。
         let handle = self
             .runtime
-            .start(RuntimeStartSpec {
-                agent_id: agent_id.clone(),
-                cwd: repo_root.to_path_buf(),
-                model: DEFAULT_MODEL.to_string(),
-                provider: DEFAULT_PROVIDER.to_string(),
-            })
+            .start(self.start_spec(agent_id.clone(), roster, repo_root))
             .await
             .map_err(|e| format!("planner start failed: {:?}", e))?;
 
         // 发提示 → 收敛到一段文本。
-        let mut rx = self
-            .runtime
-            .send(&handle, prompt)
-            .await
-            .map_err(|e| format!("planner send failed: {:?}", e))?;
-        let buffer = collect_text(&mut rx).await?;
-
-        // 解析 → Vec<Task>（含 roster 选兵校验 + DAG 依赖校验）。
-        parse_plan_response(&buffer, roster)
+        let result = async {
+            let mut rx = self
+                .runtime
+                .send(&handle, prompt)
+                .await
+                .map_err(|e| format!("planner send failed: {:?}", e))?;
+            let buffer = collect_text(&mut rx).await?;
+            parse_plan_response(&buffer, roster)
+        }
+        .await;
+        let stop_result = self.runtime.stop(&handle).await;
+        match (result, stop_result) {
+            (Ok(tasks), Ok(())) => Ok(tasks),
+            (Ok(_), Err(e)) => Err(format!("planner stop failed: {:?}", e)),
+            (Err(e), _) => Err(e),
+        }
     }
 
     /// 失败后决策：起 planner agent → 发 `build_replan_prompt` → 收敛 → 解析。
@@ -879,23 +904,26 @@ impl Planner {
 
         let handle = self
             .runtime
-            .start(RuntimeStartSpec {
-                agent_id: agent_id.clone(),
-                cwd: repo_root.to_path_buf(),
-                model: DEFAULT_MODEL.to_string(),
-                provider: DEFAULT_PROVIDER.to_string(),
-            })
+            .start(self.start_spec(agent_id.clone(), roster, repo_root))
             .await
             .map_err(|e| format!("planner(replan) start failed: {:?}", e))?;
 
-        let mut rx = self
-            .runtime
-            .send(&handle, prompt)
-            .await
-            .map_err(|e| format!("planner(replan) send failed: {:?}", e))?;
-        let buffer = collect_text(&mut rx).await?;
-
-        parse_replan_response(&buffer, roster)
+        let result = async {
+            let mut rx = self
+                .runtime
+                .send(&handle, prompt)
+                .await
+                .map_err(|e| format!("planner(replan) send failed: {:?}", e))?;
+            let buffer = collect_text(&mut rx).await?;
+            parse_replan_response(&buffer, roster)
+        }
+        .await;
+        let stop_result = self.runtime.stop(&handle).await;
+        match (result, stop_result) {
+            (Ok(decision), Ok(())) => Ok(decision),
+            (Ok(_), Err(e)) => Err(format!("planner(replan) stop failed: {:?}", e)),
+            (Err(e), _) => Err(e),
+        }
     }
 
     /// Task 16（3f）：对多候选产物打分选优。起 planner agent → 发 `build_judge_prompt`
@@ -926,12 +954,7 @@ impl Planner {
         // 起临时 planner agent：无 worktree，cwd = repo_root（planner 不改代码）。
         let handle = match self
             .runtime
-            .start(RuntimeStartSpec {
-                agent_id: agent_id.clone(),
-                cwd: repo_root.to_path_buf(),
-                model: DEFAULT_MODEL.to_string(),
-                provider: DEFAULT_PROVIDER.to_string(),
-            })
+            .start(self.start_spec(agent_id.clone(), roster, repo_root))
             .await
         {
             Ok(h) => h,
@@ -939,16 +962,24 @@ impl Planner {
         };
 
         // 发提示 → 收敛到一段文本；任一环节失败 → fallback。
-        let mut rx = match self.runtime.send(&handle, prompt).await {
-            Ok(r) => r,
-            Err(e) => return fallback_verdict(&format!("agent send failed: {:?}", e)),
-        };
-        let buffer = match collect_text(&mut rx).await {
-            Ok(t) => t,
-            Err(e) => return fallback_verdict(&format!("agent stream: {e}")),
-        };
-
-        parse_judge_response(&buffer, candidates.len())
+        let result = async {
+            let mut rx = self
+                .runtime
+                .send(&handle, prompt)
+                .await
+                .map_err(|e| format!("agent send failed: {:?}", e))?;
+            let buffer = collect_text(&mut rx)
+                .await
+                .map_err(|e| format!("agent stream: {e}"))?;
+            Ok::<_, String>(parse_judge_response(&buffer, candidates.len()))
+        }
+        .await;
+        let stop_result = self.runtime.stop(&handle).await;
+        match (result, stop_result) {
+            (Ok(verdict), Ok(())) => verdict,
+            (Ok(_), Err(e)) => fallback_verdict(&format!("agent stop failed: {:?}", e)),
+            (Err(e), _) => fallback_verdict(&e),
+        }
     }
 }
 
@@ -1021,12 +1052,14 @@ mod tests {
         Roster(vec![
             RosterEntry {
                 runtime: RuntimeKind::Sdk,
+                provider: "claude".to_string(),
                 model: "sonnet".to_string(),
                 label: "Claude Sonnet (SDK)".to_string(),
                 cost_hint: Some("mid".to_string()),
             },
             RosterEntry {
                 runtime: RuntimeKind::Cli,
+                provider: "codex".to_string(),
                 model: "glm-5.2".to_string(),
                 label: "GLM 5.2 (CLI)".to_string(),
                 cost_hint: Some("low".to_string()),
@@ -1276,12 +1309,16 @@ mod tests {
     /// send() 返回 receiver 之前压入全部事件并 drop sender。
     struct PlannerMockRuntime {
         events: std::sync::Mutex<HashMap<String, Vec<AgentEvent>>>,
+        start_specs: std::sync::Mutex<Vec<RuntimeStartSpec>>,
+        stopped: std::sync::Mutex<Vec<String>>,
     }
 
     impl PlannerMockRuntime {
         fn new() -> Self {
             Self {
                 events: std::sync::Mutex::new(HashMap::new()),
+                start_specs: std::sync::Mutex::new(Vec::new()),
+                stopped: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -1291,6 +1328,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(agent_id.to_string(), events);
+        }
+
+        fn stopped_agents(&self) -> Vec<String> {
+            self.stopped.lock().unwrap().clone()
         }
     }
 
@@ -1305,6 +1346,7 @@ mod tests {
         }
 
         async fn start(&self, spec: RuntimeStartSpec) -> Result<AgentHandle, RuntimeError> {
+            self.start_specs.lock().unwrap().push(spec.clone());
             Ok(AgentHandle {
                 agent_id: spec.agent_id,
             })
@@ -1340,7 +1382,8 @@ mod tests {
             Liveness::Alive
         }
 
-        async fn stop(&self, _handle: &AgentHandle) -> Result<(), RuntimeError> {
+        async fn stop(&self, handle: &AgentHandle) -> Result<(), RuntimeError> {
+            self.stopped.lock().unwrap().push(handle.agent_id.clone());
             Ok(())
         }
     }
@@ -1385,12 +1428,18 @@ mod tests {
             .await
             .expect("plan 应成功解析");
         assert_eq!(tasks.len(), 2);
+        let planner_spec = runtime.start_specs.lock().unwrap().first().cloned().unwrap();
+        assert_eq!(planner_spec.provider, "claude");
+        assert_eq!(planner_spec.model, "sonnet");
+        assert_eq!(planner_spec.cwd, repo_root);
+        assert_eq!(runtime.stopped_agents().len(), 1, "plan must stop its temporary agent");
 
         // 选兵 + deps 都正确。
         assert_eq!(tasks[0].id, "t1");
         assert_eq!(tasks[0].status, TaskStatus::Ready);
         let a0 = tasks[0].assignment.as_ref().unwrap();
         assert_eq!(a0.runtime, RuntimeKind::Sdk);
+        assert_eq!(a0.provider, "claude");
         assert_eq!(a0.model, "sonnet");
 
         assert_eq!(tasks[1].id, "t2");
@@ -1398,6 +1447,7 @@ mod tests {
         assert_eq!(tasks[1].status, TaskStatus::Pending);
         let a1 = tasks[1].assignment.as_ref().unwrap();
         assert_eq!(a1.runtime, RuntimeKind::Cli);
+        assert_eq!(a1.provider, "codex");
         assert_eq!(a1.model, "glm-5.2");
     }
 
@@ -1420,6 +1470,7 @@ mod tests {
         assert_eq!(decision.decision, ReplanAction::Retry);
         assert_eq!(decision.reason, "瞬时错误，重跑一次");
         assert!(decision.assignment.is_none());
+        assert_eq!(runtime.stopped_agents().len(), 1, "replan must stop its temporary agent");
     }
 
     // ===== Case 3: Planner::plan 当 mock emit Failed → Err =====
@@ -1442,6 +1493,7 @@ mod tests {
             err.contains("model overloaded"),
             "错误信息应传播原始 error，got: {err}"
         );
+        assert_eq!(runtime.stopped_agents().len(), 1, "failed plan must stop its temporary agent");
     }
 
     // ===== Case 3b: Planner::plan 当 mock emit Done{success:false} → Err =====
@@ -1637,6 +1689,7 @@ mod tests {
         assert_eq!(verdict.winner_index, 1);
         assert_eq!(verdict.scores, vec![0.6, 0.9]);
         assert_eq!(verdict.reason, "候选 2 覆盖更全");
+        assert_eq!(runtime.stopped_agents().len(), 1, "judge must stop its temporary agent");
     }
 
     // ===== Judge Case 8: Planner::judge 当 mock emit Failed → 回落确定性 JudgeVerdict =====

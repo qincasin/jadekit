@@ -10,8 +10,15 @@ vi.mock('@tauri-apps/api/event', () => {
   };
 });
 
+vi.mock('@tauri-apps/api/core', () => {
+  return {
+    invoke: vi.fn(),
+  };
+});
+
 import { useHermesStore } from './useHermesStore';
 import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
 import { TaskDto, DispatchDto } from '../types/hermes';
 
 describe('useHermesStore', () => {
@@ -152,5 +159,151 @@ describe('useHermesStore', () => {
     expect(mockUnlistenRun).toHaveBeenCalled();
     expect(mockUnlistenTask).toHaveBeenCalled();
     expect(mockUnlistenAgent).toHaveBeenCalled();
+  });
+
+  it('subscribeEvents: should return a noop cleanup when Tauri event registration is unavailable', async () => {
+    const mockListen = vi.mocked(listen);
+    mockListen.mockRejectedValueOnce(new Error('event API unavailable'));
+
+    const unsubscribe = await useHermesStore.getState().subscribeEvents();
+
+    expect(unsubscribe).not.toThrow();
+  });
+
+  it('refreshSnapshot: should hydrate tasks and active dispatches from Hermes read commands', async () => {
+    const task: TaskDto = {
+      id: 'task-1',
+      parentId: null,
+      spec: 'Implement Helm cockpit',
+      status: 'ready',
+      deps: [],
+      result: null,
+      createdAt: '2026-06-29T00:00:00Z',
+      completedAt: null,
+    };
+    const agent: DispatchDto = {
+      id: 'dispatch-1',
+      taskId: 'task-1',
+      assignee: 'codex-01',
+      status: 'dispatched',
+      failureCount: 0,
+      lastHeartbeatAt: '2026-06-29T00:05:00Z',
+      lastFailure: null,
+      dispatchedAt: '2026-06-29T00:00:00Z',
+      completedAt: null,
+      createdAt: '2026-06-29T00:00:00Z',
+    };
+
+    const mockInvoke = vi.mocked(invoke);
+    mockInvoke.mockImplementation((command) => {
+      if (command === 'hermes_task_list') return Promise.resolve([task]);
+      if (command === 'hermes_agent_list') return Promise.resolve([agent]);
+      return Promise.reject(new Error(`unexpected command: ${String(command)}`));
+    });
+
+    await useHermesStore.getState().refreshSnapshot();
+
+    const state = useHermesStore.getState();
+    expect(mockInvoke).toHaveBeenCalledWith('hermes_task_list', { filter: undefined });
+    expect(mockInvoke).toHaveBeenCalledWith('hermes_agent_list');
+    expect(state.tasks['task-1']?.spec).toBe('Implement Helm cockpit');
+    expect(state.agents['codex-01']?.taskId).toBe('task-1');
+    expect(state.agents['codex-01']?.status).toBe('working');
+    expect(state.selectedAgentId).toBe('codex-01');
+  });
+
+  it('refreshSnapshotUntilHydrated: should retry until Hermes dispatch data appears', async () => {
+    vi.useFakeTimers();
+
+    const task: TaskDto = {
+      id: 'task-2',
+      parentId: null,
+      spec: 'Build cockpit data recovery',
+      status: 'dispatched',
+      deps: [],
+      result: null,
+      createdAt: '2026-06-29T00:00:00Z',
+      completedAt: null,
+    };
+    const agent: DispatchDto = {
+      id: 'dispatch-2',
+      taskId: 'task-2',
+      assignee: 'codex-02',
+      status: 'dispatched',
+      failureCount: 0,
+      lastHeartbeatAt: '2026-06-29T00:05:00Z',
+      lastFailure: null,
+      dispatchedAt: '2026-06-29T00:00:00Z',
+      completedAt: null,
+      createdAt: '2026-06-29T00:00:00Z',
+    };
+
+    let taskListCalls = 0;
+    const mockInvoke = vi.mocked(invoke);
+    mockInvoke.mockImplementation((command) => {
+      if (command === 'hermes_task_list') {
+        taskListCalls += 1;
+        return Promise.resolve(taskListCalls === 1 ? [] : [task]);
+      }
+      if (command === 'hermes_agent_list') {
+        return Promise.resolve(taskListCalls === 1 ? [] : [agent]);
+      }
+      return Promise.reject(new Error(`unexpected command: ${String(command)}`));
+    });
+
+    const refresh = useHermesStore
+      .getState()
+      .refreshSnapshotUntilHydrated({ attempts: 2, delayMs: 10 });
+    await vi.advanceTimersByTimeAsync(10);
+    await refresh;
+
+    const state = useHermesStore.getState();
+    expect(taskListCalls).toBe(2);
+    expect(state.tasks['task-2']?.spec).toBe('Build cockpit data recovery');
+    expect(state.agents['codex-02']?.status).toBe('working');
+
+    vi.useRealTimers();
+  });
+
+  it('refreshSnapshot: should keep the cockpit open when Hermes read commands are unavailable', async () => {
+    const mockInvoke = vi.mocked(invoke);
+    mockInvoke.mockRejectedValue(new Error('command not available'));
+
+    await expect(useHermesStore.getState().refreshSnapshot()).resolves.toBeUndefined();
+
+    const state = useHermesStore.getState();
+    expect(state.tasks).toEqual({});
+    expect(state.agents).toEqual({});
+  });
+
+  it('refreshSnapshot: should remove stale agents and clear their selection when the active dispatch snapshot is empty', async () => {
+    const staleAgent: DispatchDto = {
+      id: 'dispatch-stale',
+      taskId: 'task-stale',
+      assignee: 'codex-stale',
+      status: 'dispatched',
+      failureCount: 0,
+      lastHeartbeatAt: '2026-06-29T00:05:00Z',
+      lastFailure: null,
+      dispatchedAt: '2026-06-29T00:00:00Z',
+      completedAt: null,
+      createdAt: '2026-06-29T00:00:00Z',
+    };
+    const mockInvoke = vi.mocked(invoke);
+    mockInvoke.mockImplementation((command) => {
+      if (command === 'hermes_task_list' || command === 'hermes_agent_list') {
+        return Promise.resolve([]);
+      }
+      return Promise.reject(new Error(`unexpected command: ${String(command)}`));
+    });
+
+    useHermesStore.getState().setAgents([staleAgent]);
+    useHermesStore.getState().setSelectedAgentId('codex-stale');
+
+    await useHermesStore.getState().refreshSnapshot();
+
+    const state = useHermesStore.getState();
+    expect(state.agents).toEqual({});
+    expect(state.selectedAgentId).toBeNull();
   });
 });

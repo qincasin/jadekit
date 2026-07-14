@@ -52,6 +52,8 @@ pub enum Liveness {
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// Validated daemon `[MESSAGE]` JSON snapshot retained for the worker transcript.
+    MessageRaw { json: String },
     TextDelta(String),
     Thinking(String),
     ToolUse { id: String, name: String },
