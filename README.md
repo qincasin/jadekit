@@ -224,6 +224,25 @@ npm install
 npm run tauri dev
 ```
 
+### 本地验证
+
+提交改动前建议执行以下前端验证：
+
+```bash
+npm run lint       # 检查 TypeScript / React 代码规范
+npm run test:run   # 运行前端单元测试
+npm run build      # 执行类型检查并构建前端产物
+```
+
+如果改动涉及 Rust、Tauri command、后端服务、代理、MCP、会话或 SQLite，还需要额外执行：
+
+```bash
+cargo check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
+```
+
+Rust 测试使用单线程运行是为了避免已知的 PTY 并发竞态。
+
 ### 生产构建
 
 ```bash
@@ -303,6 +322,25 @@ npm install
 npm run tauri dev      # Development
 npm run tauri build    # Production build
 ```
+
+#### Local validation
+
+Before submitting changes, run the frontend validation commands:
+
+```bash
+npm run lint       # Check TypeScript / React code quality
+npm run test:run   # Run frontend unit tests
+npm run build      # Type-check and build the frontend
+```
+
+When changes touch Rust, Tauri commands, backend services, proxy code, MCP, sessions, or SQLite, also run:
+
+```bash
+cargo check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
+```
+
+Rust tests run with one test thread to avoid the known PTY concurrency race.
 
 ### License
 
